@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 // packages/ui/src/toast.tsx
 //
 // In-app toast notification system + Promise-returning confirm dialog. Both
@@ -31,7 +50,7 @@ import {
   useToast as useAstryxToast,
   type ToastDismissFn,
 } from '@astryxdesign/core/Toast';
-import { AlertCircle, AlertTriangle, CheckCircle2, Info } from './icons.js';
+import { ICON_SIZE, AlertCircle, AlertTriangle, CheckCircle2, Info } from './icons.js';
 import { useUiLocale } from './locale-context.js';
 import { getSharedUiCopy } from './shared-ui-copy.js';
 
@@ -39,12 +58,43 @@ export type ToastVariant = 'info' | 'success' | 'warning' | 'error';
 
 export interface ToastAction {
   label: string;
-  onClick(): void;
+  onClick(): void | Promise<void>;
 }
+
+export interface ToastErrorAction {
+  label: string;
+  failureTitle: string;
+  failureDescription: string;
+  onClick(
+    input: Pick<ToastInput, 'title' | 'description' | 'diagnosticDetails' | 'diagnosticTarget'>,
+  ): Promise<void>;
+}
+
+export type ToastDiagnosticTarget =
+  | {
+      sessionId: string;
+      profileId?: never;
+      turnId?: never;
+      eventId?: never;
+    }
+  | {
+      sessionId: string;
+      turnId: string;
+      eventId: string;
+      profileId?: never;
+    }
+  | {
+      profileId: string;
+      sessionId?: never;
+      turnId?: never;
+      eventId?: never;
+    };
 
 export interface ToastInput {
   title: string;
   description?: string;
+  diagnosticDetails?: string;
+  diagnosticTarget?: ToastDiagnosticTarget;
   variant?: ToastVariant;
   /** Auto-dismiss after this many ms. 0 disables the timer. Default 4000. */
   duration?: number;
@@ -62,7 +112,12 @@ export interface ConfirmInput {
 export interface ToastApi {
   toast(input: ToastInput): string;
   success(title: string, description?: string): string;
-  error(title: string, description?: string): string;
+  error(
+    title: string,
+    description?: string,
+    diagnosticDetails?: string,
+    diagnosticTarget?: ToastDiagnosticTarget,
+  ): string;
   info(title: string, description?: string): string;
   warning(title: string, description?: string): string;
   confirm(input: ConfirmInput): Promise<boolean>;
@@ -83,52 +138,109 @@ interface ActiveConfirm {
 const DEFAULT_DURATION = 4000;
 const ToastContext = createContext<ToastApi | null>(null);
 
-export function ToastProvider(props: { children: ReactNode }) {
+export function ToastProvider(props: { children: ReactNode; errorAction?: ToastErrorAction }) {
   return (
     <LayerProvider toast={{ position: 'bottomEnd' }}>
-      <ToastController>{props.children}</ToastController>
+      <ToastController errorAction={props.errorAction}>{props.children}</ToastController>
     </LayerProvider>
   );
 }
 
-function ToastController(props: { children: ReactNode }) {
+function ToastController(props: { children: ReactNode; errorAction?: ToastErrorAction }) {
   const showToast = useAstryxToast();
   const [confirmState, setConfirmState] = useState<ActiveConfirm | null>(null);
   const activeConfirmRef = useRef<PendingConfirm | null>(null);
   const confirmQueueRef = useRef<PendingConfirm[]>([]);
   const dismissByIdRef = useRef(new Map<string, ToastDismissFn>());
+  const toastIdByContentRef = useRef(new Map<string, string>());
   const idSeed = useRef(0);
 
   const push = useCallback(
     (input: ToastInput): string => {
-      const id = `t${++idSeed.current}`;
+      const contentKey = toastContentKey(input);
+      const id = toastIdByContentRef.current.get(contentKey) ?? `t${++idSeed.current}`;
+      toastIdByContentRef.current.set(contentKey, id);
       let dismissCurrent: ToastDismissFn | undefined;
       const duration = input.duration ?? DEFAULT_DURATION;
+      const errorAction = props.errorAction;
+      const showErrorActionFailure = () => {
+        if (!errorAction) return;
+        const failureId = `t${++idSeed.current}`;
+        let dismissFailure: ToastDismissFn | undefined;
+        dismissFailure = showToast({
+          uniqueID: failureId,
+          body: (
+            <ToastBody
+              input={{
+                title: errorAction.failureTitle,
+                description: errorAction.failureDescription,
+                variant: 'error',
+              }}
+            />
+          ),
+          type: 'error',
+          isAutoHide: true,
+          autoHideDuration: DEFAULT_DURATION,
+          onHide: () => {
+            dismissByIdRef.current.delete(failureId);
+          },
+        });
+        dismissByIdRef.current.set(failureId, dismissFailure);
+      };
+      const actions = [
+        input.action,
+        input.variant === 'error' && errorAction
+          ? {
+              label: errorAction.label,
+              onClick: () => errorAction.onClick(input),
+            }
+          : undefined,
+      ].filter((action): action is ToastAction => action !== undefined);
       dismissCurrent = showToast({
         uniqueID: id,
+        collisionBehavior: 'overwrite',
         body: <ToastBody input={input} />,
         type: input.variant === 'error' ? 'error' : 'info',
         isAutoHide: duration > 0,
         autoHideDuration: duration > 0 ? duration : DEFAULT_DURATION,
-        endContent: input.action ? (
-          <AstryxButton
-            variant="ghost"
-            size="sm"
-            label={input.action.label}
-            onClick={() => {
-              input.action?.onClick();
-              dismissCurrent?.();
-            }}
-          />
+        endContent: actions.length > 0 ? (
+          <HStack gap={1}>
+            {actions.map((action, index) => (
+              <AstryxButton
+                key={`${index}:${action.label}`}
+                variant="ghost"
+                size="sm"
+                label={action.label}
+                onClick={() => {
+                  try {
+                    const pending = action.onClick();
+                    if (!pending) {
+                      dismissCurrent?.();
+                      return;
+                    }
+                    void pending.then(
+                      () => dismissCurrent?.(),
+                      showErrorActionFailure,
+                    );
+                  } catch {
+                    showErrorActionFailure();
+                  }
+                }}
+              />
+            ))}
+          </HStack>
         ) : undefined,
         onHide: () => {
           dismissByIdRef.current.delete(id);
+          if (toastIdByContentRef.current.get(contentKey) === id) {
+            toastIdByContentRef.current.delete(contentKey);
+          }
         },
       });
       dismissByIdRef.current.set(id, dismissCurrent);
       return id;
     },
-    [showToast],
+    [props.errorAction, showToast],
   );
 
   const dismiss = useCallback((id: string) => {
@@ -202,6 +314,7 @@ function ToastController(props: { children: ReactNode }) {
       }
       confirmQueueRef.current = [];
       dismissByIdRef.current.clear();
+      toastIdByContentRef.current.clear();
     };
   }, []);
 
@@ -209,7 +322,15 @@ function ToastController(props: { children: ReactNode }) {
     () => ({
       toast: push,
       success: (title, description) => push({ title, description, variant: 'success' }),
-      error: (title, description) => push({ title, description, variant: 'error', duration: 6000 }),
+      error: (title, description, diagnosticDetails, diagnosticTarget) =>
+        push({
+          title,
+          description,
+          diagnosticDetails,
+          diagnosticTarget,
+          variant: 'error',
+          duration: 6000,
+        }),
       info: (title, description) => push({ title, description, variant: 'info' }),
       warning: (title, description) => push({ title, description, variant: 'warning' }),
       confirm,
@@ -233,6 +354,27 @@ function ToastController(props: { children: ReactNode }) {
   );
 }
 
+export function toastContentKey(input: ToastInput): string {
+  const diagnosticTarget = input.diagnosticTarget;
+  const diagnosticScope = !diagnosticTarget
+    ? null
+    : 'profileId' in diagnosticTarget
+      ? ['profile', diagnosticTarget.profileId]
+      : [
+          'session',
+          diagnosticTarget.sessionId,
+          diagnosticTarget.turnId ?? '',
+          diagnosticTarget.eventId ?? '',
+        ];
+  return JSON.stringify([
+    input.variant ?? 'info',
+    input.title,
+    input.description ?? '',
+    input.action?.label ?? '',
+    diagnosticScope,
+  ]);
+}
+
 /**
  * Read the toast API from context. Throws when called outside a provider so
  * we don't silently swallow notifications during refactors.
@@ -244,10 +386,10 @@ export function useToast(): ToastApi {
 }
 
 const VARIANT_ICON: Record<ToastVariant, ReactNode> = {
-  info: <Info size={16} aria-hidden="true" />,
-  success: <CheckCircle2 size={16} aria-hidden="true" />,
-  warning: <AlertTriangle size={16} aria-hidden="true" />,
-  error: <AlertCircle size={16} aria-hidden="true" />,
+  info: <Info size={ICON_SIZE.chrome} aria-hidden="true" />,
+  success: <CheckCircle2 size={ICON_SIZE.chrome} aria-hidden="true" />,
+  warning: <AlertTriangle size={ICON_SIZE.chrome} aria-hidden="true" />,
+  error: <AlertCircle size={ICON_SIZE.chrome} aria-hidden="true" />,
 };
 
 function ToastBody({ input }: { input: ToastInput }) {

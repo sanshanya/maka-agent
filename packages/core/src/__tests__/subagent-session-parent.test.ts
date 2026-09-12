@@ -1,22 +1,35 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import type {
-  SessionSummary,
-  SubagentSessionParent,
-  SubagentSessionRuntime,
-  SubagentSessionSpawn,
-} from '../session.js';
+import type { SessionSummary, SubagentSessionParent, SubagentSessionSpawn } from '../session.js';
 import {
   childSessionsForParent,
-  filterLinkedSessionTree,
   isLinkedSubagentSession,
   isSubagentSessionParent,
   isSubagentSessionRuntime,
   isSubagentSessionSpawn,
+  linkedSubagentParentSessionId,
   projectLinkedSessionTree,
   subagentSessionRuntimeSummary,
 } from '../session.js';
-import { isPermissionModeWithinCeiling } from '../permission.js';
 
 const relation: SubagentSessionParent = {
   kind: 'subagent',
@@ -27,18 +40,6 @@ const relation: SubagentSessionParent = {
     toolCallId: 'tool-call',
   },
   lifecycle: 'foreground',
-};
-
-const runtime: SubagentSessionRuntime = {
-  schemaVersion: 1,
-  definitionVersion: 1,
-  agentId: 'local-read',
-  agentName: 'Local Read',
-  profile: 'local_read',
-  systemPrompt: 'Read the assigned workspace task.',
-  toolNames: ['Read', 'Glob', 'Grep'],
-  categoryPolicy: { read: 'allow' },
-  permissionCeiling: 'ask',
 };
 
 const spawn: SubagentSessionSpawn = {
@@ -96,34 +97,6 @@ describe('subagent session parent relation', () => {
     assert.equal(isSubagentSessionParent({ ...relation, unexpected: true }), false);
   });
 
-  test('strictly decodes current runtime snapshots and optional legacy permission ceilings', () => {
-    assert.equal(isSubagentSessionRuntime(runtime), true);
-    const { permissionCeiling: _legacyPermissionCeiling, ...currentRuntime } = runtime;
-    assert.equal(isSubagentSessionRuntime(currentRuntime), true);
-    assert.equal(isSubagentSessionRuntime({ ...runtime, toolNames: ['Read', 'Read'] }), false);
-    assert.equal(isSubagentSessionRuntime({ ...runtime, definitionVersion: 0 }), false);
-    assert.equal(
-      isSubagentSessionRuntime({ ...runtime, categoryPolicy: { unknown: 'allow' } }),
-      false,
-    );
-    assert.equal(isSubagentSessionRuntime({ ...runtime, permissionCeiling: 'invalid' }), false);
-    assert.equal(isSubagentSessionRuntime({ ...runtime, unexpected: true }), false);
-    assert.deepEqual(subagentSessionRuntimeSummary(runtime), {
-      schemaVersion: 1,
-      definitionVersion: 1,
-      agentId: 'local-read',
-      agentName: 'Local Read',
-      profile: 'local_read',
-      toolNames: ['Read', 'Glob', 'Grep'],
-      permissionCeiling: 'ask',
-    });
-
-    assert.equal(isPermissionModeWithinCeiling('explore', 'ask'), true);
-    assert.equal(isPermissionModeWithinCeiling('ask', 'ask'), true);
-    assert.equal(isPermissionModeWithinCeiling('execute', 'ask'), false);
-    assert.equal(isPermissionModeWithinCeiling('bypass', 'execute'), false);
-  });
-
   test('strictly decodes the initial child-spawn identity', () => {
     assert.equal(isSubagentSessionSpawn(spawn), true);
     assert.equal(isSubagentSessionSpawn({ ...spawn, requestFingerprint: 'not-a-hash' }), false);
@@ -156,6 +129,9 @@ describe('subagent session parent relation', () => {
     assert.equal(isLinkedSubagentSession(childA), true);
     assert.equal(isLinkedSubagentSession(hostChild), true);
     assert.equal(isLinkedSubagentSession(branch), false);
+    assert.equal(linkedSubagentParentSessionId(childA), 'parent-session');
+    assert.equal(linkedSubagentParentSessionId(hostChild), 'parent-session');
+    assert.equal(linkedSubagentParentSessionId(branch), undefined);
   });
 
   test('projects linked children beneath parents while preserving branches and orphans', () => {
@@ -206,43 +182,6 @@ describe('subagent session parent relation', () => {
     );
     assert.equal(tree.childrenByParentId.size, 0);
   });
-
-  test('filters every tree level and promotes matching descendants past hidden ancestors', () => {
-    const parent = summary('parent', { isFlagged: false, isArchived: false });
-    const archivedChild = summary('archived-child', {
-      isArchived: true,
-      subagentParent: { ...relation, parentSessionId: parent.id },
-    });
-    const flaggedGrandchild = summary('flagged-grandchild', {
-      isFlagged: true,
-      subagentParent: { ...relation, parentSessionId: archivedChild.id },
-    });
-    const tree = projectLinkedSessionTree([parent, archivedChild, flaggedGrandchild]);
-
-    const chats = filterLinkedSessionTree(tree, (session) => !session.isArchived);
-    assert.deepEqual(
-      chats.roots.map((session) => session.id),
-      ['parent'],
-    );
-    assert.deepEqual(
-      chats.childrenByParentId.get(parent.id)?.map((session) => session.id),
-      ['flagged-grandchild'],
-    );
-
-    const archived = filterLinkedSessionTree(tree, (session) => session.isArchived);
-    assert.deepEqual(
-      archived.roots.map((session) => session.id),
-      ['archived-child'],
-    );
-    assert.equal(archived.childrenByParentId.size, 0);
-
-    const flagged = filterLinkedSessionTree(tree, (session) => session.isFlagged);
-    assert.deepEqual(
-      flagged.roots.map((session) => session.id),
-      ['flagged-grandchild'],
-    );
-    assert.equal(flagged.childrenByParentId.size, 0);
-  });
 });
 
 function summary(id: string, overrides: Partial<SessionSummary> = {}): SessionSummary {
@@ -265,3 +204,31 @@ function summary(id: string, overrides: Partial<SessionSummary> = {}): SessionSu
     ...overrides,
   };
 }
+
+describe('legacy child execution snapshots', () => {
+  const runtime = {
+    schemaVersion: 1,
+    definitionVersion: 1,
+    agentId: 'agent-1',
+    agentName: 'Reader',
+    profile: 'local_read',
+    systemPrompt: 'Read only.',
+    toolNames: ['Read'],
+    categoryPolicy: { read: 'allow' },
+  } as const;
+
+  test('accepts a snapshot carrying a retired key', () => {
+    // Written before `permissionCeiling` was dropped. Rejecting it would make
+    // the whole child Session unreadable, and nothing reads the value.
+    assert.equal(isSubagentSessionRuntime({ ...runtime, permissionCeiling: 'execute' }), true);
+    assert.equal(isSubagentSessionRuntime({ ...runtime, permissionCeiling: 'ask' }), true);
+  });
+
+  test('accepts a current snapshot without the key', () => {
+    assert.equal(isSubagentSessionRuntime(runtime), true);
+  });
+
+  test('still rejects a key that was never part of the shape', () => {
+    assert.equal(isSubagentSessionRuntime({ ...runtime, notAField: 'x' }), false);
+  });
+});

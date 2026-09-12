@@ -1,18 +1,37 @@
-import { execFile } from 'node:child_process';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { randomUUID } from 'node:crypto';
-import { readFile, realpath, rename, stat } from 'node:fs/promises';
-import { basename, dirname, join, normalize, resolve } from 'node:path';
-import { promisify } from 'node:util';
-import type { ProjectLocation, ProjectRecord } from '@maka/core';
+import { realpath, stat } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
+import type { ProjectLocation, ProjectRecord } from '@maka/core/project';
+import type { SessionHeader } from '@maka/core/session';
+import { markPersisted } from '@maka/core/persisted-value';
+import { execGitText } from './git-exec.js';
 import { hasEnclosingGitEntry } from './git-entry.js';
 import {
   acquireOperationalStateDatabase,
   type OperationalStateDatabaseLease,
 } from './operational-state-store.js';
+import { decodePersistedSessionHeader, normalizeSessionHeader } from './session-store.js';
 
-export type { ProjectLocation, ProjectRecord } from '@maka/core';
-
-const execFileAsync = promisify(execFile);
+export type { ProjectLocation, ProjectRecord } from '@maka/core/project';
 
 export class ProjectPathMismatchError extends Error {
   readonly name = 'ProjectPathMismatchError';
@@ -26,38 +45,58 @@ export class ProjectPathMismatchError extends Error {
   }
 }
 
+export class ProjectNotFoundError extends Error {
+  readonly name = 'ProjectNotFoundError';
+  readonly code = 'project_not_found';
+
+  constructor(readonly projectId: string) {
+    super(`No such project: ${projectId}`);
+  }
+}
+
+export class ProjectArchivedError extends Error {
+  readonly name = 'ProjectArchivedError';
+  readonly code = 'project_archived';
+
+  constructor(readonly projectId: string) {
+    super(`Project is archived: ${projectId}`);
+  }
+}
+
+export class ProjectUnavailableError extends Error {
+  readonly name = 'ProjectUnavailableError';
+  readonly code = 'project_unavailable';
+
+  constructor(readonly projectId: string) {
+    super(`Project is unavailable: ${projectId}`);
+  }
+}
+
+export class ProjectPathConflictError extends Error {
+  readonly name = 'ProjectPathConflictError';
+  readonly code = 'project_path_conflict';
+
+  constructor(readonly conflictingProjectId: string) {
+    super(`Project path already belongs to project: ${conflictingProjectId}`);
+  }
+}
+
+export class ProjectPathBoundaryError extends TypeError {
+  readonly name = 'ProjectPathBoundaryError';
+  readonly code = 'project_path_outside_boundary';
+
+  constructor(readonly path: string) {
+    super(`Project path is outside its registration boundary: ${path}`);
+  }
+}
+
 export function isProjectPathMismatchError(error: unknown): error is ProjectPathMismatchError {
   return error instanceof ProjectPathMismatchError;
 }
 
-/**
- * The catalog changed underneath a relink while its `beforeCommit` callback was
- * still reassigning sessions, so the merge the caller was told to prepare is no
- * longer the merge that would be committed. Relink is already retryable — its
- * callback throwing leaves the catalog untouched — so failing here hands the
- * decision back rather than committing a half-true one.
- */
-export class ProjectRelinkContentionError extends Error {
-  readonly name = 'ProjectRelinkContentionError';
-  readonly code = 'project_relink_contention';
-
-  constructor(readonly projectId: string) {
-    super(`Project changed while relinking, retry: ${projectId}`);
-  }
-}
-
-export interface ProjectRelinkContext {
-  projectId: string;
-  projectAliases: string[];
-  destinationPath: string;
-  previousLocations: ProjectLocation[];
-  conflictingProjectId?: string;
-  conflictingProjectAliases?: string[];
-}
-
 export interface ProjectCatalog {
   list(): Promise<ProjectRecord[]>;
-  register(path: string): Promise<ProjectRecord>;
+  register(path: string, options?: ProjectRegistrationOptions): Promise<ProjectRecord>;
   /**
    * Resolve a path recorded by an existing session rather than chosen by the
    * user. Unlike `register`, the directory may already be gone — a session
@@ -67,16 +106,31 @@ export interface ProjectCatalog {
   resolveHistoricalPath(path: string, usedAt?: number): Promise<ProjectRecord>;
   select(projectId: string): Promise<{ project: ProjectRecord; path: string }>;
   touch(projectId: string, path?: string): Promise<ProjectRecord>;
-  relink(
+  relink(projectId: string, path: string): Promise<ProjectRecord>;
+  relinkWithSessions(
     projectId: string,
     path: string,
-    beforeCommit?: (context: ProjectRelinkContext) => Promise<void>,
-  ): Promise<ProjectRecord>;
+  ): Promise<{ project: ProjectRecord; updatedSessionIds: readonly string[] }>;
   rename(projectId: string, name: string): Promise<ProjectRecord>;
   archive(projectId: string): Promise<ProjectRecord>;
   restore(projectId: string): Promise<ProjectRecord>;
   /** Release this catalog's share of the operational database. */
   close(): void;
+}
+
+export interface ProjectRegistrationOptions {
+  /**
+   * Require the final canonical location persisted by the catalog to remain
+   * inside this directory. The check happens after path resolution so a
+   * pathname replaced between authorization and registration cannot escape
+   * its published boundary.
+   */
+  readonly withinRoot?: string;
+  /**
+   * Whether an additional location should be recorded as recently used. A new
+   * project still establishes its sole location as the initial preference.
+   */
+  readonly prefer?: boolean;
 }
 
 interface PersistedProject {
@@ -103,16 +157,14 @@ export function createProjectCatalog(
   deps: {
     now?: () => number;
     createId?: () => string;
-    /** Report a `projects.json` that could not be imported; the catalog still opens. */
-    onLegacyImportFailure?: (error: unknown) => void;
+    relinkFailpoint?: (stage: 'after_session_updates') => void;
   } = {},
 ): ProjectCatalog {
   return new SqliteProjectCatalog(
     acquireOperationalStateDatabase(storageRoot),
-    join(storageRoot, 'projects.json'),
     deps.now ?? Date.now,
     deps.createId ?? randomUUID,
-    deps.onLegacyImportFailure ?? (() => {}),
+    deps.relinkFailpoint,
   );
 }
 
@@ -129,14 +181,12 @@ export function createProjectCatalog(
  */
 class SqliteProjectCatalog implements ProjectCatalog {
   private queue: Promise<void> = Promise.resolve();
-  private legacyImport: Promise<void> | undefined;
 
   constructor(
     private readonly lease: OperationalStateDatabaseLease,
-    private readonly legacyPath: string,
     private readonly now: () => number,
     private readonly createId: () => string,
-    private readonly onLegacyImportFailure: (error: unknown) => void,
+    private readonly relinkFailpoint?: (stage: 'after_session_updates') => void,
   ) {}
 
   close(): void {
@@ -154,9 +204,12 @@ class SqliteProjectCatalog implements ProjectCatalog {
     return Promise.all(projects.map((project) => this.present(project)));
   }
 
-  async register(path: string): Promise<ProjectRecord> {
-    const resolved = await resolveProjectLocation({ path });
-    return this.upsertResolvedProject(resolved, this.now());
+  async register(path: string, options?: ProjectRegistrationOptions): Promise<ProjectRecord> {
+    const resolved = await resolveUserSelectedProjectLocation(path);
+    if (options?.withinRoot && !isPathWithin(options.withinRoot, resolved.canonicalPath)) {
+      throw new ProjectPathBoundaryError(resolved.canonicalPath);
+    }
+    return this.upsertResolvedProject(resolved, this.now(), options?.prefer !== false);
   }
 
   async resolveHistoricalPath(path: string, usedAt: number = this.now()): Promise<ProjectRecord> {
@@ -185,6 +238,7 @@ class SqliteProjectCatalog implements ProjectCatalog {
   private async upsertResolvedProject(
     resolved: ResolvedProjectLocation,
     timestamp: number,
+    prefer = true,
   ): Promise<ProjectRecord> {
     const registered = await this.mutate((file) => {
       const locationPath =
@@ -193,13 +247,13 @@ class SqliteProjectCatalog implements ProjectCatalog {
       if (existing) {
         const location = existing.locations.find((item) => item.path === locationPath);
         if (location) {
-          location.lastUsedAt = Math.max(location.lastUsedAt, timestamp);
+          if (prefer) location.lastUsedAt = Math.max(location.lastUsedAt, timestamp);
           location.isWorktree = resolved.git?.isWorktree ?? false;
         } else {
           existing.locations.push({
             path: locationPath,
             isWorktree: resolved.git?.isWorktree ?? false,
-            lastUsedAt: timestamp,
+            lastUsedAt: prefer ? timestamp : 0,
           });
         }
         existing.lastUsedAt = Math.max(existing.lastUsedAt, timestamp);
@@ -231,7 +285,7 @@ class SqliteProjectCatalog implements ProjectCatalog {
       // Probing the filesystem cannot happen inside the write transaction, so
       // availability is decided first and the choice is re-validated under it.
       const existing = findProjectById((await this.read()).projects, projectId);
-      if (!existing) throw new Error(`No such project: ${projectId}`);
+      if (!existing) throw new ProjectNotFoundError(projectId);
       const availablePaths = new Set(
         (
           await Promise.all(
@@ -243,14 +297,14 @@ class SqliteProjectCatalog implements ProjectCatalog {
       );
       [selected, selectedPath] = await this.mutate((file) => {
         const project = findProjectById(file.projects, projectId);
-        if (!project) throw new Error(`No such project: ${projectId}`);
+        if (!project) throw new ProjectNotFoundError(projectId);
         if (project.archivedAt !== undefined) {
-          throw new Error(`Project is archived: ${projectId}`);
+          throw new ProjectArchivedError(projectId);
         }
         const location = project.locations
           .filter((item) => availablePaths.has(item.path))
           .sort((a, b) => b.lastUsedAt - a.lastUsedAt || a.path.localeCompare(b.path))[0];
-        if (!location) throw new Error(`Project is unavailable: ${projectId}`);
+        if (!location) throw new ProjectUnavailableError(projectId);
         const timestamp = this.now();
         location.lastUsedAt = timestamp;
         project.lastUsedAt = timestamp;
@@ -262,22 +316,24 @@ class SqliteProjectCatalog implements ProjectCatalog {
   }
 
   async touch(projectId: string, path?: string): Promise<ProjectRecord> {
-    const resolved = path ? await resolveProjectLocation({ path }) : undefined;
-    const resolvedPath = resolved
-      ? resolved.kind === 'git'
-        ? resolved.git!.worktreeRoot
-        : resolved.canonicalPath
-      : undefined;
+    let canonicalPath: string | undefined;
+    if (path) {
+      try {
+        canonicalPath = normalize(await realpath(resolve(path)));
+      } catch {
+        throw new ProjectUnavailableError(projectId);
+      }
+    }
     const touched = await this.mutate((file) => {
       const project = findProjectById(file.projects, projectId);
-      if (!project) throw new Error(`No such project: ${projectId}`);
-      const location = resolvedPath
-        ? project.locations.find((item) => item.path === resolvedPath)
+      if (!project) throw new ProjectNotFoundError(projectId);
+      const location = canonicalPath
+        ? project.locations.find((item) => item.path === canonicalPath)
         : [...project.locations].sort(
             (a, b) => b.lastUsedAt - a.lastUsedAt || a.path.localeCompare(b.path),
           )[0];
-      if (resolvedPath && !location) {
-        throw new ProjectPathMismatchError(projectId, resolvedPath);
+      if (canonicalPath && !location) {
+        throw new ProjectPathMismatchError(projectId, canonicalPath);
       }
       const timestamp = this.now();
       if (location) location.lastUsedAt = timestamp;
@@ -287,78 +343,58 @@ class SqliteProjectCatalog implements ProjectCatalog {
     return this.present(touched);
   }
 
-  async relink(
-    projectId: string,
-    path: string,
-    beforeCommit?: (context: ProjectRelinkContext) => Promise<void>,
-  ): Promise<ProjectRecord> {
-    const resolved = await resolveProjectLocation({ path });
+  async relink(projectId: string, path: string): Promise<ProjectRecord> {
+    const resolved = await resolveUserSelectedProjectLocation(path);
     const timestamp = this.now();
-    let relinked: PersistedProject | undefined;
     const locationPath =
       resolved.kind === 'git' ? resolved.git!.worktreeRoot : resolved.canonicalPath;
-    await this.withQueue(async () => {
-      // `beforeCommit` reassigns the sessions of the project being merged away,
-      // so it cannot run inside the write transaction. It is shown the state it
-      // will act on, and the commit below refuses to proceed if that state no
-      // longer holds: re-deriving instead would leave the catalog consistent
-      // while the sessions the callback already moved point at the wrong owner.
-      const preview = await this.read();
-      const previewProject = findProjectById(preview.projects, projectId);
-      if (!previewProject) throw new Error(`No such project: ${projectId}`);
-      const previewConflict = preview.projects.find(
-        (item) => item.id !== previewProject.id && item.identity === resolved.identity,
+    const relinked = await this.mutate((file) => {
+      const project = findProjectById(file.projects, projectId);
+      if (!project) throw new ProjectNotFoundError(projectId);
+      const conflict = file.projects.find(
+        (item) => item.id !== project.id && item.identity === resolved.identity,
       );
-      if (previewConflict && !beforeCommit) {
-        throw new Error(`Project path already belongs to project: ${previewConflict.id}`);
-      }
-      await beforeCommit?.({
-        projectId: previewProject.id,
-        projectAliases: [...(previewProject.aliases ?? [])],
-        destinationPath: locationPath,
-        previousLocations: previewProject.locations.map((location) => ({ ...location })),
-        ...(previewConflict
-          ? {
-              conflictingProjectId: previewConflict.id,
-              conflictingProjectAliases: [...(previewConflict.aliases ?? [])],
-            }
-          : {}),
-      });
-      relinked = await this.mutate((file) => {
+      if (conflict) throw new ProjectPathConflictError(conflict.id);
+      return applyRelink(file, project, undefined, resolved, locationPath, timestamp);
+    });
+    return this.present(relinked);
+  }
+
+  async relinkWithSessions(
+    projectId: string,
+    path: string,
+  ): Promise<{ project: ProjectRecord; updatedSessionIds: readonly string[] }> {
+    const resolved = await resolveUserSelectedProjectLocation(path);
+    const timestamp = this.now();
+    const locationPath =
+      resolved.kind === 'git' ? resolved.git!.worktreeRoot : resolved.canonicalPath;
+    let committed:
+      | { readonly project: PersistedProject; readonly updatedSessionIds: readonly string[] }
+      | undefined;
+    await this.withQueue(async () => {
+      committed = this.lease.transaction('write', () => {
+        const file = this.selectCatalog();
         const project = findProjectById(file.projects, projectId);
-        if (!project) throw new Error(`No such project: ${projectId}`);
+        if (!project) throw new ProjectNotFoundError(projectId);
         const conflict = file.projects.find(
           (item) => item.id !== project.id && item.identity === resolved.identity,
         );
-        if (conflict && !beforeCommit) {
-          throw new Error(`Project path already belongs to project: ${conflict.id}`);
-        }
-        if (conflict?.id !== previewConflict?.id) {
-          throw new ProjectRelinkContentionError(projectId);
-        }
-        if (conflict) {
-          project.aliases = [
-            ...new Set([...(project.aliases ?? []), conflict.id, ...(conflict.aliases ?? [])]),
-          ];
-          file.projects = file.projects.filter((item) => item.id !== conflict.id);
-        }
-        project.identity = resolved.identity;
-        project.locations = [
-          {
-            path: locationPath,
-            isWorktree: resolved.git?.isWorktree ?? false,
-            lastUsedAt: timestamp,
-          },
-          ...(conflict?.locations
-            .filter((location) => location.path !== locationPath)
-            .map((location) => ({ ...location })) ?? []),
-        ];
-        project.lastUsedAt = Math.max(timestamp, conflict?.lastUsedAt ?? 0);
-        return project;
+        const context = relinkContext(project, conflict, locationPath);
+        const updatedSessionIds = reassignProjectSessions(this.lease, context, timestamp);
+        this.relinkFailpoint?.('after_session_updates');
+        const relinked = applyRelink(file, project, conflict, resolved, locationPath, timestamp);
+        this.replaceCatalog(normalizeProjectCatalogFile(file));
+        return {
+          project: relinked,
+          updatedSessionIds,
+        };
       });
     });
-    if (!relinked) throw new Error(`Failed to relink project: ${projectId}`);
-    return this.present(relinked);
+    if (!committed) throw new Error(`Failed to relink project and Sessions: ${projectId}`);
+    return {
+      project: await this.present(committed.project),
+      updatedSessionIds: committed.updatedSessionIds,
+    };
   }
 
   async rename(projectId: string, name: string): Promise<ProjectRecord> {
@@ -367,7 +403,7 @@ class SqliteProjectCatalog implements ProjectCatalog {
     return this.present(
       await this.mutate((file) => {
         const project = findProjectById(file.projects, projectId);
-        if (!project) throw new Error(`No such project: ${projectId}`);
+        if (!project) throw new ProjectNotFoundError(projectId);
         project.name = trimmed;
         return project;
       }),
@@ -378,7 +414,7 @@ class SqliteProjectCatalog implements ProjectCatalog {
     return this.present(
       await this.mutate((file) => {
         const project = findProjectById(file.projects, projectId);
-        if (!project) throw new Error(`No such project: ${projectId}`);
+        if (!project) throw new ProjectNotFoundError(projectId);
         project.archivedAt = this.now();
         return project;
       }),
@@ -389,7 +425,7 @@ class SqliteProjectCatalog implements ProjectCatalog {
     return this.present(
       await this.mutate((file) => {
         const project = findProjectById(file.projects, projectId);
-        if (!project) throw new Error(`No such project: ${projectId}`);
+        if (!project) throw new ProjectNotFoundError(projectId);
         delete project.archivedAt;
         return project;
       }),
@@ -426,7 +462,6 @@ class SqliteProjectCatalog implements ProjectCatalog {
   }
 
   private async read(): Promise<ProjectCatalogFile> {
-    await this.importLegacyCatalogOnce();
     return this.selectCatalog();
   }
 
@@ -443,7 +478,6 @@ class SqliteProjectCatalog implements ProjectCatalog {
    * `relink` await the filesystem mid-change and keep the two-phase form.
    */
   private async mutate<T>(change: (file: ProjectCatalogFile) => T): Promise<T> {
-    await this.importLegacyCatalogOnce();
     return this.lease.transaction('write', () => {
       const file = this.selectCatalog();
       const result = change(file);
@@ -545,47 +579,6 @@ class SqliteProjectCatalog implements ProjectCatalog {
     });
   }
 
-  /**
-   * `projects.json` predates the operational database and was left behind when
-   * the rest of the File stores were retired, so it still holds the only copy
-   * of every project name, relink alias and archive state. Importing it once is
-   * not legacy-format support: it recovers state this refactor would otherwise
-   * strand. The file is renamed rather than deleted so a failed upgrade stays
-   * inspectable, and a malformed file leaves SQLite untouched.
-   *
-   * An import that cannot complete — unreadable file, malformed contents, a
-   * read-only disk — is reported and then dropped rather than rethrown. SQLite
-   * is the authority now, so failing the import must not take the read path
-   * down with it; `projects.json` is still on disk to recover from by hand.
-   */
-  private importLegacyCatalogOnce(): Promise<void> {
-    this.legacyImport ??= (async () => {
-      try {
-        let raw: string;
-        try {
-          raw = await readFile(this.legacyPath, 'utf8');
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-          throw error;
-        }
-        const imported = normalizeProjectCatalogFile(JSON.parse(raw));
-        const occupied = this.lease.transaction(
-          'read',
-          () =>
-            this.lease.database.prepare('SELECT 1 AS found FROM projects LIMIT 1').get() !==
-            undefined,
-        );
-        if (!occupied) this.replaceCatalog(imported);
-        // Timestamped so a second upgrade attempt cannot overwrite the only
-        // remaining copy of a catalog that failed to import the first time.
-        await rename(this.legacyPath, `${this.legacyPath}.imported-${this.now()}`);
-      } catch (error) {
-        this.onLegacyImportFailure(error);
-      }
-    })();
-    return this.legacyImport;
-  }
-
   private withQueue(operation: () => Promise<void>): Promise<void> {
     const next = this.queue.then(operation, operation);
     this.queue = next.catch(() => {});
@@ -666,6 +659,119 @@ function findProjectById(
   return projects.find(
     (project) => project.id === projectId || project.aliases?.includes(projectId),
   );
+}
+
+interface ProjectSessionReassignment {
+  readonly projectId: string;
+  readonly projectAliases: readonly string[];
+  readonly destinationPath: string;
+  readonly previousLocations: readonly ProjectLocation[];
+  readonly conflictingProjectId?: string;
+  readonly conflictingProjectAliases?: readonly string[];
+}
+
+function relinkContext(
+  project: PersistedProject,
+  conflict: PersistedProject | undefined,
+  destinationPath: string,
+): ProjectSessionReassignment {
+  return {
+    projectId: project.id,
+    projectAliases: [...(project.aliases ?? [])],
+    destinationPath,
+    previousLocations: project.locations.map((location) => ({ ...location })),
+    ...(conflict
+      ? {
+          conflictingProjectId: conflict.id,
+          conflictingProjectAliases: [...(conflict.aliases ?? [])],
+        }
+      : {}),
+  };
+}
+
+function applyRelink(
+  file: ProjectCatalogFile,
+  project: PersistedProject,
+  conflict: PersistedProject | undefined,
+  resolved: ResolvedProjectLocation,
+  locationPath: string,
+  timestamp: number,
+): PersistedProject {
+  if (conflict) {
+    project.aliases = [
+      ...new Set([...(project.aliases ?? []), conflict.id, ...(conflict.aliases ?? [])]),
+    ];
+    file.projects = file.projects.filter((item) => item.id !== conflict.id);
+  }
+  project.identity = resolved.identity;
+  project.locations = [
+    {
+      path: locationPath,
+      isWorktree: resolved.git?.isWorktree ?? false,
+      lastUsedAt: timestamp,
+    },
+    ...(conflict?.locations
+      .filter((location) => location.path !== locationPath)
+      .map((location) => ({ ...location })) ?? []),
+  ];
+  project.lastUsedAt = Math.max(timestamp, conflict?.lastUsedAt ?? 0);
+  return project;
+}
+
+function reassignProjectSessions(
+  lease: OperationalStateDatabaseLease,
+  context: ProjectSessionReassignment,
+  committedAt: number,
+): readonly string[] {
+  const survivingIds = new Set([context.projectId, ...context.projectAliases]);
+  const conflictingIds = new Set([
+    ...(context.conflictingProjectId ? [context.conflictingProjectId] : []),
+    ...(context.conflictingProjectAliases ?? []),
+  ]);
+  const rows = lease.database
+    .prepare(
+      `SELECT session_id, payload_json, metadata_version
+       FROM session_metadata
+       ORDER BY session_id`,
+    )
+    .all() as Array<{
+    session_id: string;
+    payload_json: string;
+    metadata_version: number;
+  }>;
+  const update = lease.database.prepare(
+    `UPDATE session_metadata
+     SET payload_json = ?, metadata_version = ?, committed_at = ?
+     WHERE session_id = ? AND metadata_version = ?`,
+  );
+  const updatedSessionIds: string[] = [];
+  for (const row of rows) {
+    const header = decodePersistedSessionHeader(
+      markPersisted<SessionHeader>(JSON.parse(row.payload_json)),
+      row.session_id,
+    );
+    let patch: Pick<SessionHeader, 'cwd' | 'projectId'> | undefined;
+    if (header.projectId && survivingIds.has(header.projectId)) {
+      patch = { cwd: context.destinationPath, projectId: context.projectId };
+    } else if (header.projectId && conflictingIds.has(header.projectId)) {
+      patch = { cwd: header.cwd, projectId: context.projectId };
+    }
+    if (!patch) continue;
+    const next = normalizeSessionHeader({ ...header, ...patch }, row.session_id);
+    const nextVersion = row.metadata_version + 1;
+    const result = update.run(
+      JSON.stringify(next),
+      nextVersion,
+      committedAt,
+      row.session_id,
+      row.metadata_version,
+    );
+    if (result.changes !== 1) {
+      throw new Error(`Session metadata compare-and-set failed: ${row.session_id}`);
+    }
+    updatedSessionIds.push(row.session_id);
+  }
+  return updatedSessionIds;
 }
 
 function normalizeProjectLocation(value: unknown): PersistedProjectLocation {
@@ -755,6 +861,12 @@ export async function resolveProjectLocation(input: {
   path: string;
 }): Promise<ResolvedProjectLocation> {
   const canonicalPath = normalize(await realpath(resolve(input.path)));
+  // Regular files are not valid projects. Without this check, a file inside a
+  // Git worktree reaches `git -C <file> rev-parse ...`, whose numeric failure
+  // is not treated as an invalid path by the Host coordinator and drains it.
+  if (!(await stat(canonicalPath)).isDirectory()) {
+    throw new TypeError(`Project path is not a directory: ${canonicalPath}`);
+  }
   if (!(await hasEnclosingGitEntry(canonicalPath))) {
     return {
       canonicalPath,
@@ -771,32 +883,42 @@ export async function resolveProjectLocation(input: {
   };
 }
 
+/**
+ * A directory the user picked in the add/relink chooser.
+ *
+ * `resolveProjectLocation` still walks to the enclosing Git worktree so a
+ * historical session cwd inside a repository stays on that repository.
+ * The chooser must not do that: selecting `repo/child` would otherwise
+ * silently become `repo` and reopen the parent project.
+ */
+async function resolveUserSelectedProjectLocation(path: string): Promise<ResolvedProjectLocation> {
+  const resolved = await resolveProjectLocation({ path });
+  if (
+    resolved.kind !== 'git' ||
+    !resolved.git ||
+    resolved.canonicalPath === resolved.git.worktreeRoot
+  ) {
+    return resolved;
+  }
+  return {
+    canonicalPath: resolved.canonicalPath,
+    identity: `folder:${resolved.canonicalPath}`,
+    kind: 'folder',
+  };
+}
+
+function isPathWithin(root: string, candidate: string): boolean {
+  const path = relative(normalize(root), normalize(candidate));
+  return path === '' || (!isAbsolute(path) && path !== '..' && !path.startsWith(`..${sep}`));
+}
+
 async function resolveGitLocation(
   canonicalPath: string,
 ): Promise<NonNullable<ResolvedProjectLocation['git']>> {
-  const env: NodeJS.ProcessEnv = { ...process.env, GIT_OPTIONAL_LOCKS: '0' };
-  delete env.GIT_DIR;
-  delete env.GIT_WORK_TREE;
-  delete env.GIT_INDEX_FILE;
-  delete env.GIT_COMMON_DIR;
-  const { stdout: locationOutput } = await execFileAsync(
-    'git',
-    [
-      '-C',
-      canonicalPath,
-      'rev-parse',
-      '--path-format=absolute',
-      '--show-toplevel',
-      '--git-dir',
-      '--git-common-dir',
-    ],
-    {
-      env,
-      encoding: 'utf8',
-      maxBuffer: 64 * 1024,
-      timeout: 3_000,
-      windowsHide: true,
-    },
+  const locationOutput = await execGitText(
+    canonicalPath,
+    ['rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir'],
+    { maxBuffer: 64 * 1024, timeoutMs: 3_000 },
   );
   const [worktreeRootRaw, gitDirRaw, commonDirRaw] = locationOutput.trim().split(/\r?\n/);
   if (!worktreeRootRaw || !gitDirRaw || !commonDirRaw) {

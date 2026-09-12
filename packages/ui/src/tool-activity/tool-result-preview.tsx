@@ -1,24 +1,37 @@
-import { useEffect, useInsertionEffect, useMemo, useRef, type ReactNode } from 'react';
-import {
-  isShellOutput,
-  normalizeSearchUrl,
-  parseUnifiedDiffRows,
-  ptyHumanTerminalText,
-  readWriteStdinInputPreview,
-  type ShellOutput,
-  type ToolResultContent,
-} from '@maka/core';
-import { Button as UiButton, ensureHighlightStyles, type TokenLine } from '@astryxdesign/core';
-import { AlertCircle, Ban, Check, Clock, Copy, GitBranch, Loader2, Plug, ShieldAlert } from '../icons.js';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { useEffect, useRef, type ReactNode } from 'react';
+import { isShellOutput, type ShellOutput } from '@maka/core/shell-run';
+import { normalizeSearchUrl } from '@maka/core/search';
+import { ptyHumanTerminalText } from '@maka/core/pty-output-view';
+import { readWriteStdinInputPreview } from '@maka/core/tool-activity-args';
+import { type ToolResultContent } from '@maka/core/events';
+import { Button as UiButton, Link } from '@astryxdesign/core';
+import { ICON_SIZE, AlertCircle, Ban, Check, Clock, Copy, GitBranch, Loader2, Plug, ShieldAlert } from '../icons.js';
 import { redactSecrets } from '../redact.js';
 import { useClipboardCopyFeedback } from '../clipboard-feedback.js';
 import { useUiLocale } from '../locale-context.js';
 import { cn } from '../ui.js';
-import { previewVariants } from '../primitives/chat.js';
-import { AgentSwarmPreview, ExploreAgentPreview, SubagentPreview } from './agent-preview.js';
 import { formatQuietJsonValue } from './builtin-preview.js';
 import { ToolCodeBlock } from './tool-code-block.js';
-import { diffSyntaxTokens } from './diff-syntax.js';
+import { DiffCodePreview } from './diff-code-preview.js';
 import { TOOL_LINE_CAP, capLines, formatUserVisibleToolText } from './preview-utils.js';
 import { getToolActivityCopy } from './copy.js';
 import { isSandboxDeniedToolResult } from './sandbox-denial.js';
@@ -66,12 +79,16 @@ export function ToolOutputSurface(props: {
   kind: string;
   heading?: string;
   body?: string;
-  attention?: 'error' | 'warning';
+  actions?: ReactNode;
+  actionIdentity?: string;
   children: ReactNode;
 }) {
   const copyText = getToolActivityCopy(useUiLocale()).copy;
   const feedback = useClipboardCopyFeedback();
   const command = props.heading?.trim() ? props.heading : undefined;
+  const actionIdentity =
+    props.actionIdentity?.trim() ||
+    redactSecrets(command ?? '').trim().slice(0, 80);
   const copyPayload = [command, props.body].filter(Boolean).join('\n');
   // Each surface owns its own feedback hook, so the key never has to
   // distinguish one surface from another — it only has to be stable across
@@ -90,32 +107,31 @@ export function ToolOutputSurface(props: {
     <div
       data-slot="tool-output"
       data-kind={props.kind}
-      className={cn(
-        TOOL_OUTPUT_PANEL_CLASS,
-        props.attention === 'error' && 'maka-tool-output-destructive-border',
-        props.attention === 'warning' && 'maka-tool-output-warning-border',
-      )}
+      className={TOOL_OUTPUT_PANEL_CLASS}
     >
       {command && (
         <div className="maka-tool-output-command-row">
           <code className={TOOL_OUTPUT_COMMAND_CLASS}>{command}</code>
-          <UiButton
-            variant="ghost"
-            size="sm"
-            className="maka-tool-output-command-copy"
-            data-copy-feedback={phase ?? undefined}
-            // Icon-only: the heading already fills the row, and a word beside
-            // it would compete with the thing being copied. `label` is the
-            // accessible name in this mode.
-            isIconOnly
-            label={label}
-            aria-busy={phase === 'pending' ? 'true' : undefined}
-            isDisabled={phase === 'pending'}
-            onClick={() => void feedback.copy(copyKey, copyPayload)}
-            icon={phase === 'copied'
-              ? <Check size={14} aria-hidden="true" />
-              : <Copy size={14} aria-hidden="true" />}
-          />
+          <div className="maka-tool-output-command-actions">
+            {props.actions}
+            <UiButton
+              variant="ghost"
+              size="sm"
+              className="maka-tool-output-command-copy"
+              data-copy-feedback={phase ?? undefined}
+              // Icon-only: the heading already fills the row, and a word beside
+              // it would compete with the thing being copied. `label` is the
+              // accessible name in this mode.
+              isIconOnly
+              label={copyText.actionAriaLabel(label, actionIdentity)}
+              aria-busy={phase === 'pending' ? 'true' : undefined}
+              isDisabled={phase === 'pending'}
+              onClick={() => void feedback.copy(copyKey, copyPayload)}
+              icon={phase === 'copied'
+                ? <Check size={ICON_SIZE.control} aria-hidden="true" />
+                : <Copy size={ICON_SIZE.control} aria-hidden="true" />}
+            />
+          </div>
         </div>
       )}
       {props.children}
@@ -129,12 +145,21 @@ export function ToolResultPreview(props: {
   toolName?: string;
   args?: unknown;
   shellRunSource?: 'owned' | 'unavailable';
+  fileDiffActions?: ReactNode;
+  actionIdentity?: string;
 }) {
   const { content } = props;
   const locale = useUiLocale();
 
   if (content.kind === 'file_diff') {
-    return <FileDiffPreview diff={content.diff} paths={content.paths} />;
+    return (
+      <FileDiffPreview
+        diff={content.diff}
+        paths={content.paths}
+        actions={props.fileDiffActions}
+        actionIdentity={props.actionIdentity}
+      />
+    );
   }
 
   if (content.kind === 'web_search') {
@@ -165,25 +190,20 @@ export function ToolResultPreview(props: {
         failureMessage={content.failureMessage}
         output={isShellOutput(content.output) ? content.output : undefined}
         sandboxBlocked={isSandboxDeniedToolResult(content)}
+        actionIdentity={props.actionIdentity}
       />
     );
   }
 
   if (content.kind === 'shell_run') {
     if (props.toolName === 'WriteStdin') return <PtyControlPreview result={content} args={props.args} />;
-    return <ShellRunPreview result={content} source={props.shellRunSource} />;
-  }
-
-  if (content.kind === 'explore_agent') {
-    return <ExploreAgentPreview result={content} />;
-  }
-
-  if (content.kind === 'subagent') {
-    return <SubagentPreview result={content} />;
-  }
-
-  if (content.kind === 'agent_swarm') {
-    return <AgentSwarmPreview result={content} />;
+    return (
+      <ShellRunPreview
+        result={content}
+        source={props.shellRunSource}
+        actionIdentity={props.actionIdentity}
+      />
+    );
   }
 
   if (content.kind === 'rive_workflow') {
@@ -198,6 +218,7 @@ export function ToolResultPreview(props: {
         <ToolCodeBlock
           code={formatUserVisibleToolText(quiet.body, locale)}
           title={quiet.headline ? formatUserVisibleToolText(quiet.headline, locale) : undefined}
+          actionIdentity={props.actionIdentity}
         />
       </div>
     );
@@ -209,7 +230,7 @@ export function ToolResultPreview(props: {
     const code = capped > 0 ? `${body}\n\n${copy.hiddenLines(capped)}` : body;
     return (
       <div data-kind="text">
-        <ToolCodeBlock code={code} />
+        <ToolCodeBlock code={code} actionIdentity={props.actionIdentity} />
       </div>
     );
   }
@@ -217,15 +238,19 @@ export function ToolResultPreview(props: {
   // image / summary / unknown — show a compact descriptor so the user knows
   // what kind landed without dumping binary or storage refs.
   if (content.kind === 'file_write') {
+    const copy = getToolActivityCopy(locale).result;
     return (
       <div data-kind={content.kind}>
-        <ToolCodeBlock code={`Wrote ${content.bytes} bytes to ${content.path}`} />
+        <ToolCodeBlock
+          code={copy.fileWritten(content.bytes, content.path)}
+          actionIdentity={props.actionIdentity}
+        />
       </div>
     );
   }
   return (
     <div data-kind={content.kind}>
-      <ToolCodeBlock code={`[${content.kind}]`} />
+      <ToolCodeBlock code={`[${content.kind}]`} actionIdentity={props.actionIdentity} />
     </div>
   );
 }
@@ -270,28 +295,6 @@ function PtyControlPreview(props: {
 }
 
 /**
- * Which tint a unified-diff line takes. Deliberately shallow: it reads the
- * line's first character, not the hunk semantics, which is all the colouring
- * needs and all a preview should promise.
- *
- * `+++`/`---` are file markers, not an addition and a deletion — they have to
- * be tested before the single-character cases or every diff opens with one
- * green and one red line that mean nothing.
- */
-export function diffLineKind(line: string): 'add' | 'del' | 'hunk' | 'meta' | 'ctx' {
-  // The trailing space is what separates a file marker from content: unified
-  // diff writes `--- a/path`, never a bare `---`. Without it, deleting a YAML
-  // document separator or an SQL `--` comment paints the removal as a header —
-  // the one line the reader most needs to see as red.
-  if (line.startsWith('--- ') || line.startsWith('+++ ')) return 'meta';
-  if (line.startsWith('@@')) return 'hunk';
-  if (line.startsWith('+')) return 'add';
-  if (line.startsWith('-')) return 'del';
-  if (line.startsWith('diff ') || line.startsWith('index ')) return 'meta';
-  return 'ctx';
-}
-
-/**
  * Line-level diff colouring — green additions, red deletions, a tinted hunk
  * header — in the same surface a command uses, with the changed paths as its
  * heading.
@@ -310,140 +313,27 @@ export function diffLineKind(line: string): 'add' | 'del' | 'hunk' | 'meta' | 'c
  * `diff-syntax.ts`); the tint and the marker carry add/del between them, so
  * the code no longer has to be uniformly green or red to say which it is.
  */
-type DiffPreviewRow = {
-  kind: 'add' | 'del' | 'ctx' | 'meta';
-  /** `+`, `-`, or empty — the marker column, split out of the line's text. */
-  marker: string;
-  /** The line without its marker: the source the syntax colouring applies to. */
-  code: string;
-  lineNumber?: number;
-};
-
-/**
- * Display rows for the gutter, from the shared structural parse in
- * `@maka/core`: hunk headers are consumed into the line numbers (a deletion
- * shows its old-side number, additions and context the new-side one) and file
- * headers never survive the parse — so a deleted SQL `-- a` comment can no
- * longer be mistaken for one. A foreign diff with no hunk headers degrades
- * to unnumbered meta rows.
- *
- * The marker is split off here rather than left in the text. Inline, it cost
- * the reader twice: it ate the first column, so an addition's indentation no
- * longer lined up with the context around it, and it sat flush against the
- * code with no separation — `+# Tool result diffs` reads as one token. Split
- * out, it is a column of its own and the code beside it starts where the file
- * says it does.
- */
-function diffPreviewRows(lines: string[]): DiffPreviewRow[] {
-  return parseUnifiedDiffRows(lines.join('\n')).flatMap((row): DiffPreviewRow[] => {
-    if (row.kind === 'hunk') return [];
-    // Meta is not source — `diff --git a/x b/x`, `\ No newline at end of
-    // file`. It carries no marker and takes no colouring.
-    if (row.kind === 'meta') return [{ kind: 'meta' as const, marker: '', code: row.text }];
-    const lineNumber = row.kind === 'del' ? row.oldLine : row.newLine;
-    // Context carries a leading space, which some generators drop on a blank
-    // line; add/del always carry their sign.
-    const marker = row.kind === 'ctx' ? '' : row.text.slice(0, 1);
-    const code = row.kind === 'ctx' ? row.text.replace(/^ /, '') : row.text.slice(1);
-    return [
-      { kind: row.kind, marker, code, ...(lineNumber !== undefined ? { lineNumber } : {}) },
-    ];
-  });
-}
-
-/**
- * One row's code, split into `astryx-token-*` spans at the tokenizer's
- * boundaries. Text between tokens (and all of it when the language is unknown)
- * stays a plain string, so an uncoloured diff renders exactly the nodes it
- * used to.
- */
-function highlightedCode(code: string, tokens: TokenLine | undefined): ReactNode {
-  if (!tokens || tokens.length === 0) return code;
-  const parts: ReactNode[] = [];
-  let cursor = 0;
-  for (const token of tokens) {
-    // A token can end past its own line: the JS block-comment pattern is
-    // `/\*[\s\S]*?\*\//`, which happily matches across newlines in the joined
-    // buffer, so a diff row that opens `/*` returns a token reaching into the
-    // rows below. Clamping keeps the row's text exact — dropping or repeating
-    // source to preserve a colour would be the wrong trade.
-    const end = Math.min(token.end, code.length);
-    if (token.start < cursor || end <= token.start) continue;
-    if (token.start > cursor) parts.push(code.slice(cursor, token.start));
-    parts.push(
-      <span key={token.start} className={`astryx-token-${token.type}`}>
-        {code.slice(token.start, end)}
-      </span>,
-    );
-    cursor = end;
-  }
-  if (cursor < code.length) parts.push(code.slice(cursor));
-  return parts;
-}
-
-function FileDiffPreview(props: { diff: string; paths: string[] }) {
+function FileDiffPreview(props: {
+  diff: string;
+  paths: string[];
+  actions?: ReactNode;
+  actionIdentity?: string;
+}) {
   const copy = getToolActivityCopy(useUiLocale()).result;
-  // Astryx injects the `astryx-token-*` rules on first use of a code surface;
-  // a diff can be the first one on screen, so it has to ask for them itself.
-  // Insertion effect, like Astryx's own span-mode code element, so the sheet
-  // is in place before the spans paint.
-  useInsertionEffect(() => {
-    ensureHighlightStyles();
-  }, []);
   // Apply UI-level redaction then cap the displayed lines. Both are
   // @kenji's PR76 review items: never echo a token a tool happened to dump
   // into a diff (commit body, .env file diff, etc.), and never let a
   // 10k-line diff create 10k React elements.
   const { body, capped } = capLines(redactSecrets(props.diff));
-  // The copyable body keeps the full standard diff; the rendered rows come
-  // from the structural parse, which drops the redundant file headers.
-  const rows = useMemo(() => {
-    // A diff arrives newline-terminated, and splitting one leaves a trailing
-    // empty field. As flat text that was invisible; as one element per line it
-    // is a blank tinted row at the end of every diff.
-    const lines = body.split('\n');
-    if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
-    return diffPreviewRows(lines);
-  }, [body]);
-  // Tokenizing is a regex sweep over up to TOOL_LINE_CAP lines; it depends on
-  // nothing but the rows and the paths, so it runs once per distinct diff
-  // rather than once per expand/collapse render.
-  const tokenLines = useMemo(
-    () => diffSyntaxTokens(props.paths, rows.map((row) => row.code)),
-    [rows, props.paths],
-  );
-  const numbered = rows.some((row) => row.lineNumber !== undefined);
-  const digits = numbered
-    ? String(rows.reduce((max, row) => Math.max(max, row.lineNumber ?? 0), 0)).length
-    : 0;
   return (
     <ToolOutputSurface
       kind="file_diff"
       heading={props.paths.length > 0 ? props.paths.join(', ') : undefined}
       body={body}
+      actions={props.actions}
+      actionIdentity={props.actionIdentity}
     >
-      <pre className={previewVariants({ part: 'diff-body' })}>
-        {rows.map((row, index) => (
-          <span
-            // Index keys: the list is a re-split of one immutable string, so a
-            // line's position is its identity.
-            key={index}
-            className={previewVariants({ part: 'diff-line' })}
-            data-line={row.kind}
-          >
-            {numbered && (
-              <span className="maka-tool-diff-gutter" style={{ minWidth: `${digits}ch` }}>
-                {row.lineNumber ?? ''}
-              </span>
-            )}
-            <span className="maka-tool-diff-marker">{row.marker}</span>
-            <span className="maka-tool-diff-code">
-              {row.kind === 'meta' ? row.code : highlightedCode(row.code, tokenLines[index])}
-            </span>
-            {'\n'}
-          </span>
-        ))}
-      </pre>
+      <DiffCodePreview diff={body} paths={props.paths} />
       {capped > 0 && (
         <p className={TOOL_OUTPUT_NOTE_CLASS}>{copy.hiddenLines(capped)}</p>
       )}
@@ -459,6 +349,7 @@ function TerminalPreview(props: {
   failureMessage?: string;
   output?: ShellOutput;
   sandboxBlocked?: boolean;
+  actionIdentity?: string;
 }) {
   const activityCopy = getToolActivityCopy(useUiLocale());
   const copy = activityCopy.result;
@@ -472,7 +363,7 @@ function TerminalPreview(props: {
       kind="terminal"
       heading={safeCmd}
       body={props.output ? shellOutputText(props.output, copy) : undefined}
-      attention={props.sandboxBlocked ? 'warning' : succeeded ? undefined : 'error'}
+      actionIdentity={props.actionIdentity}
     >
       {props.output ? (
         <ShellOutputBody output={props.output} failed={!succeeded} />
@@ -510,6 +401,7 @@ function TerminalPreview(props: {
 function ShellRunPreview(props: {
   result: Extract<ToolResultContent, { kind: 'shell_run' }>;
   source?: 'owned' | 'unavailable';
+  actionIdentity?: string;
 }) {
   const locale = useUiLocale();
   const copy = getToolActivityCopy(locale).result;
@@ -517,7 +409,6 @@ function ShellRunPreview(props: {
   const sandboxBlocked = isSandboxDeniedToolResult(result);
   const safeCmd = redactSecrets(result.cmd);
   const output = isShellOutput(result.output) ? result.output : undefined;
-  const attention = result.status === 'failed' || result.status === 'orphaned' || (result.exitCode !== undefined && result.exitCode !== 0);
 
   if (result.mode === 'pty') {
     return (
@@ -525,7 +416,6 @@ function ShellRunPreview(props: {
         result={result}
         output={output?.mode === 'pty' ? output : undefined}
         safeCmd={safeCmd}
-        attention={attention}
         sandboxBlocked={sandboxBlocked}
         source={props.source}
       />
@@ -546,7 +436,7 @@ function ShellRunPreview(props: {
       kind="shell_run"
       heading={safeCmd}
       body={pipeOutput ? shellOutputText(pipeOutput, copy) : undefined}
-      attention={attention ? (sandboxBlocked ? 'warning' : 'error') : undefined}
+      actionIdentity={props.actionIdentity}
     >
       <p className={TOOL_OUTPUT_NOTE_CLASS}>
         {statusLabel}
@@ -574,7 +464,6 @@ function PtyShellSurface(props: {
   result: Extract<ToolResultContent, { kind: 'shell_run' }>;
   output?: Extract<ShellOutput, { mode: 'pty' }>;
   safeCmd: string;
-  attention: boolean;
   sandboxBlocked: boolean;
   source?: 'owned' | 'unavailable';
 }) {
@@ -584,15 +473,7 @@ function PtyShellSurface(props: {
     <div
       data-slot="tool-output"
       data-kind="pty-shell"
-      className={cn(
-        TOOL_OUTPUT_PANEL_CLASS,
-        'maka-pty-shell',
-        props.attention && (
-          props.sandboxBlocked
-            ? 'maka-tool-output-warning-border'
-            : 'maka-tool-output-destructive-border'
-        ),
-      )}
+      className={cn(TOOL_OUTPUT_PANEL_CLASS, 'maka-pty-shell')}
     >
       <header className="maka-pty-shell-header">
         <span className="maka-pty-shell-title">
@@ -641,26 +522,26 @@ function ShellRunStatus(props: {
 }) {
   const activityCopy = getToolActivityCopy(useUiLocale());
   const copy = activityCopy.result;
-  if (props.source === 'owned') return <><GitBranch size={15} aria-hidden="true" />{copy.managedBySource}</>;
-  if (props.source === 'unavailable') return <><GitBranch size={15} aria-hidden="true" />{copy.sourceUnavailable}</>;
+  if (props.source === 'owned') return <><GitBranch size={ICON_SIZE.control} aria-hidden="true" />{copy.managedBySource}</>;
+  if (props.source === 'unavailable') return <><GitBranch size={ICON_SIZE.control} aria-hidden="true" />{copy.sourceUnavailable}</>;
   const suffix = props.exitCode !== undefined && props.exitCode !== 0 ? ` · ${copy.exitCode(props.exitCode)}` : '';
   if (props.sandboxBlocked) {
-    return <><ShieldAlert size={15} aria-hidden="true" />{activityCopy.status.sandboxBlocked}{suffix}</>;
+    return <><ShieldAlert size={ICON_SIZE.control} aria-hidden="true" />{activityCopy.status.sandboxBlocked}{suffix}</>;
   }
   switch (props.status) {
     case 'starting':
     case 'running':
-      return <><Loader2 size={15} aria-hidden="true" className="maka-spin" />{copy.running}</>;
+      return <><Loader2 size={ICON_SIZE.control} aria-hidden="true" className="maka-spin" />{copy.running}</>;
     case 'completed':
-      return <><Check size={15} aria-hidden="true" />{copy.success}</>;
+      return <><Check size={ICON_SIZE.control} aria-hidden="true" />{copy.success}</>;
     case 'failed':
-      return <><AlertCircle size={15} aria-hidden="true" />{copy.failed}{suffix}</>;
+      return <><AlertCircle size={ICON_SIZE.control} aria-hidden="true" />{copy.failed}{suffix}</>;
     case 'timed_out':
-      return <><Clock size={15} aria-hidden="true" />{copy.timedOut}{suffix}</>;
+      return <><Clock size={ICON_SIZE.control} aria-hidden="true" />{copy.timedOut}{suffix}</>;
     case 'cancelled':
-      return <><Ban size={15} aria-hidden="true" />{copy.cancelled}{suffix}</>;
+      return <><Ban size={ICON_SIZE.control} aria-hidden="true" />{copy.cancelled}{suffix}</>;
     case 'orphaned':
-      return <><Plug size={15} aria-hidden="true" />{copy.disconnected}</>;
+      return <><Plug size={ICON_SIZE.control} aria-hidden="true" />{copy.disconnected}</>;
   }
 }
 
@@ -768,7 +649,7 @@ function isCancelledStatus(status: string | undefined): boolean {
   return status === 'cancelled';
 }
 
-function shellRunStatusLabel(status: string, locale: import('@maka/core').UiLocale): string {
+function shellRunStatusLabel(status: string, locale: import('@maka/core/ui-locale').UiLocale): string {
   const copy = getToolActivityCopy(locale).result;
   const label = (copy.backgroundStatus as Readonly<Record<string, string>>)[status];
   return label ?? copy.backgroundUnknown(status);
@@ -804,7 +685,7 @@ function RiveWorkflowPreview(props: {
     result.stderrTail ? `stderr_tail:\n${result.stderrTail}` : '',
   ].filter(Boolean);
   const body = [
-    result.ok ? 'Rive workflow completed' : 'Rive workflow failed',
+    result.ok ? copy.workflowCompleted : copy.workflowFailed,
     result.summary,
     '',
     ...rows.map(([label, value]) => `${label}: ${value}`),
@@ -874,13 +755,9 @@ function WebSearchPreview(props: {
       <ul className="maka-web-result-list">
         {rows.map((row, idx) => (
           <li key={`${row.url}-${idx}`}>
-            <a
-              href={row.url}
-              target="_blank"
-              rel="noreferrer noopener"
-            >
+            <Link href={row.url} isExternalLink>
               {redactSecrets(row.title)}
-            </a>
+            </Link>
             <small>{redactSecrets(row.source)}</small>
             <p>{redactSecrets(row.snippet)}</p>
           </li>

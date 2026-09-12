@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import { fork, type ChildProcess } from 'node:child_process';
 import {
@@ -15,24 +34,37 @@ import {
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import type { ArtifactRecord } from '@maka/core/artifacts';
 import {
-  openHeadlessArtifactStoreForWrite as openHeadlessArtifactStoreForWriteRaw,
-  type HeadlessArtifactStoreWriter,
+  openInteractiveArtifactStoreForWrite as openInteractiveArtifactStoreForWriteRaw,
+  type InteractiveArtifactStoreWriter,
 } from '../artifact-stores.js';
 import {
-  type ArtifactStore,
+  type ArtifactAuthorityStore,
   type CreateArtifactInput,
-  createSqliteArtifactStore,
+  createSqliteArtifactStoreWriteAuthority,
 } from '../artifact-store.js';
 import { withArtifactWriterLock } from '../artifact-writer-lock.js';
-import { createHeadlessRootLease, resolveStorageRoot } from '../root-authority.js';
+import {
+  resolveStorageRoot,
+  tryAcquireInteractiveRootOwner,
+  type StorageRootLease,
+} from '../root-authority.js';
 import { exportSessionBundleState } from '../session-bundle-policy.js';
 import { createSessionStore } from '../session-store.js';
+import {
+  removeTrackedControlDirectories,
+  trackControlDirectory,
+} from './fixtures/control-directory-hygiene.js';
+
+// The control directory of each resolved root lives outside that root, so a
+// temporary root's removal leaves it behind; reclaim the recorded rootIds here.
+after(removeTrackedControlDirectories);
 
 const TEST_TIMEOUT_MS = 15_000;
 const OPERATION_TIMEOUT_MS = 5_000;
+const BUNDLE_EXPORT_TIMEOUT_MS = 10_000;
 const COMPETING_PAYLOAD_BYTES = 4 * 1024 * 1024;
 // Windows does not permit replacing or deleting a directory while SQLite has files open in it.
 // These tests exercise POSIX root-replacement semantics; Windows coverage verifies cleanup after
@@ -40,18 +72,26 @@ const COMPETING_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const SKIP_OPEN_SQLITE_ROOT_REPLACEMENT = process.platform === 'win32';
 const artifactStoreClosersByRoot = new Map<string, Set<() => void>>();
 
-function createArtifactStore(root: string): ArtifactStore {
-  const store = createSqliteArtifactStore(root);
+function createArtifactStore(root: string): ArtifactAuthorityStore {
+  const authority = createSqliteArtifactStoreWriteAuthority(root);
   const closers = artifactStoreClosersByRoot.get(root) ?? new Set<() => void>();
-  closers.add(() => store.close?.());
+  closers.add(() => authority.close());
   artifactStoreClosersByRoot.set(root, closers);
-  return store;
+  return authority.store;
 }
 
-async function openHeadlessArtifactStoreForWrite(
-  lease: Parameters<typeof openHeadlessArtifactStoreForWriteRaw>[0],
-): Promise<HeadlessArtifactStoreWriter> {
-  const store = await openHeadlessArtifactStoreForWriteRaw(lease);
+async function listArtifacts(store: ArtifactAuthorityStore, sessionId: string) {
+  return (await store.listPage(sessionId, { offset: 0, limit: Number.MAX_SAFE_INTEGER })).records;
+}
+
+function readArtifactText(store: ArtifactAuthorityStore, artifactId: string) {
+  return store.readTextInSession('session-1', artifactId);
+}
+
+async function openInteractiveArtifactStoreForWrite(
+  lease: StorageRootLease<'interactive', 'write'>,
+): Promise<InteractiveArtifactStoreWriter> {
+  const store = await openInteractiveArtifactStoreForWriteRaw(lease);
   const root = lease.canonicalPath;
   const closers = artifactStoreClosersByRoot.get(root) ?? new Set<() => void>();
   closers.add(() => store.close());
@@ -67,7 +107,7 @@ function closeArtifactStoresUnder(root: string): void {
   }
 }
 
-test('public Store mutation waits for a child-held writer lock and preserves metadata', {
+test('unleased write authority waits for a child-held writer lock and preserves metadata', {
   timeout: TEST_TIMEOUT_MS,
 }, async () => {
   await withTemporaryDirectory(async (root) => {
@@ -82,7 +122,9 @@ test('public Store mutation waits for a child-held writer lock and preserves met
       await withTimeout(mutation, OPERATION_TIMEOUT_MS, 'Store mutation');
 
       assert.deepEqual(
-        (await createArtifactStore(stateRoot).list('session-1')).map((record) => record.id).sort(),
+        (await listArtifacts(createArtifactStore(stateRoot), 'session-1'))
+          .map((record) => record.id)
+          .sort(),
         ['after-lock', 'seed'],
       );
     } finally {
@@ -91,7 +133,7 @@ test('public Store mutation waits for a child-held writer lock and preserves met
   });
 });
 
-test('public Store mutations in separate processes reload and publish under one OS lock', {
+test('unleased write authorities in separate processes reload and publish under one OS lock', {
   timeout: TEST_TIMEOUT_MS,
 }, async () => {
   await withTemporaryDirectory(async (root) => {
@@ -99,7 +141,7 @@ test('public Store mutations in separate processes reload and publish under one 
     const seedRecord = await createArtifactStore(stateRoot).create(artifactInput('seed'));
 
     const parentStore = createArtifactStore(stateRoot);
-    await parentStore.list('session-1');
+    await listArtifacts(parentStore, 'session-1');
     const child = await spawnPublicWriter(stateRoot, 'session-1');
     const holder = await spawnLockHolder(stateRoot);
     try {
@@ -116,21 +158,24 @@ test('public Store mutations in separate processes reload and publish under one 
       const [parentRecord, childCreated] = await withTimeout(
         Promise.all([parentMutation, childMutation.created]),
         OPERATION_TIMEOUT_MS,
-        'competing public Store mutations',
+        'competing unleased write authority mutations',
       );
       await withTimeout(waitForExit(child), OPERATION_TIMEOUT_MS, 'public writer shutdown');
 
       const freshStore = createArtifactStore(stateRoot);
-      const records = (await freshStore.list('session-1')).sort(compareRecordsById);
+      const records = [...(await listArtifacts(freshStore, 'session-1'))].sort(compareRecordsById);
       assert.deepEqual(
         records,
         [seedRecord, parentRecord, childCreated.record].sort(compareRecordsById),
       );
-      assert.deepEqual(await freshStore.readText('parent-public'), {
+      assert.deepEqual(await readArtifactText(freshStore, 'parent-public'), {
         ok: true,
         text: parentPayload,
       });
-      assert.deepEqual(await freshStore.readText('child-public'), { ok: true, text: childPayload });
+      assert.deepEqual(await readArtifactText(freshStore, 'child-public'), {
+        ok: true,
+        text: childPayload,
+      });
     } finally {
       await stopHolder(child);
       await stopHolder(holder);
@@ -138,17 +183,19 @@ test('public Store mutations in separate processes reload and publish under one 
   });
 });
 
-test('public Store mutations share the rootId writer lock used by lease-bound authority', {
+test('unleased writes share the rootId writer lock used by lease-bound authority', {
   timeout: TEST_TIMEOUT_MS,
 }, async () => {
   await withTemporaryDirectory(async (root) => {
     const stateRoot = join(root, 'state');
     await mkdir(stateRoot);
-    const capability = await resolveStorageRoot({ path: stateRoot, kind: 'headless' });
+    const capability = trackControlDirectory(
+      await resolveStorageRoot({ path: stateRoot, kind: 'interactive' }),
+    );
     const holder = await spawnAuthorityLockHolder(stateRoot, capability.rootId);
     try {
       const mutation = createArtifactStore(stateRoot).create(artifactInput('public-marked-root'));
-      await assertPending(mutation, 'public Store mutation on a marked root');
+      await assertPending(mutation, 'unleased write authority mutation on a marked root');
 
       await releaseHolder(holder);
       assert.equal(
@@ -156,7 +203,7 @@ test('public Store mutations share the rootId writer lock used by lease-bound au
           await withTimeout(
             mutation,
             OPERATION_TIMEOUT_MS,
-            'public Store mutation on a marked root',
+            'unleased write authority mutation on a marked root',
           )
         ).id,
         'public-marked-root',
@@ -178,13 +225,13 @@ test('mutations spanning initial root marking remain serialized by the bootstrap
       const firstMutation = createArtifactStore(stateRoot).create(
         artifactInput('before-root-marking'),
       );
-      await assertPending(firstMutation, 'public mutation started before root marking');
+      await assertPending(firstMutation, 'unleased mutation started before root marking');
 
-      await resolveStorageRoot({ path: stateRoot, kind: 'headless' });
+      trackControlDirectory(await resolveStorageRoot({ path: stateRoot, kind: 'interactive' }));
       const secondMutation = createArtifactStore(stateRoot).create(
         artifactInput('after-root-marking', undefined, 2),
       );
-      await assertPending(secondMutation, 'public mutation started after root marking');
+      await assertPending(secondMutation, 'unleased mutation started after root marking');
 
       await releaseHolder(holder);
       await withTimeout(
@@ -194,15 +241,15 @@ test('mutations spanning initial root marking remain serialized by the bootstrap
       );
 
       const freshStore = createArtifactStore(stateRoot);
-      assert.deepEqual((await freshStore.list('session-1')).map((record) => record.id).sort(), [
-        'after-root-marking',
-        'before-root-marking',
-      ]);
-      assert.deepEqual(await freshStore.readText('before-root-marking'), {
+      assert.deepEqual(
+        (await listArtifacts(freshStore, 'session-1')).map((record) => record.id).sort(),
+        ['after-root-marking', 'before-root-marking'],
+      );
+      assert.deepEqual(await readArtifactText(freshStore, 'before-root-marking'), {
         ok: true,
         text: 'before-root-marking',
       });
-      assert.deepEqual(await freshStore.readText('after-root-marking'), {
+      assert.deepEqual(await readArtifactText(freshStore, 'after-root-marking'), {
         ok: true,
         text: 'after-root-marking',
       });
@@ -212,7 +259,7 @@ test('mutations spanning initial root marking remain serialized by the bootstrap
   });
 });
 
-test('public mutation rejects an unmarked replacement installed while waiting for bootstrap', {
+test('unleased mutation rejects an unmarked replacement installed while waiting for bootstrap', {
   timeout: TEST_TIMEOUT_MS,
   skip: SKIP_OPEN_SQLITE_ROOT_REPLACEMENT,
 }, async () => {
@@ -225,7 +272,10 @@ test('public mutation rejects an unmarked replacement installed while waiting fo
       const mutation = createArtifactStore(stateRoot).create(
         artifactInput('stale-public-replacement'),
       );
-      await assertPending(mutation, 'public mutation waiting for its captured bootstrap authority');
+      await assertPending(
+        mutation,
+        'unleased mutation waiting for its captured bootstrap authority',
+      );
 
       await rename(stateRoot, displacedRoot);
       await mkdir(stateRoot);
@@ -242,7 +292,7 @@ test('public mutation rejects an unmarked replacement installed while waiting fo
   });
 });
 
-test('public mutation through a retargeted alias stays bound to its verified canonical root', {
+test('unleased mutation through a retargeted alias stays bound to its verified canonical root', {
   timeout: TEST_TIMEOUT_MS,
 }, async () => {
   await withTemporaryDirectory(async (root) => {
@@ -251,19 +301,21 @@ test('public mutation through a retargeted alias stays bound to its verified can
     const alias = join(root, 'state-alias');
     await Promise.all([mkdir(stateRoot), mkdir(replacementRoot)]);
     await writeFile(join(replacementRoot, 'replacement-sentinel'), 'replacement');
-    const capability = await resolveStorageRoot({ path: stateRoot, kind: 'headless' });
+    const capability = trackControlDirectory(
+      await resolveStorageRoot({ path: stateRoot, kind: 'interactive' }),
+    );
     await createArtifactStore(stateRoot).create(artifactInput('seed'));
     await symlink(stateRoot, alias, process.platform === 'win32' ? 'junction' : 'dir');
     const store = createArtifactStore(alias);
     assert.deepEqual(
-      (await store.list('session-1')).map((record) => record.id),
+      (await listArtifacts(store, 'session-1')).map((record) => record.id),
       ['seed'],
     );
 
     const holder = await spawnAuthorityLockHolder(stateRoot, capability.rootId);
     try {
       const mutation = store.create(artifactInput('alias-mutation', undefined, 2));
-      await assertPending(mutation, 'public mutation through the original alias target');
+      await assertPending(mutation, 'unleased mutation through the original alias target');
 
       await rm(alias, { force: true });
       await symlink(replacementRoot, alias, process.platform === 'win32' ? 'junction' : 'dir');
@@ -271,7 +323,9 @@ test('public mutation through a retargeted alias stays bound to its verified can
       assert.equal((await mutation).id, 'alias-mutation');
 
       assert.deepEqual(
-        (await createArtifactStore(stateRoot).list('session-1')).map((record) => record.id).sort(),
+        (await listArtifacts(createArtifactStore(stateRoot), 'session-1'))
+          .map((record) => record.id)
+          .sort(),
         ['alias-mutation', 'seed'],
       );
       assert.deepEqual(await readdir(replacementRoot), ['replacement-sentinel']);
@@ -289,18 +343,17 @@ test('admitted lease-bound mutations reject a replacement root without modifying
   await withTemporaryDirectory(async (root) => {
     const stateRoot = join(root, 'state');
     await mkdir(stateRoot);
-    const capability = await resolveStorageRoot({ path: stateRoot, kind: 'headless' });
-    const firstLease = createHeadlessRootLease(capability, 'write');
-    const secondLease = createHeadlessRootLease(capability, 'write');
-    const [firstStore, secondStore] = await Promise.all([
-      openHeadlessArtifactStoreForWrite(firstLease),
-      openHeadlessArtifactStoreForWrite(secondLease),
-    ]);
-    const holder = await spawnAuthorityLockHolder(stateRoot, capability.rootId);
+    const capability = trackControlDirectory(
+      await resolveStorageRoot({ path: stateRoot, kind: 'interactive' }),
+    );
+    const owner = await tryAcquireInteractiveRootOwner(capability);
+    assert.ok(owner);
+    const firstStore = await openInteractiveArtifactStoreForWrite(owner.lease);
+    const holder = await spawnLockHolder(stateRoot);
     const displacedRoot = join(root, 'displaced-state');
     try {
       const firstMutation = firstStore.create(artifactInput('stale-replacement-first'));
-      const secondMutation = secondStore.create(
+      const secondMutation = firstStore.create(
         artifactInput('stale-replacement-second', undefined, 2),
       );
       await Promise.all([
@@ -323,6 +376,7 @@ test('admitted lease-bound mutations reject a replacement root without modifying
       await assert.rejects(() => stat(join(stateRoot, 'artifacts')), { code: 'ENOENT' });
     } finally {
       await stopHolder(holder);
+      await owner.close();
     }
   });
 });
@@ -334,10 +388,13 @@ test('lease-bound mutation does not rebuild a root deleted while waiting for the
   await withTemporaryDirectory(async (root) => {
     const stateRoot = join(root, 'state');
     await mkdir(stateRoot);
-    const capability = await resolveStorageRoot({ path: stateRoot, kind: 'headless' });
-    const lease = createHeadlessRootLease(capability, 'write');
-    const store = await openHeadlessArtifactStoreForWrite(lease);
-    const holder = await spawnAuthorityLockHolder(stateRoot, capability.rootId);
+    const capability = trackControlDirectory(
+      await resolveStorageRoot({ path: stateRoot, kind: 'interactive' }),
+    );
+    const owner = await tryAcquireInteractiveRootOwner(capability);
+    assert.ok(owner);
+    const store = await openInteractiveArtifactStoreForWrite(owner.lease);
+    const holder = await spawnLockHolder(stateRoot);
     try {
       const mutation = store.create(artifactInput('stale-deleted'));
       await assertPending(mutation, 'lease-bound mutation');
@@ -349,6 +406,7 @@ test('lease-bound mutation does not rebuild a root deleted while waiting for the
       await assert.rejects(() => lstat(stateRoot), { code: 'ENOENT' });
     } finally {
       await stopHolder(holder);
+      await owner.close();
     }
   });
 });
@@ -383,20 +441,22 @@ test('bundle export excludes a mutation queued behind the same child-held writer
       await assertPending(mutation, 'Store mutation');
 
       await releaseHolder(holder);
-      await withTimeout(bundleExport, OPERATION_TIMEOUT_MS, 'bundle export');
+      await withTimeout(bundleExport, BUNDLE_EXPORT_TIMEOUT_MS, 'bundle export');
       await withTimeout(mutation, OPERATION_TIMEOUT_MS, 'Store mutation');
 
-      const exportedStore = createSqliteArtifactStore(destinationRoot);
+      const exportedStore = createArtifactStore(destinationRoot);
       try {
         assert.deepEqual(
-          (await exportedStore.list(session.id)).map((record) => record.id),
+          (await listArtifacts(exportedStore, session.id)).map((record) => record.id),
           ['seed'],
         );
       } finally {
         exportedStore.close?.();
       }
       assert.deepEqual(
-        (await createArtifactStore(stateRoot).list(session.id)).map((record) => record.id).sort(),
+        (await listArtifacts(createArtifactStore(stateRoot), session.id))
+          .map((record) => record.id)
+          .sort(),
         ['after-export', 'seed'],
       );
     } finally {
@@ -451,11 +511,15 @@ test('bundle export holds Artifact authority through selected-session projection
       await releaseHolder(holder);
       assert.equal(
         (
-          await withTimeout(projectedMessages, OPERATION_TIMEOUT_MS, 'selected-session projection')
+          await withTimeout(
+            projectedMessages,
+            BUNDLE_EXPORT_TIMEOUT_MS,
+            'selected-session projection',
+          )
         ).find((message) => message.type === 'user')?.text,
         'portable transcript',
       );
-      await withTimeout(bundleExport, OPERATION_TIMEOUT_MS, 'bundle export');
+      await withTimeout(bundleExport, BUNDLE_EXPORT_TIMEOUT_MS, 'bundle export');
     } finally {
       await stopHolder(holder);
     }
@@ -470,6 +534,7 @@ function artifactInput(id: string, content = id, now = 1): CreateArtifactInput {
     name: `${id}.txt`,
     kind: 'file' as const,
     content,
+    source: 'tool_result',
     now,
   };
 }
@@ -480,7 +545,7 @@ function sessionInput() {
     backend: 'fake' as const,
     llmConnectionSlug: 'fixture',
     model: 'fixture-model',
-    permissionMode: 'execute' as const,
+    permissionMode: 'ask' as const,
     name: 'Selected',
   };
 }

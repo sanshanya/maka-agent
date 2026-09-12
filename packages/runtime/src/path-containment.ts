@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { createHash } from 'node:crypto';
 import {
   lstat,
@@ -13,8 +32,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 
 /**
  * Shared filesystem-containment and identifier guards. This is the single
- * authority for path-containment checks across the runtime, the desktop main
- * process, and headless: both the pure-Node runtime and the desktop main (which
+ * authority for path-containment checks across Runtime and the desktop main:
+ * both the pure-Node runtime and the desktop main (which
  * already depends on `@maka/runtime`) reach it here without reverse
  * dependencies. {@link isPathInside} itself is a pure `node:path` predicate; the
  * canonicalisation and contained-I/O helpers around it touch the filesystem.
@@ -113,6 +132,43 @@ export async function realpathAllowMissing(target: string): Promise<string> {
       cursor = parent;
     }
   }
+}
+
+export interface CanonicalDirectoryEntryTarget {
+  root: string;
+  path: string;
+  existingAncestor: string;
+}
+
+/**
+ * Resolve a directory entry without following its final component. This is the
+ * shared identity for create/delete locking, permission checks, sandbox grants,
+ * and execution; content updates continue to use the followed target instead.
+ */
+export async function resolveCanonicalDirectoryEntryTarget(
+  cwd: string,
+  inputPath: string,
+): Promise<CanonicalDirectoryEntryTarget> {
+  const root = await realpath(cwd);
+  const requested = isAbsolute(inputPath) ? resolve(inputPath) : resolve(root, inputPath);
+  const parent = await realpathAllowMissing(dirname(requested));
+  let existingAncestor = parent;
+  while (true) {
+    try {
+      if ((await lstat(existingAncestor)).isDirectory()) break;
+    } catch (error) {
+      if (!isMissingPathError(error)) throw error;
+    }
+    const next = dirname(existingAncestor);
+    if (next === existingAncestor)
+      throw new Error(`No directory contains ${JSON.stringify(inputPath)}`);
+    existingAncestor = next;
+  }
+  return {
+    root,
+    path: resolve(parent, basename(requested)),
+    existingAncestor,
+  };
 }
 
 /** Dangling links followed by {@link realpathAllowMissing} before it gives up. */

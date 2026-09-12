@@ -1,52 +1,41 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import electronUpdater from 'electron-updater';
 import type { AppUpdater, UpdateCheckResult } from 'electron-updater';
 import type { ProgressInfo, UpdateInfo } from 'electron-updater';
+import type { DownloadedUpdateAttestationVerifier } from './app-update-attestation.js';
+import type { DesktopUpdateChannel } from './app-update-attestation.js';
+import { resolveUpdateFeedOverride } from './app-update-test-context.js';
+import type {
+  AppUpdateInstallRequest,
+  AppUpdateInstallResult,
+  AppUpdateProgress as SharedAppUpdateProgress,
+  AppUpdateStatus,
+} from '../shared/app-update.js';
 
-export type AppUpdateProgress = {
-  percent: number;
-  bytesPerSecond?: number;
-  transferred?: number;
-  total?: number;
-};
-
-export type AppUpdateStatus =
-  | { state: 'idle'; currentVersion: string }
-  | { state: 'checking'; currentVersion: string }
-  | { state: 'not-available'; currentVersion: string; latestVersion?: string }
-  | {
-      state: 'available';
-      currentVersion: string;
-      latestVersion: string;
-    }
-  | {
-      state: 'downloading';
-      currentVersion: string;
-      latestVersion: string;
-      progress: AppUpdateProgress;
-    }
-  | {
-      state: 'downloaded';
-      currentVersion: string;
-      latestVersion: string;
-    }
-  | { state: 'installing'; currentVersion: string; latestVersion: string }
-  | {
-      state: 'error';
-      currentVersion: string;
-      message: string;
-      operation: 'check' | 'download' | 'install';
-      latestVersion?: string;
-    };
-
-export type AppUpdateInstallRequest = {
-  /** User consent from the trusted desktop renderer; this is a UX boundary, not a security boundary. */
-  allowInterruptActiveTasks: boolean;
-};
-
-export type AppUpdateInstallResult =
-  | { ok: true }
-  | { ok: false; reason: 'active_tasks' }
-  | { ok: false; reason: 'not_downloaded' | 'install_failed' };
+export type {
+  AppUpdateInstallRequest,
+  AppUpdateInstallResult,
+  AppUpdateStatus,
+} from '../shared/app-update.js';
+export type AppUpdateProgress = SharedAppUpdateProgress;
 
 export interface AppUpdateService {
   start(): void;
@@ -54,25 +43,83 @@ export interface AppUpdateService {
   getStatus(): AppUpdateStatus;
   retryUpdateDownload(): Promise<AppUpdateStatus>;
   installUpdate(input: AppUpdateInstallRequest): Promise<AppUpdateInstallResult>;
+  /** Check because the window regained focus, subject to a shared throttle. */
+  checkForUpdatesOnFocus(): Promise<void>;
+  /**
+   * User-initiated check from Settings → About. Skips the focus throttle so
+   * the button always runs a real check (or joins an in-flight one).
+   */
+  checkForUpdatesNow(): Promise<AppUpdateStatus>;
 }
 
 interface AppUpdateServiceDeps {
   currentVersion: string;
   isPackaged: boolean;
+  updateChannel?: DesktopUpdateChannel;
   updater?: AppUpdater;
+  /**
+   * Harness-only feed override (`MAKA_UPDATE_TEST_FEED`); see
+   * {@link resolveUpdateFeedOverride} for the exact accepted shape.
+   */
+  testFeedUrl?: string;
   mockLatestVersion?: string;
   mockState?: 'available' | 'downloading' | 'downloaded';
   onStatusChange?: (status: AppUpdateStatus) => void;
-  hasActiveTasks: () => boolean | Promise<boolean>;
+  verifyDownloadedUpdate: DownloadedUpdateAttestationVerifier;
+  prepareInstall: (
+    input: AppUpdateInstallRequest,
+  ) => Promise<
+    | { readonly kind: 'active_tasks' }
+    | { readonly kind: 'prepared'; rollback(): void }
+  >;
   clock?: {
     setTimeout(callback: () => void, delayMs: number): unknown;
     clearTimeout(handle: unknown): void;
+    /** Time source for the focus-check throttle. */
+    now?(): number;
   };
 }
 
 const FIRST_UPDATE_CHECK_DELAY_MS = 10_000;
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
+/**
+ * Focus is a cheap, frequent signal, so it is throttled rather than trusted:
+ * alt-tabbing ten times in a minute must not mean ten update requests. The
+ * four-hour timer stays as the floor for a window that is never refocused.
+ */
+const UPDATE_CHECK_ON_FOCUS_MIN_INTERVAL_MS = 15 * 60 * 1000;
+/**
+ * GitHub intermittently answers the releases-feed request electron-updater
+ * uses to resolve "latest" with a transient HTTP 406 (#4790), and the same
+ * request succeeds seconds later. One quick retry before surfacing a check
+ * failure absorbs that class of error; anything still failing afterwards is
+ * reported exactly as before.
+ */
+const UPDATE_CHECK_RETRY_DELAY_MS = 2_000;
+const UPDATE_CHECK_MAX_ATTEMPTS = 2;
 
+/**
+ * Harness-only override for the update feed (`MAKA_UPDATE_TEST_FEED`).
+ *
+ * Accepts exactly `http://127.0.0.1:<port>[/path]` and maps it to a generic
+ * provider so the end-to-end Windows auto-update verification can serve a
+ * candidate installer plus `latest.yml` from a loopback HTTP server. Anything
+ * else set — a remote host, `localhost`, another loopback alias, HTTPS,
+ * userinfo, a query string, or a malformed URL — throws: a mistyped override
+ * must never silently fall back to the production GitHub feed, because a test
+ * run quietly installing a real release is exactly the failure this shape
+ * exists to prevent.
+ *
+ * Security posture (this is not an update-hijack vector): setting an
+ * environment variable on the app's process already requires code execution
+ * as the same user, and the per-user NSIS install model means that user can
+ * rewrite the installation directory directly — the override grants no
+ * capability across any privilege boundary. Loopback-only keeps even that
+ * same-user surface minimal: the feed must be a process listening on this
+ * machine. With the variable unset the feed configuration is byte-identical
+ * to production. The application composition root deliberately bypasses
+ * release provenance only for this synthetic-byte transport harness.
+ */
 function normalizeVersion(version: string): string {
   return version.trim().replace(/^v/i, '');
 }
@@ -148,7 +195,16 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     cancellationToken?: UpdateCheckResult['cancellationToken'];
     cancelledForRetry: boolean;
   } | undefined;
+  let activeVerification: Promise<void> | undefined;
   let checkTimer: unknown;
+  let checkRetryTimer: unknown;
+  /**
+   * Attempts still owed after the one currently running. While this is
+   * non-zero a check failure is transient by definition and must not be
+   * published as an error — the retry has not had its turn yet.
+   */
+  let checkAttemptsRemaining = 0;
+  let installHandoff: { rollback(): void } | undefined;
   let started = false;
   let disposed = false;
   // Resolve Electron's singleton lazily so tests can inject an updater without
@@ -158,6 +214,10 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     setTimeout: (callback: () => void, delayMs: number) => setTimeout(callback, delayMs),
     clearTimeout: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>),
   };
+  const now = (): number => clock.now?.() ?? Date.now();
+  // One record shared by both triggers. Keeping a separate timestamp per
+  // trigger would let a focus check fire seconds after a scheduled one.
+  let lastCheckStartedAt: number | undefined;
 
   const publish = (next: AppUpdateStatus): AppUpdateStatus => {
     status = next;
@@ -167,7 +227,7 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
   const currentStatus = (): AppUpdateStatus => status;
 
   const latestVersion = () =>
-    status.state === 'available' || status.state === 'downloading' || status.state === 'downloaded' ||
+    status.state === 'available' || status.state === 'downloading' || status.state === 'verifying' || status.state === 'downloaded' ||
     status.state === 'installing' || status.state === 'error'
       ? status.latestVersion
       : updateInfoVersion(latestInfo);
@@ -182,6 +242,12 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     operation,
     message: error instanceof Error ? error.message : String(error),
   });
+
+  const rollbackInstallHandoff = (): void => {
+    const handoff = installHandoff;
+    installHandoff = undefined;
+    handoff?.rollback();
+  };
 
   const trackAutoDownload = (result: UpdateCheckResult | null): void => {
     if (!result?.downloadPromise) return;
@@ -208,13 +274,12 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
 
   updater.autoDownload = true;
   updater.autoInstallOnAppQuit = false;
-  updater.allowPrerelease = false;
+  updater.allowPrerelease = deps.updateChannel === 'nightly';
   updater.logger = null;
-  updater.setFeedURL({
-    provider: 'github',
-    owner: 'Maka-Agent',
-    repo: 'maka-agent',
-  });
+  const testFeed = resolveUpdateFeedOverride(deps.testFeedUrl);
+  // Production reads electron-builder's packaged app-update.yml. Only the
+  // loopback harness replaces that single authority boundary.
+  if (testFeed) updater.setFeedURL(testFeed);
 
   updater.on('checking-for-update', () => {
     publish({ state: 'checking', currentVersion: deps.currentVersion });
@@ -247,18 +312,43 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
   });
   updater.on('update-downloaded', (event) => {
     latestInfo = event;
-    publish({
-      state: 'downloaded',
-      currentVersion: deps.currentVersion,
-      latestVersion: updateInfoVersion(event) ?? latestVersion() ?? deps.currentVersion,
-    });
+    const version = updateInfoVersion(event) ?? latestVersion() ?? deps.currentVersion;
+    publish({ state: 'verifying', currentVersion: deps.currentVersion, latestVersion: version });
+    const verification = Promise.resolve().then(() =>
+      deps.verifyDownloadedUpdate({
+        downloadedFile: event.downloadedFile,
+        version,
+        files: event.files,
+      }),
+    );
+    activeVerification = verification;
+    void verification
+      .then(() => {
+        if (activeVerification !== verification) return;
+        publish({
+          state: 'downloaded',
+          currentVersion: deps.currentVersion,
+          latestVersion: version,
+        });
+      })
+      .catch((error) => {
+        if (activeVerification === verification) publishError('download', error);
+      })
+      .finally(() => {
+        if (activeVerification === verification) activeVerification = undefined;
+      });
   });
   updater.on('error', (error) => {
     const operation = status.state === 'installing'
       ? 'install'
-      : status.state === 'available' || status.state === 'downloading'
+      : status.state === 'available' || status.state === 'downloading' || status.state === 'verifying'
         ? 'download'
         : 'check';
+    if (operation === 'install') rollbackInstallHandoff();
+    // A check failure with retry attempts still owed is transient: hold it
+    // back and let the scheduled retry produce the final word. Download and
+    // install errors always surface immediately.
+    if (operation === 'check' && checkAttemptsRemaining > 0) return;
     publishError(operation, error);
   });
 
@@ -269,20 +359,56 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     if (!deps.isPackaged) {
       return publish({ state: 'not-available', currentVersion: deps.currentVersion });
     }
-    if (status.state === 'downloaded' || status.state === 'installing') return status;
+    if (status.state === 'verifying' || status.state === 'downloaded' || status.state === 'installing') return status;
     if (status.state === 'downloading' && !allowDuringDownload) return status;
     if (activeDownload && !allowDuringDownload) return status;
     if (checkInFlight) return checkInFlight;
-    checkInFlight = updater
-      .checkForUpdates()
-      .then((result) => {
-        trackAutoDownload(result);
+    lastCheckStartedAt = now();
+    // Each attempt propagates its rejection; the publish-or-retry decision
+    // lives in the outer catch below, so only the last failure surfaces.
+    const attempt = (): Promise<AppUpdateStatus> =>
+      updater
+        .checkForUpdates()
+        .then(async (result) => {
+          trackAutoDownload(result);
+          const verification = activeVerification;
+          if (verification) await verification.catch(() => undefined);
+          return status;
+        });
+    checkAttemptsRemaining = UPDATE_CHECK_MAX_ATTEMPTS - 1;
+    checkInFlight = attempt().catch((error) => {
+      if (disposed) {
+        // Terminal: settle without publishing to a disposed service's
+        // subscribers, and run the .finally cleanup below.
+        checkAttemptsRemaining = 0;
         return status;
-      })
-      .catch((error) => status.state === 'error' ? status : publishError('check', error))
-      .finally(() => {
-        checkInFlight = null;
+      }
+      if (checkAttemptsRemaining <= 0) {
+        checkAttemptsRemaining = 0;
+        return status.state === 'error' ? status : publishError('check', error);
+      }
+      checkAttemptsRemaining -= 1;
+      // Back off briefly, then re-check. The 'error' listener holds the
+      // first failure back while this retry is pending, so a transient
+      // feed refusal (#4790) never reaches the renderer as an error.
+      return new Promise<AppUpdateStatus>((resolve) => {
+        checkRetryTimer = clock.setTimeout(() => {
+          checkRetryTimer = undefined;
+          if (disposed) {
+            // dispose() does not clear this timer precisely so the promise
+            // still settles here and `checkInFlight` is not left dangling.
+            resolve(status);
+            return;
+          }
+          resolve(attempt().catch((retryError) =>
+            status.state === 'error' ? status : publishError('check', retryError),
+          ));
+        }, UPDATE_CHECK_RETRY_DELAY_MS);
       });
+    }).finally(() => {
+      checkAttemptsRemaining = 0;
+      checkInFlight = null;
+    });
     return checkInFlight;
   }
 
@@ -310,13 +436,16 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
       clock.clearTimeout(checkTimer);
       checkTimer = undefined;
     }
+    // Deliberately leaves the retry timer running: its callback checks
+    // `disposed` and settles the in-flight check, so `checkInFlight` is not
+    // left dangling and its .finally cleanup still runs.
   }
 
   async function retryUpdateDownload(): Promise<AppUpdateStatus> {
     if (deps.mockLatestVersion) {
       return publish(mockStatus(deps.currentVersion, deps.mockLatestVersion, 'downloaded'));
     }
-    if (!deps.isPackaged || status.state === 'downloaded' || status.state === 'installing') {
+    if (!deps.isPackaged || status.state === 'verifying' || status.state === 'downloaded' || status.state === 'installing') {
       return status;
     }
     if (checkInFlight) await checkInFlight;
@@ -333,26 +462,17 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
 
   async function installUpdate(input: AppUpdateInstallRequest): Promise<AppUpdateInstallResult> {
     if (status.state !== 'downloaded') return { ok: false, reason: 'not_downloaded' };
-    let hasActiveTasks: boolean;
-    try {
-      hasActiveTasks = await deps.hasActiveTasks();
-    } catch (error) {
-      publishError('install', error);
-      return { ok: false, reason: 'install_failed' };
-    }
-    if (typeof hasActiveTasks !== 'boolean') {
-      publishError('install', new Error('Active task status is unavailable'));
-      return { ok: false, reason: 'install_failed' };
-    }
-    if (hasActiveTasks && !input.allowInterruptActiveTasks) {
-      return { ok: false, reason: 'active_tasks' };
-    }
     if (deps.mockLatestVersion) {
       return { ok: true };
     }
-    const version = latestVersion() ?? deps.currentVersion;
-    publish({ state: 'installing', currentVersion: deps.currentVersion, latestVersion: version });
     try {
+      const preparation = await deps.prepareInstall(input);
+      if (preparation.kind === 'active_tasks') {
+        return { ok: false, reason: 'active_tasks' };
+      }
+      installHandoff = preparation;
+      const version = latestVersion() ?? deps.currentVersion;
+      publish({ state: 'installing', currentVersion: deps.currentVersion, latestVersion: version });
       updater.quitAndInstall(false, true);
       const installStatus = currentStatus();
       if (installStatus.state === 'error' && installStatus.operation === 'install') {
@@ -360,9 +480,42 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
       }
       return { ok: true };
     } catch (error) {
+      rollbackInstallHandoff();
       publishError('install', error);
       return { ok: false, reason: 'install_failed' };
     }
+  }
+
+  /**
+   * Check because the user came back to the window.
+   *
+   * The four-hour timer alone means a version published while the app sat
+   * open is not noticed until the next tick — which is what "the update did
+   * not show up" actually was. Focus is when the user is present and a restart
+   * prompt is least disruptive, so it is the right moment to look.
+   *
+   * Deliberately does NOT reset the scheduled timer: the two triggers stay
+   * independent and the shared throttle is what keeps them from doubling up.
+   */
+  async function checkForUpdatesOnFocus(): Promise<void> {
+    if (disposed || !started) return;
+    if (
+      lastCheckStartedAt !== undefined &&
+      now() - lastCheckStartedAt < UPDATE_CHECK_ON_FOCUS_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+    // No `allowDuringDownload`: a download already in flight is the update
+    // arriving, and re-checking mid-download is exactly what that guard exists
+    // to prevent.
+    await checkForUpdates();
+  }
+
+  async function checkForUpdatesNow(): Promise<AppUpdateStatus> {
+    if (disposed) return currentStatus();
+    // Explicit user action: always attempt (or join) a check; do not apply the
+    // focus throttle. Still refuses to restart a mid-flight download.
+    return checkForUpdates();
   }
 
   return {
@@ -371,5 +524,7 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     getStatus: currentStatus,
     retryUpdateDownload,
     installUpdate,
+    checkForUpdatesOnFocus,
+    checkForUpdatesNow,
   };
 }

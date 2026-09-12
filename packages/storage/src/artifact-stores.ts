@@ -1,4 +1,23 @@
-import type { ArtifactRecord } from '@maka/core/artifacts';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import type { ArtifactRecord, ArtifactSource } from '@maka/core/artifacts';
 import {
   createSqliteArtifactStoreWriteAuthority,
   type ArtifactAuthorityStore,
@@ -22,29 +41,38 @@ import {
 export {
   createArtifactAttachmentResourceReader,
   createAttachmentByteReader,
+  createReadImageSnapshotPlanner,
   createReadImageSnapshotter,
   type ArtifactAttachmentResourceReader,
+  type ReadImageSnapshotPlan,
 } from './artifact-attachments.js';
-export { persistProviderRequestCaptureArtifact } from './provider-request-capture-artifact.js';
 
 const writerBrand: unique symbol = Symbol('InteractiveArtifactStoreWriter');
 const writers = new WeakSet<object>();
 const writerByLease = new WeakMap<object, InteractiveArtifactStoreWriter>();
 const writerOpeningByLease = new WeakMap<object, Promise<InteractiveArtifactStoreWriter>>();
-const headlessWriterByLease = new WeakMap<object, HeadlessArtifactStoreWriter>();
-const headlessWriterOpeningByLease = new WeakMap<object, Promise<HeadlessArtifactStoreWriter>>();
 
 export interface InteractiveArtifactStoreWriter extends DurableArtifactAttachmentReader {
   readonly kind: 'interactive';
   readonly access: 'write';
   readonly [writerBrand]: true;
-  recover(): Promise<void>;
   create(input: CreateArtifactInput): Promise<ArtifactRecord>;
-  deleteOwnedDeepResearchArtifactInSession(sessionId: string, artifactId: string): Promise<void>;
+  /**
+   * Narrow system delete for one Session-owned artifact of a declared source.
+   *
+   * The caller must name the source it believes it owns, and a mismatch throws,
+   * so a caller that is wrong about what it is reclaiming reclaims nothing.
+   */
+  deleteOwnedArtifactInSession(
+    sessionId: string,
+    artifactId: string,
+    source: ArtifactSource,
+  ): Promise<void>;
   copyConversationArtifacts(
     input: ConversationArtifactCopyInput,
   ): Promise<ConversationArtifactCopyResult>;
   purgeSessionArtifacts(sessionId: string): Promise<void>;
+  reclaimUpgradeResidue: ArtifactAuthorityStore['reclaimUpgradeResidue'];
   listPage: ArtifactAuthorityStore['listPage'];
   listTurnArtifacts: ArtifactAuthorityStore['listTurnArtifacts'];
   getInSession: ArtifactAuthorityStore['getInSession'];
@@ -54,13 +82,6 @@ export interface InteractiveArtifactStoreWriter extends DurableArtifactAttachmen
   deleteUserArtifactInSession: ArtifactAuthorityStore['deleteUserArtifactInSession'];
   close(): void;
 }
-
-export type HeadlessArtifactStoreWriter = Readonly<
-  Pick<
-    ArtifactAuthorityStore,
-    'create' | 'list' | 'get' | 'readText' | 'readBinary' | 'readDurableAttachmentBinary'
-  > & { close(): void }
->;
 
 export function authenticateInteractiveArtifactStoreWriter(
   store: InteractiveArtifactStoreWriter,
@@ -104,69 +125,6 @@ export async function openInteractiveArtifactStoreForWrite(
   }
 }
 
-export async function openHeadlessArtifactStoreForWrite(
-  lease: StorageRootLease<'headless', 'write'>,
-): Promise<HeadlessArtifactStoreWriter> {
-  await assertStorageRootLease(lease, 'headless', 'write');
-  const existing = headlessWriterByLease.get(lease);
-  if (existing) return existing;
-  const opening = headlessWriterOpeningByLease.get(lease);
-  if (opening) return opening;
-
-  const pending = Promise.resolve().then(async () => {
-    const leaseBoundWriterLockAuthority = await prepareArtifactWriterLockAuthorityForLease(
-      lease,
-      'headless',
-    );
-    const assertAuthority = createStorageRootLeaseIdentityGuard(lease, 'headless', 'write');
-    const authority = createSqliteArtifactStoreWriteAuthority(lease.canonicalPath, {
-      assertAuthority,
-      leaseBoundWriterLockAuthority,
-    });
-    const run = <T>(operation: () => Promise<T>) =>
-      runWithStorageRootLease(lease, 'headless', 'write', operation);
-    await run(() => authority.recover());
-    const recoveredExisting = headlessWriterByLease.get(lease);
-    if (recoveredExisting) return recoveredExisting;
-    const facade = createHeadlessWriterFacade(lease, authority);
-    headlessWriterByLease.set(lease, facade);
-    return facade;
-  });
-  headlessWriterOpeningByLease.set(lease, pending);
-  try {
-    return await pending;
-  } finally {
-    if (headlessWriterOpeningByLease.get(lease) === pending) {
-      headlessWriterOpeningByLease.delete(lease);
-    }
-  }
-}
-
-function createHeadlessWriterFacade(
-  lease: StorageRootLease<'headless', 'write'>,
-  authority: ArtifactStoreWriteAuthority,
-): HeadlessArtifactStoreWriter {
-  const { store } = authority;
-  const run = <T>(operation: () => Promise<T>) =>
-    runWithStorageRootLease(lease, 'headless', 'write', operation);
-  const facade: HeadlessArtifactStoreWriter = Object.freeze({
-    create: (input) => {
-      const acceptedInput = snapshotCreateInput(input);
-      return run(() => store.create(acceptedInput));
-    },
-    list: (sessionId, options) => run(() => store.list(sessionId, options)),
-    get: (artifactId) => run(() => store.get(artifactId)),
-    readText: (artifactId, options) => run(() => store.readText(artifactId, options)),
-    readBinary: (artifactId, options) => run(() => store.readBinary(artifactId, options)),
-    readDurableAttachmentBinary: (input) => run(() => store.readDurableAttachmentBinary(input)),
-    close: () => {
-      if (headlessWriterByLease.get(lease) === facade) headlessWriterByLease.delete(lease);
-      authority.close();
-    },
-  });
-  return facade;
-}
-
 function createWriterFacade(
   lease: StorageRootLease<'interactive', 'write'>,
   authority: ArtifactStoreWriteAuthority,
@@ -188,27 +146,39 @@ function createWriterFacade(
     readChunkInSession: (sessionId, artifactId, options) =>
       run(() => store.readChunkInSession(sessionId, artifactId, options)),
     readDurableAttachmentBinary: (input) => run(() => store.readDurableAttachmentBinary(input)),
-    recover: () => run(() => authority.recover()),
     create: (input) => {
       const acceptedInput = snapshotCreateInput(input);
       return run(() => store.create(acceptedInput));
     },
-    deleteOwnedDeepResearchArtifactInSession: (sessionId, artifactId) =>
-      run(async () => {
-        const entry = await store.getInSession(sessionId, artifactId);
-        if (!entry.record || entry.record.source !== 'deep_research') {
-          throw new Error('Artifact does not belong to the expected Session authority');
-        }
-        await store.delete(artifactId);
-      }),
+    deleteOwnedArtifactInSession: (sessionId, artifactId, source) =>
+      run(() => store.deleteOwnedArtifactInSession(sessionId, artifactId, source)),
     copyConversationArtifacts: (input) => {
       const acceptedInput: ConversationArtifactCopyInput = Object.freeze({
         ...input,
         turnIds: Object.freeze([...input.turnIds]),
+        ...(input.excludeArtifactIds
+          ? { excludeArtifactIds: Object.freeze([...input.excludeArtifactIds]) }
+          : {}),
+        ...(input.includeArtifactIds
+          ? { includeArtifactIds: Object.freeze([...input.includeArtifactIds]) }
+          : {}),
+        ...(input.linkedArtifacts
+          ? {
+              linkedArtifacts: Object.freeze(
+                input.linkedArtifacts.map((linked) =>
+                  Object.freeze({
+                    sessionId: linked.sessionId,
+                    artifactIds: Object.freeze([...linked.artifactIds]),
+                  }),
+                ),
+              ),
+            }
+          : {}),
       });
       return run(() => store.copyConversationArtifacts(acceptedInput));
     },
     purgeSessionArtifacts: (sessionId) => run(() => store.purgeSessionArtifacts(sessionId)),
+    reclaimUpgradeResidue: (input) => run(() => store.reclaimUpgradeResidue(input)),
     deleteUserArtifactInSession: (sessionId, artifactId) =>
       run(() => store.deleteUserArtifactInSession(sessionId, artifactId)),
     close: () => {

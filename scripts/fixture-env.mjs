@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 // The environment a Maka fixture window launches into.
 //
 // Extracted from apps/desktop/e2e/fixtures.ts, which worked it out first and
@@ -14,8 +33,7 @@
  * silently drop and break the launch.
  *
  * Inheriting `process.env` wholesale leaks:
- *   - provider keys, which auto-bootstrap a connection and break the "true
- *     first-run" assertion;
+ *   - provider keys, which auto-bootstrap a connection and change the fixture;
  *   - `VITE_DEV_SERVER_URL`, which loads the dev server instead of the built
  *     bundle — so the run silently measures something other than the build
  *     under test;
@@ -38,7 +56,7 @@ function isDeniedEnvKey(key) {
  * @param {string} homeDir
  * @param {{
  *   scenario?: string,
- *   locale?: 'zh' | 'en',
+ *   locale?: 'zh-CN' | 'zh-TW' | 'en',
  *   platform?: 'darwin' | 'win32' | 'linux',
  *   theme?: 'light' | 'dark',
  *   timezone?: string,
@@ -105,4 +123,27 @@ export function buildFixtureEnv(userDataDir, homeDir, options = {}) {
  */
 export function isCiLinuxDisplay(env = process.env, platform = process.platform) {
   return Boolean(env.CI) && platform === 'linux';
+}
+
+/**
+ * Extra Electron arguments a launch needs when its window will be revealed
+ * inactively.
+ *
+ * Electron 43 defaults to native Wayland when XDG_SESSION_TYPE=wayland, where
+ * BrowserWindow.showInactive() is unsupported — the window may simply not
+ * appear, which puts back the ~1fps compositor throttling and the geometry
+ * failures that asking for a visible window exists to avoid. Keep those
+ * launches on XWayland; every other launch retains Electron's platform
+ * default.
+ *
+ * Returns only the extra arguments, so each launcher composes it with its own:
+ * `['.', ...inactiveWindowPlatformArgs(), `--user-data-dir=${dir}`]`.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {NodeJS.Platform} [platform]
+ */
+export function inactiveWindowPlatformArgs(env = process.env, platform = process.platform) {
+  return platform === 'linux' && env.XDG_SESSION_TYPE?.toLowerCase() === 'wayland'
+    ? ['--ozone-platform=x11']
+    : [];
 }

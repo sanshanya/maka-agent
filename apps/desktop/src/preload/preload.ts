@@ -1,184 +1,2101 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import type {
+  SessionBundleExportIpcResult,
+  SessionBundleImportIpcResult,
+} from './bridge-contract.js';
+
+import type { WorkHubAnswerInput, WorkHubAnswerResult } from '../shared/workhub-conversation.js';
+import type { SessionObservationMessage } from '../shared/session-execution-projection.js';
 import { contextBridge, ipcRenderer } from 'electron';
+import { workHubControlBridge } from './workhub-control.js';
+import { workHubPresentationBridge } from './workhub-presentation.js';
+import {
+  isRuntimeHostProfileKind,
+  type RuntimeHostProfileKind,
+} from '@maka/runtime-host/profile-kind';
 import { encodeIngestItems } from './attachment-ingest-payload.js';
+import { collectThreadSearchResponses } from './multi-host-thread-search.js';
+import { releaseSessionObservation } from './session-observation-release.js';
+import {
+  resolveDesktopWorkHubCoordinationCreateScope,
+  resolveDesktopWorkHubCoordinationSession,
+} from './workhub-coordination-session.js';
 import type {
   MakaBridge,
   OnboardingSnapshot,
+  DesktopTaskSubmissionReadinessRequest,
   PermissionActionResult,
   PermissionOverlayStartResult,
   RendererIngestInput,
+  DesktopBranchFromTurnInput,
+  DesktopSideConversationBranchResult,
+  DesktopSessionStopResult,
+  DesktopReviseBeforeTurnInput,
   AppUpdateInstallRequest,
   AppUpdateInstallResult,
   AppUpdateStatus,
   WindowCommand,
+  PetPackChangedEvent,
+  WorkBoardChangedEvent,
+  DesktopRuntimeHostProfileAddInput,
+  DesktopRuntimeHostProfileChangedEvent,
+  DesktopRuntimeHostProfileSnapshot,
+  DesktopRuntimeHostSshTerminalEvent,
+  DesktopRuntimeHostSshTerminalSnapshot,
+  DesktopRuntimeHostOnboardingInput,
+  DesktopRuntimeHostOnboardingSnapshot,
+  DesktopRuntimeHostManagementAction,
+  DesktopRuntimeHostManagementResponse,
+  DesktopRuntimeHostManagementProgress,
+  DesktopRuntimeHostAccessSnapshot,
+  DesktopNewTaskCatalog,
+  DesktopNewTaskHost,
+  DesktopNewTaskHostRef,
+  DesktopNewTaskTarget,
+  DesktopRuntimeHostRef,
+  DesktopOAuthLoginTarget,
+  DesktopOAuthAuthorizationResult,
+  DesktopProjectSnapshot,
+  DesktopAppInfo,
+  DesktopSessionTracePage,
+  DesktopSessionUsageSummary,
+  AppIconImportResult,
+  AppIconRemoveResult,
+  AppIconSelectResult,
 } from './bridge-contract.js';
+import type { ExternalSessionImportIpcResult } from './external-session-import-result.js';
+import type { RuntimeHostObservationIpcResult } from '../shared/runtime-host-observation-ipc.js';
+import {
+  projectDesktopExternalSessionCatalogItem,
+  type DesktopExternalSessionCatalogItem,
+  type DesktopHostExternalSessionCatalogItem,
+} from './external-session-catalog.js';
+import {
+  DESKTOP_TRANSCRIPT_FRAGMENT_MAX_BYTES,
+  assertDesktopTranscriptBatch,
+  type DesktopTranscriptBatch,
+  type DesktopTranscriptHandle,
+  type DesktopTranscriptOpenResult,
+} from './transcript-contract.js';
+import {
+  adoptTranscriptIdentity,
+  type DesktopTranscriptIdentity,
+} from './transcript-identity.js';
 import type {
-  ConnectionEvent,
+  DesktopDiagnosticInput,
+  DesktopErrorDiagnosticWireInput,
+  DesktopExecutionDiagnosticTarget,
+  DesktopManualDiagnosticTarget,
+  DesktopManualDiagnosticWireInput,
+} from './diagnostics-contract.js';
+import type { ConnectionEvent } from '@maka/core/connections';
+import type {
   ConnectionTestResult,
   CreateConnectionInput,
-  AppSettings,
-  BotProvider,
-  BotOnboardingSnapshot,
-  BotOnboardingStartInput,
-  HealthSnapshot,
-  ExecutionBoundaryReadModel,
   LlmConnection,
   ModelDiscoveryResult,
   ModelInfo,
-  ActiveInteractionRequestEvent,
-  SandboxBoundaryResponse,
-  UserQuestionResponse,
-  PermissionMode,
-  CollaborationMode,
-  OrchestrationMode,
-  TurnOrchestration,
-  PlanSessionState,
-  SearchErrorReason,
-  SearchRequest,
-  SearchResult,
-  SettingsTestResult,
-  SessionCommand,
-  SessionChangedEvent,
-  SessionEvent,
-  SessionListFilter,
-  SessionSummary,
-  ShellRunUpdate,
-  StoredMessage,
-  ThinkingLevel,
   UpdateConnectionInput,
+} from '@maka/core/llm-connections';
+import type {
+  AppIcon,
+  AppIconChoice,
+  AppIconTarget,
+  AppSettings,
+  RuntimeHostAppSettings,
+  RuntimeHostSettingsUpdateGuard,
+  SettingsTestResult,
   UpdateAppSettingsInput,
   UpdateAppSettingsResult,
   UsageRange,
   UsageStats,
-  E2eFixtureState,
+  ThemePreference,
+} from '@maka/core/settings';
+import type { BotProvider } from '@maka/core/bot-chat-settings';
+import type { BotOnboardingSnapshot, BotOnboardingStartInput } from '@maka/core/bot-onboarding';
+import type { HealthSnapshot } from '@maka/core/health';
+import {
+  createRuntimeHostSessionCatalogRefresher,
+  recordObservedRuntimeHostSessionAuthority,
+  reconcileRuntimeHostSessionCatalog,
+  resolveRuntimeHostSessionCatalog,
+  type RuntimeHostSessionCatalogCoverage,
+} from './runtime-host-session-catalog.js';
+import { collectAvailablePendingTurnRequests } from './runtime-host-turn-request-inbox.js';
+import type { ExecutionBoundaryReadModel, SandboxBoundaryResponse } from '@maka/core/sandbox-boundary';
+import type { ClientCapabilityResponse } from '@maka/core/client-capability-grant';
+import type {
+  ActiveInteractionRequestEvent,
+  MessageContent,
+  SessionCommand,
+  SessionEvent,
+  ShellRunUpdate,
+} from '@maka/core/events';
+import type { UserQuestionResponse } from '@maka/core/user-question';
+import type { InteractionFormResponse } from '@maka/core/interaction';
+import type { PermissionMode } from '@maka/core/permission';
+import type { CollaborationMode } from '@maka/core/collaboration';
+import type { OrchestrationMode } from '@maka/core/orchestration';
+
+import type { TurnOrchestration, SessionListFilter, RegenerateTurnInput } from '@maka/core/runtime-inputs';
+import type { PlanSessionState } from '@maka/core/plan';
+import type { SearchErrorReason, SearchRequest, SearchResult } from '@maka/core/search';
+import type {
+  SessionCatalogSummary,
+  SessionChangedEvent,
+  SessionSummary,
+  TurnRecord,
+} from '@maka/core/session';
+import type { ThinkingLevel } from '@maka/core/model-thinking';
+import type { E2eFixtureState } from '@maka/core/e2e-fixture';
+import type {
+  GitReviewReadResult,
+  GitReviewSource,
+} from '@maka/core/git-review';
+import type {
   ArtifactBinaryReadResult,
-  ArtifactChangedEvent,
   ArtifactDescriptor,
   ArtifactSaveResult,
   ArtifactTextReadResult,
-  BranchFromTurnInput,
-  CapabilitySnapshotCollection,
-  RegenerateTurnInput,
-  ReviseBeforeTurnInput,
-  TurnRecord,
-  PermissionSnapshot,
-  LocalMemoryEntryPreview,
-  LocalMemoryState,
-  AuthorizationUrlPayload,
-  SubscriptionAccountState,
-  SubscriptionActionResult,
-  PlanReminder,
-  ProjectRecord,
-  PlanReminderDeliveryTarget,
-  PlanReminderRecurrence,
+} from '@maka/core/artifacts';
+import type { CapabilitySnapshotCollection, PermissionSnapshot } from '@maka/core/capabilities';
+import type { LocalMemoryState } from '@maka/core/local-memory';
+import type { SubscriptionActionResult } from '@maka/core/oauth-subscription';
+import type { CreateScheduledTaskInput, ScheduledTask, UpdateScheduledTaskInput } from '@maka/core/scheduled-task';
+import type { ProjectRecord } from '@maka/core/project';
+import type {
   DailyReviewArchive,
   DailyReviewArchiveSummary,
-  QueueEnqueueOutcome,
-  VoiceBeginRequest,
-  VoiceBeginResult,
-  VoiceCapturedAudio,
-  VoiceCoordinatorToolCall,
-  VoiceFinishCaptureResult,
-  VoiceRealtimeClientSession,
   DailyReviewConfig,
   DailyReviewRange,
   DailyReviewSummary,
-  WebSearchProvider,
-  WebSearchResponse,
-  BrowserState,
-  BrowserViewRect,
-  ThemePreference,
-  Task,
-  TaskLedgerChangedEvent,
-  DeepResearchChangedEvent,
-  DeepResearchClientProgress,
-} from '@maka/core';
-import type { SessionTrace } from '@maka/core/session-trace';
+} from '@maka/core/daily-review';
+import type { WebSearchProvider, WebSearchResponse } from '@maka/core/web-search';
+import type { BrowserState, BrowserViewRect } from '@maka/core/browser';
+import { createBrowserSelectionCoordinator } from './browser-selection.js';
+import type { SessionTodoItem } from '@maka/core/session-todo';
+import type { DeepResearchChangedEvent, DeepResearchClientProgress } from '@maka/core/deep-research-run';
+import {
+  isWebSearchProvider,
+  MASKED_TOKEN_SENTINEL,
+  normalizeWebSearchLimit,
+  normalizeWebSearchQuery,
+} from '@maka/core/web-search';
+import {
+  isSessionTrace,
+} from '@maka/core/session-trace';
+import type { ContextDiagnosticsResult } from '@maka/runtime-host/protocol';
+import {
+  DAILY_REVIEW_RANGES,
+  normalizeDailyReviewConfig,
+} from '@maka/core/daily-review';
 import type {
-  AgentGraphClientChangedEvent,
   AgentGraphClientSnapshot,
   AgentGraphClientSnapshotOptions,
   AgentGraphOperatorInspection,
-  BotStatus,
-  WechatBridgeQrCodeResult,
-} from '@maka/runtime';
-import type { GoalState } from '@maka/runtime';
-import type { BundledSkillCatalogEntry, ManagedSkillSourceEntry, ManagedSkillUpdatePreview, SkillEntry, SkillGovernanceDetails } from '@maka/ui';
-import type { ConfigCategory } from '@maka/storage';
-import type { TestProxyInput } from '@maka/core/settings/network-settings';
+} from '@maka/runtime/stream-graph-read-model';
+import type { BotStatus, WechatBridgeQrCodeResult } from '@maka/runtime/bots';
+import type { ShellRunPtyDataEvent, ShellRunPtySnapshot } from '@maka/runtime/shell-run-contract';
+import type { GoalState } from '@maka/runtime/goal-state';
+import type { BundledSkillCatalogEntry, ManagedSkillSourceEntry, ManagedSkillUpdatePreview, SkillEntry } from '@maka/ui';
+import type { ConfigCategory } from '@maka/storage/config-transfer';
+import {
+  SENSITIVE_PLACEHOLDER,
+  type TestProxyInput,
+} from '@maka/core/settings/network-settings';
 import type { Result } from '@maka/core/result';
-import type { CreateSessionRequestInput } from '@maka/core';
+import type { CreateSessionRequestInput } from '@maka/core/runtime-inputs';
 import type {
+  McpConfigAddResult,
+  McpConfigImportResult,
   McpConfigFile,
   McpServerConfig,
   McpServerStatus,
   McpTestResult,
 } from '@maka/core/mcp';
-import type {
-  AttachmentRef,
-  InlineReference,
-  OnboardingMilestoneId,
-  QuoteRef,
-} from '@maka/core';
+import type { AttachmentRef, InlineReference, QuoteRef } from '@maka/core/events';
+import type { OnboardingMilestoneId } from '@maka/core/onboarding';
+import {
+  decodeSharedSessionCatalogProjection,
+  SCHEDULED_TASK_CATALOG_MAX_ITEMS,
+  type OperationInput,
+  type OperationOutcome,
+  type OperationOutput,
+  type CollaborationTurnRequestQueryResult,
+  type CollaborationTurnRequestWithdrawResult,
+  type SessionTurnAccessRequest,
+} from '@maka/runtime-host/protocol';
+import type { PlanControlIpcResult } from '../shared/plan-mode-ipc.js';
+import type { AgentGraphEpochDirectory } from '@maka/runtime-host/client';
+import {
+  desktopSessionKey,
+  parseDesktopSessionKey,
+  requireDesktopTargetScope,
+  type DesktopTargetScope,
+} from '../shared/runtime-host-identity.js';
+import type { GoalArmOutcome, GoalArmRequest } from '../shared/goal-arm.js';
+import {
+  invokeProjectedSessionRuntimeHost as invokeProjectedSessionRuntimeHostBridge,
+  projectProtocolSessionIds,
+} from './projected-session-runtime-host.js';
+import {
+  projectDesktopAttachmentRefs,
+  projectDesktopDailyReviewSummary,
+  projectDesktopSessionEvent,
+  projectDesktopSessionSummary,
+  projectDesktopTurnRecord,
+  projectDesktopUsageStats,
+  type DesktopSessionSummary,
+  type DesktopSessionSummaryInput,
+} from '../shared/desktop-session-projection.js';
+import { projectDesktopSharedSessionSummary } from '../shared/shared-session-catalog-projection.js';
 
-type LocalMemoryMutationResult =
-  | { ok: true; state: LocalMemoryState; entry?: LocalMemoryEntryPreview; proposal?: LocalMemoryEntryPreview }
-  | { ok: false; state: LocalMemoryState; reason: string; message: string };
+let activeRuntimeHost: DesktopTargetScope | undefined;
+let activeRuntimeHostGeneration = 0;
+let newTaskCatalogGeneration = 0;
+type RuntimeHostScopeKey = string;
+const runtimeHostScopes = new Map<string, DesktopTargetScope>();
+const runtimeHostProfiles = new Map<string, string>();
+const runtimeHostMetadata = new Map<
+  string,
+  {
+    readonly profileId: string;
+    readonly profileName: string;
+    readonly profileKind: RuntimeHostProfileKind;
+    readonly profileAccess: 'owner' | 'session_guest';
+  }
+>();
+const runtimeHostSessionProfiles = new Map<string, string>();
+let lastDesktopSessionCatalog: RuntimeHostSessionCatalogCoverage = {
+  sessions: [],
+  completeHostIds: [],
+};
+const newTaskChangeListeners = new Set<() => void>();
+let previousMainProcessInterruptionRead: Promise<boolean> | undefined;
+
+function runtimeHostScopeKey(scope: DesktopTargetScope): RuntimeHostScopeKey {
+  return `${scope.hostId}\u0000${scope.targetEpoch}`;
+}
+
+function runtimeHostMetadataFor(scope: DesktopTargetScope) {
+  return runtimeHostMetadata.get(runtimeHostScopeKey(scope));
+}
+
+function observeRuntimeHostSessionScope(scope: DesktopTargetScope, sessionId: string): {
+  readonly sessionId: string;
+  readonly authorityAccepted: boolean;
+} {
+  const projected = desktopSessionKey({ hostId: scope.hostId, sessionId });
+  const profileId = runtimeHostMetadataFor(scope)?.profileId;
+  if (!profileId) throw new Error('Desktop Runtime Host metadata is unavailable');
+  return {
+    sessionId: projected,
+    authorityAccepted: recordObservedRuntimeHostSessionAuthority(
+      runtimeHostSessionProfiles,
+      projected,
+      profileId,
+    ),
+  };
+}
+
+function recordRuntimeHostSessionScope(scope: DesktopTargetScope, sessionId: string): string {
+  return observeRuntimeHostSessionScope(scope, sessionId).sessionId;
+}
+
+type RuntimeHostProfileWireEvent = DesktopRuntimeHostProfileChangedEvent;
+
+ipcRenderer.on(
+  'runtime-host-profiles:changed',
+  (_event, change: RuntimeHostProfileWireEvent) => {
+    const previousScopeKey = runtimeHostProfiles.get(change.profileId);
+    const nextScope = change.hostId
+      ? { hostId: change.hostId, targetEpoch: change.epoch }
+      : undefined;
+    const nextScopeKey = nextScope ? runtimeHostScopeKey(nextScope) : undefined;
+    if (
+      previousScopeKey &&
+      (change.removed || (nextScopeKey !== undefined && previousScopeKey !== nextScopeKey))
+    ) {
+      runtimeHostScopes.delete(previousScopeKey);
+      runtimeHostMetadata.delete(previousScopeKey);
+      if (change.removed) {
+        runtimeHostProfiles.delete(change.profileId);
+      }
+    }
+    if (nextScope && nextScopeKey) {
+      runtimeHostScopes.set(nextScopeKey, nextScope);
+      runtimeHostProfiles.set(change.profileId, nextScopeKey);
+      runtimeHostMetadata.set(nextScopeKey, {
+        profileId: change.profileId,
+        profileName: change.profileName,
+        profileKind: change.profileKind,
+        profileAccess: change.profileAccess,
+      });
+      if (change.isDefault) activeRuntimeHost = nextScope;
+    } else if (change.isDefault) {
+      activeRuntimeHost = undefined;
+    }
+    if (
+      change.hostId ||
+      change.removed ||
+      change.isDefault ||
+      change.readiness === 'unavailable'
+    ) {
+      activeRuntimeHostGeneration += 1;
+    }
+    // Guest mounts can only participate in their shared Sessions. Their
+    // reconnects cannot change the Hosts/projects available for a new task.
+    if (change.profileAccess === 'owner') {
+      newTaskCatalogGeneration += 1;
+      for (const listener of newTaskChangeListeners) listener();
+    }
+  },
+);
+
+function recordRuntimeHostIdentity(value: unknown): {
+  readonly scope: DesktopTargetScope;
+  readonly readiness: 'ready' | 'reconnecting';
+} {
+  const scope = requireDesktopTargetScope(value);
+  const metadata = value as {
+    profileId?: unknown;
+    profileName?: unknown;
+    profileKind?: unknown;
+    profileAccess?: unknown;
+    readiness?: unknown;
+  };
+  if (
+    typeof metadata.profileId !== 'string' ||
+    typeof metadata.profileName !== 'string' ||
+    !isRuntimeHostProfileKind(metadata.profileKind) ||
+    (metadata.profileAccess !== 'owner' && metadata.profileAccess !== 'session_guest') ||
+    (metadata.readiness !== 'ready' && metadata.readiness !== 'reconnecting')
+  ) {
+    throw new Error('Desktop Runtime Host identity is invalid');
+  }
+  const scopeKey = runtimeHostScopeKey(scope);
+  runtimeHostScopes.set(scopeKey, scope);
+  runtimeHostProfiles.set(metadata.profileId, scopeKey);
+  runtimeHostMetadata.set(scopeKey, {
+    profileId: metadata.profileId,
+    profileName: metadata.profileName,
+    profileKind: metadata.profileKind,
+    profileAccess: metadata.profileAccess,
+  });
+  return { scope, readiness: metadata.readiness };
+}
+
+async function runtimeHostScopeList(): Promise<readonly DesktopTargetScope[]> {
+  while (true) {
+    const generation = activeRuntimeHostGeneration;
+    const identities: unknown = await ipcRenderer.invoke('runtime-host:identities');
+    if (generation !== activeRuntimeHostGeneration) continue;
+    if (!Array.isArray(identities)) {
+      throw new Error('Desktop Runtime Host identities are unavailable');
+    }
+    const authoritativeScopeKeys = new Set<RuntimeHostScopeKey>();
+    const readyScopes: DesktopTargetScope[] = [];
+    for (const identity of identities) {
+      const { scope, readiness } = recordRuntimeHostIdentity(identity);
+      authoritativeScopeKeys.add(runtimeHostScopeKey(scope));
+      if (readiness === 'ready') readyScopes.push(scope);
+    }
+    for (const scopeKey of runtimeHostScopes.keys()) {
+      if (authoritativeScopeKeys.has(scopeKey)) continue;
+      runtimeHostScopes.delete(scopeKey);
+      runtimeHostMetadata.delete(scopeKey);
+    }
+    return readyScopes;
+  }
+}
+
+async function readyOwnerRuntimeHostScopes(): Promise<readonly DesktopTargetScope[]> {
+  return (await runtimeHostScopeList()).filter(
+    (scope) => runtimeHostMetadataFor(scope)?.profileAccess === 'owner',
+  );
+}
+
+async function runtimeHostSessionRef(sessionId: string): Promise<{
+  readonly scope: DesktopTargetScope;
+  readonly sessionId: string;
+}> {
+  const ref = parseDesktopSessionKey(sessionId);
+  await runtimeHostScopeList();
+  const recordedProfileId = runtimeHostSessionProfiles.get(sessionId);
+  let scope: DesktopTargetScope | undefined;
+  if (recordedProfileId) {
+    const scopeKey = runtimeHostProfiles.get(recordedProfileId);
+    scope = scopeKey ? runtimeHostScopes.get(scopeKey) : undefined;
+    if (!scope || scope.hostId !== ref.hostId) {
+      throw new Error('The Runtime Host for this task is unavailable');
+    }
+  } else {
+    const candidates = [...runtimeHostScopes.values()].filter(({ hostId }) => hostId === ref.hostId);
+    if (candidates.length === 1) scope = candidates[0];
+  }
+  if (!scope) throw new Error('The Runtime Host for this task is unavailable');
+  return { scope, sessionId: ref.sessionId };
+}
+
+function hostAttachmentRefs(
+  session: { scope: DesktopTargetScope; sessionId: string },
+  attachments: readonly AttachmentRef[],
+): AttachmentRef[] {
+  return attachments.map((attachment) => {
+    if (attachment.ref.kind !== 'session_file') return attachment;
+    const owner = parseDesktopSessionKey(attachment.ref.sessionId);
+    if (owner.hostId !== session.scope.hostId || owner.sessionId !== session.sessionId) {
+      throw new Error('Retained attachment belongs to another Host or Session');
+    }
+    return { ...attachment, ref: { ...attachment.ref, sessionId: owner.sessionId } };
+  });
+}
+
+type DiagnosticRuntimeHostResolution<TTarget extends 'default' | 'task'> = {
+  readonly hostTarget: TTarget;
+  readonly scope?: DesktopTargetScope;
+};
+
+type TaskDiagnosticRuntimeHostResolution = DiagnosticRuntimeHostResolution<'task'>;
+type ManualDiagnosticRuntimeHostResolution = DiagnosticRuntimeHostResolution<'default' | 'task'>;
+
+type ManualDiagnosticHostSelector =
+  | { readonly kind: 'profile'; readonly profileId: string }
+  | { readonly kind: 'session'; readonly sessionId: string };
+
+async function resolveManualDiagnosticRuntimeHost(
+  value: DesktopManualDiagnosticTarget | undefined,
+): Promise<ManualDiagnosticRuntimeHostResolution> {
+  if (value === undefined) return { hostTarget: 'default' };
+  const target = parseDiagnosticTarget(value);
+  if (target.execution) {
+    throw new TypeError('Manual Desktop diagnostics do not accept execution targets');
+  }
+  return resolveTaskDiagnosticRuntimeHost(target.selector);
+}
+
+async function resolveTaskDiagnosticRuntimeHost(
+  selector: ManualDiagnosticHostSelector,
+): Promise<TaskDiagnosticRuntimeHostResolution> {
+  try {
+    await runtimeHostScopeList();
+  } catch {
+    return { hostTarget: 'task' };
+  }
+  if (selector.kind === 'session') {
+    try {
+      return { hostTarget: 'task', scope: (await runtimeHostSessionRef(selector.sessionId)).scope };
+    } catch {
+      return { hostTarget: 'task' };
+    }
+  }
+  const scope = runtimeHostScopes.get(runtimeHostProfiles.get(selector.profileId) ?? '');
+  return { hostTarget: 'task', ...(scope ? { scope } : {}) };
+}
+
+function parseDiagnosticTarget(value: unknown): {
+  readonly selector: ManualDiagnosticHostSelector;
+  readonly execution?: DesktopExecutionDiagnosticTarget;
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('Invalid Desktop diagnostic target');
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).length === 1 &&
+    Object.hasOwn(record, 'sessionId') &&
+    typeof record.sessionId === 'string' &&
+    Buffer.byteLength(record.sessionId, 'utf8') <= 512
+  ) {
+    return {
+      selector: { kind: 'session', sessionId: record.sessionId },
+    };
+  }
+  if (
+    Object.keys(record).length === 1 &&
+    Object.hasOwn(record, 'profileId') &&
+    typeof record.profileId === 'string' &&
+    record.profileId.length > 0 &&
+    !/[\u0000-\u001f\u007f]/.test(record.profileId) &&
+    Buffer.byteLength(record.profileId, 'utf8') <= 512
+  ) {
+    return { selector: { kind: 'profile', profileId: record.profileId } };
+  }
+  const executionKeys = ['sessionId', 'turnId', 'eventId'] as const;
+  if (
+    Object.keys(record).length === executionKeys.length &&
+    executionKeys.every((key) => Object.hasOwn(record, key)) &&
+    typeof record.sessionId === 'string' &&
+    Buffer.byteLength(record.sessionId, 'utf8') <= 512 &&
+    typeof record.turnId === 'string' &&
+    Buffer.byteLength(record.turnId, 'utf8') <= 512 &&
+    typeof record.eventId === 'string' &&
+    Buffer.byteLength(record.eventId, 'utf8') <= 512
+  ) {
+    return {
+      selector: { kind: 'session', sessionId: record.sessionId },
+      execution: {
+        sessionId: parseDesktopSessionKey(record.sessionId).sessionId,
+        turnId: record.turnId,
+        eventId: record.eventId,
+      },
+    };
+  }
+  throw new TypeError('Invalid Desktop diagnostic target');
+}
+
+async function activeRuntimeHostRef(): Promise<DesktopTargetScope> {
+  while (!activeRuntimeHost) {
+    const generation = activeRuntimeHostGeneration;
+    const snapshot = await ipcRenderer.invoke('runtime-host:activeIdentity');
+    if (generation !== activeRuntimeHostGeneration) continue;
+    activeRuntimeHost = recordRuntimeHostIdentity(snapshot).scope;
+  }
+  return activeRuntimeHost;
+}
+
+async function localRuntimeHostRef(): Promise<DesktopTargetScope> {
+  const scopes = await runtimeHostScopeList();
+  const scope = scopes.find(
+    (candidate) => runtimeHostMetadataFor(candidate)?.profileKind === 'local',
+  );
+  if (!scope) throw new Error('The Local Runtime Host is unavailable');
+  return scope;
+}
+
+async function runtimeHostScope(host: DesktopRuntimeHostRef): Promise<DesktopTargetScope> {
+  if (!host.profileId || !host.hostId) {
+    throw new Error('The Runtime Host target is invalid');
+  }
+  await runtimeHostScopeList();
+  const currentScopeKey = runtimeHostProfiles.get(host.profileId);
+  const scope = currentScopeKey ? runtimeHostScopes.get(currentScopeKey) : undefined;
+  if (!scope || scope.hostId !== host.hostId) {
+    throw new Error('The selected Runtime Host is no longer available');
+  }
+  return scope;
+}
+
+async function selectedRuntimeHostScope(
+  host: DesktopRuntimeHostRef | undefined,
+): Promise<DesktopTargetScope> {
+  return host ? runtimeHostScope(host) : activeRuntimeHostRef();
+}
+
+async function loadNewTaskCatalog(): Promise<DesktopNewTaskCatalog> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const generation = newTaskCatalogGeneration;
+    const profiles = await ipcRenderer.invoke(
+      'runtime-host-profiles:getSnapshot',
+    ) as DesktopRuntimeHostProfileSnapshot;
+    await runtimeHostScopeList();
+    const hosts = await Promise.all(
+      profiles.entries
+        .filter(
+          (entry) =>
+            entry.enabled &&
+            (entry.profile.kind !== 'remote' || entry.profile.access !== 'session_guest'),
+        )
+        .map(async (entry): Promise<DesktopNewTaskHost> => {
+        if (entry.readiness !== 'ready' || !entry.hostId) {
+          return {
+            profile: entry.profile,
+            readiness: entry.readiness === 'ready'
+              ? 'reconnecting'
+              : entry.readiness === 'disabled'
+                ? 'unavailable'
+                : entry.readiness,
+            ...(entry.message ? { message: entry.message } : {}),
+          };
+        }
+        const host = { profileId: entry.profile.id, hostId: entry.hostId };
+        try {
+          const scope = await runtimeHostScope(host);
+          const [snapshot, info, settings] = await Promise.all([
+            ipcRenderer.invoke('projects:getSnapshot', scope) as Promise<DesktopProjectSnapshot>,
+            ipcRenderer.invoke('app:info', scope) as Promise<DesktopAppInfo>,
+            ipcRenderer.invoke('settings:get', scope) as Promise<AppSettings>,
+          ]);
+          return {
+            profile: entry.profile,
+            hostId: entry.hostId,
+            readiness: 'ready',
+            state: 'available',
+            projects: snapshot.projects,
+            capabilities: snapshot.capabilities,
+            selectedProjectId: info.projectId,
+            ...(settings.projects.defaultProjectId
+              ? { defaultProjectId: settings.projects.defaultProjectId }
+              : {}),
+            chatDefaults: settings.chatDefaults,
+            ...(snapshot.capabilities.viewClientPath && info.projectPath
+              ? { projectPath: info.projectPath }
+              : {}),
+            ...(info.projectGit.branch ? { branch: info.projectGit.branch } : {}),
+          };
+        } catch (error) {
+          return {
+            profile: entry.profile,
+            hostId: entry.hostId,
+            readiness: 'ready',
+            state: 'error',
+            message: error instanceof Error ? error.message : String(error),
+          };
+        }
+        }),
+    );
+    if (generation !== newTaskCatalogGeneration) continue;
+    return { defaultProfileId: profiles.defaultProfileId, hosts };
+  }
+  throw new Error('Runtime Host targets changed while the new-task catalog was loading');
+}
+
+async function invokeActiveRuntimeHost<T>(channel: string, ...args: unknown[]): Promise<T> {
+  return ipcRenderer.invoke(channel, await activeRuntimeHostRef(), ...args) as Promise<T>;
+}
+
+async function invokeSelectedRuntimeHost<T>(
+  host: DesktopRuntimeHostRef | undefined,
+  channel: string,
+  ...args: unknown[]
+): Promise<T> {
+  return ipcRenderer.invoke(channel, await selectedRuntimeHostScope(host), ...args) as Promise<T>;
+}
+
+function scopedRuntimeHost(scope: DesktopTargetScope): MakaBridge['runtimeHost'] {
+  return {
+    query(operation, input) {
+      return ipcRenderer.invoke('runtime-host:query', scope, operation, input) as Promise<
+        OperationOutput<typeof operation>
+      >;
+    },
+    command(operation, input) {
+      return ipcRenderer.invoke('runtime-host:command', scope, operation, input) as Promise<
+        OperationOutput<typeof operation>
+      >;
+    },
+  };
+}
+
+async function invokeSessionRuntimeHost<T>(
+  channel: string,
+  sessionId: string,
+  ...args: unknown[]
+): Promise<T> {
+  const session = await runtimeHostSessionRef(sessionId);
+  return ipcRenderer.invoke(channel, session.scope, session.sessionId, ...args) as Promise<T>;
+}
+
+async function invokeRuntimeHostForSession<T>(
+  channel: string,
+  sessionId: string,
+  ...args: unknown[]
+): Promise<T> {
+  const session = await runtimeHostSessionRef(sessionId);
+  return ipcRenderer.invoke(channel, session.scope, ...args) as Promise<T>;
+}
+
+async function invokeProjectedSessionRuntimeHost<T>(
+  channel: string,
+  sessionId: string,
+  ...args: unknown[]
+): Promise<T> {
+  return invokeProjectedSessionRuntimeHostBridge<T>(
+    runtimeHostSessionRef,
+    (targetChannel, scope, rawSessionId, ...targetArgs) => ipcRenderer.invoke(
+      targetChannel,
+      scope,
+      rawSessionId,
+      ...targetArgs,
+    ),
+    channel,
+    sessionId,
+    ...args,
+  );
+}
+
+async function invokeSessionSummary(
+  channel: string,
+  sessionId: string,
+  ...args: unknown[]
+): Promise<DesktopSessionSummary> {
+  const session = await runtimeHostSessionRef(sessionId);
+  const summary = await ipcRenderer.invoke(
+    channel,
+    session.scope,
+    session.sessionId,
+    ...args,
+  ) as DesktopSessionSummaryInput;
+  return projectSessionSummary(session.scope, summary);
+}
+
+async function invokeBranchFromTurn(
+  sessionId: string,
+  input: DesktopBranchFromTurnInput & { sideConversation: true },
+): Promise<DesktopSideConversationBranchResult>;
+async function invokeBranchFromTurn(
+  sessionId: string,
+  input: DesktopBranchFromTurnInput & { sideConversation?: false },
+): Promise<DesktopSessionSummary>;
+async function invokeBranchFromTurn(
+  sessionId: string,
+  input: DesktopBranchFromTurnInput,
+): Promise<DesktopSessionSummary | DesktopSideConversationBranchResult> {
+  const ref = await runtimeHostSessionRef(sessionId);
+  const result = await ipcRenderer.invoke(
+    'sessions:branchFromTurn',
+    ref.scope,
+    ref.sessionId,
+    input,
+  ) as DesktopSessionSummaryInput | { ok: true; session: DesktopSessionSummaryInput } | { ok: false; reason: string };
+  if (input.sideConversation) {
+    if (!('ok' in result) || result.ok === false) {
+      return result as DesktopSideConversationBranchResult;
+    }
+    return { ok: true, session: projectCreatedSessionSummary(ref.scope, result.session) };
+  }
+  return projectCreatedSessionSummary(ref.scope, result as DesktopSessionSummaryInput);
+}
+
+async function invokeSessionInput<T, I extends { readonly sessionId: string }>(
+  channel: string,
+  input: I,
+  ...args: unknown[]
+): Promise<T> {
+  const session = await runtimeHostSessionRef(input.sessionId);
+  return ipcRenderer.invoke(
+    channel,
+    session.scope,
+    { ...input, sessionId: session.sessionId },
+    ...args,
+  ) as Promise<T>;
+}
+
+function projectSessionSummary(
+  scope: DesktopTargetScope,
+  session: DesktopSessionSummaryInput,
+): DesktopSessionSummary {
+  const projected = projectSessionCatalogSummary(scope, session);
+  runtimeHostSessionProfiles.set(projected.id, projected.profileId);
+  return projected;
+}
+
+function projectSessionCatalogSummary(
+  scope: DesktopTargetScope,
+  session: DesktopSessionSummaryInput,
+): DesktopSessionSummary {
+  const metadata = runtimeHostMetadataFor(scope);
+  if (!metadata) throw new Error('Desktop Runtime Host metadata is unavailable');
+  return projectDesktopSessionSummary(
+    { ...scope, ...metadata },
+    session,
+  );
+}
+
+function recordSessionCatalogAuthorities(sessions: readonly DesktopSessionSummary[]): void {
+  for (const session of sessions) {
+    runtimeHostSessionProfiles.set(session.id, session.profileId);
+  }
+}
+
+function commitDesktopSessionCatalog(catalog: RuntimeHostSessionCatalogCoverage): void {
+  recordSessionCatalogAuthorities(catalog.sessions);
+  lastDesktopSessionCatalog = catalog;
+}
+
+function projectOnboardingSnapshot(
+  scope: DesktopTargetScope,
+  snapshot: OnboardingSnapshot,
+): OnboardingSnapshot {
+  return {
+    ...snapshot,
+    sessions: snapshot.sessions.map((session) => projectSessionSummary(scope, session)),
+    sessionSendOutcomes: projectOnboardingSendOutcomes(scope, snapshot.sessionSendOutcomes),
+  };
+}
+
+function projectOnboardingSendOutcomes(
+  scope: DesktopTargetScope,
+  outcomes: OnboardingSnapshot['sessionSendOutcomes'],
+): OnboardingSnapshot['sessionSendOutcomes'] {
+  return Object.fromEntries(
+    Object.entries(outcomes).map(([sessionId, outcome]) => [
+      recordRuntimeHostSessionScope(scope, sessionId),
+      outcome,
+    ]),
+  );
+}
+
+async function loadDesktopOnboardingSnapshot(): Promise<OnboardingSnapshot> {
+  const catalogSeed = desktopSessionCatalogRefresher.beginSeed();
+  const defaultScope = await activeRuntimeHostRef();
+  const readyScopes = await readyOwnerRuntimeHostScopes();
+  const scopes = [
+    defaultScope,
+    ...readyScopes.filter(
+      (scope) =>
+        scope.hostId !== defaultScope.hostId || scope.targetEpoch !== defaultScope.targetEpoch,
+    ),
+  ];
+  const results = await Promise.allSettled(
+    scopes.map(async (scope) => ({
+      scope,
+      snapshot: await ipcRenderer.invoke('onboarding:getSnapshot', scope) as OnboardingSnapshot,
+    })),
+  );
+  const primary = results[0];
+  if (!primary || primary.status === 'rejected') {
+    throw primary?.reason ?? new Error('Default Runtime Host onboarding is unavailable');
+  }
+  const snapshots = results.flatMap((result) =>
+    result.status === 'fulfilled'
+      ? [result.value]
+      : [],
+  );
+  // A successful Owner onboarding snapshot is already an authenticated,
+  // complete catalog. Seed it before the independent catalog refresh so a
+  // transient sessions:list failure cannot blank the first renderer commit.
+  const ownerSnapshots = snapshots.filter(
+    ({ scope }) => runtimeHostMetadataFor(scope)?.profileAccess === 'owner',
+  );
+  const completeHostIds = [...new Set(ownerSnapshots.map(({ scope }) => scope.hostId))];
+  catalogSeed.commit({
+    sessions: reconcileRuntimeHostSessionCatalog(lastDesktopSessionCatalog.sessions, {
+      sessions: ownerSnapshots.flatMap(({ scope, snapshot }) =>
+        snapshot.sessions.map((session) => projectSessionCatalogSummary(scope, session))),
+      completeHostIds,
+      knownOwnerProfileIds: [...runtimeHostMetadata.values()].flatMap(
+        ({ profileId, profileAccess }) => profileAccess === 'owner' ? [profileId] : [],
+      ),
+    }),
+    completeHostIds,
+  });
+  const sessions = await listDesktopSessions();
+  return {
+    ...snapshots[0]!.snapshot,
+    sessions,
+    sessionSendOutcomes: Object.assign(
+      {},
+      ...snapshots.map(({ scope, snapshot }) =>
+        projectOnboardingSendOutcomes(scope, snapshot.sessionSendOutcomes)),
+    ),
+  };
+}
+
+function projectShellRunUpdate(
+  scope: DesktopTargetScope,
+  update: ShellRunUpdate,
+): ShellRunUpdate {
+  const sessionId = (value: string): string =>
+    recordRuntimeHostSessionScope(scope, value);
+  return {
+    ...update,
+    sessionId: sessionId(update.sessionId),
+    ownership: update.ownership.kind === 'local'
+      ? update.ownership
+      : update.ownership.kind === 'source_owned'
+        ? {
+            ...update.ownership,
+            sourceSessionId: sessionId(update.ownership.sourceSessionId),
+            ownerSessionId: sessionId(update.ownership.ownerSessionId),
+          }
+        : {
+            ...update.ownership,
+            sourceSessionId: sessionId(update.ownership.sourceSessionId),
+          },
+  };
+}
+
+function subscribeRuntimeHostEvent<T extends readonly unknown[]>(
+  channel: string,
+  scope: DesktopTargetScope,
+  handler: (...args: T) => void,
+): () => void {
+  const listener = (
+    _event: Electron.IpcRendererEvent,
+    value: unknown,
+    ...args: unknown[]
+  ): void => {
+    let eventScope: DesktopTargetScope;
+    try {
+      eventScope = requireDesktopTargetScope(value);
+    } catch {
+      return;
+    }
+    const current = runtimeHostScopes.get(runtimeHostScopeKey(scope));
+    if (
+      !current ||
+      eventScope.hostId !== current.hostId ||
+      eventScope.targetEpoch !== current.targetEpoch ||
+      eventScope.targetEpoch !== scope.targetEpoch
+    ) return;
+    handler(...(args as unknown as T));
+  };
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.off(channel, listener);
+}
+
+function subscribeEveryRuntimeHostEvent<T extends readonly unknown[]>(
+  channel: string,
+  handler: (scope: DesktopTargetScope, ...args: T) => void,
+): () => void {
+  const listener = (
+    _event: Electron.IpcRendererEvent,
+    value: unknown,
+    ...args: unknown[]
+  ): void => {
+    let scope: DesktopTargetScope;
+    try {
+      scope = requireDesktopTargetScope(value);
+    } catch {
+      return;
+    }
+    const current = runtimeHostScopes.get(runtimeHostScopeKey(scope));
+    if (!current || current.targetEpoch !== scope.targetEpoch) return;
+    handler(scope, ...(args as unknown as T));
+  };
+  ipcRenderer.on(channel, listener);
+  void runtimeHostScopeList().catch(() => undefined);
+  return () => {
+    ipcRenderer.off(channel, listener);
+  };
+}
+
+function subscribeGuestSessionMountChanges(
+  handler: () => void,
+): () => void {
+  const listener = (): void => handler();
+  ipcRenderer.on('session-collaboration:mounts:changed', listener);
+  return () => ipcRenderer.off('session-collaboration:mounts:changed', listener);
+}
+
+const desktopSessionCatalogRefresher = createRuntimeHostSessionCatalogRefresher({
+  currentCatalog: () => lastDesktopSessionCatalog,
+  listCatalog: async () => {
+    const owners = listDesktopOwnerSessionsWithCoverage();
+    return resolveRuntimeHostSessionCatalog(
+      lastDesktopSessionCatalog.sessions,
+      owners,
+      () => [...runtimeHostMetadata.values()].flatMap(({ profileId, profileAccess }) =>
+        profileAccess === 'owner' ? [profileId] : []),
+      listGuestSessionMountCatalog(),
+    );
+  },
+  commitCatalog: commitDesktopSessionCatalog,
+});
+
+function projectCreatedSessionSummary(
+  scope: DesktopTargetScope,
+  session: DesktopSessionSummaryInput,
+): DesktopSessionSummary {
+  const projected = projectSessionSummary(scope, session);
+  // Guest catalog membership belongs exclusively to the retained mount
+  // service. A newly created Owner Session, however, must be visible before
+  // an older catalog read can settle.
+  if (runtimeHostMetadataFor(scope)?.profileAccess === 'owner') {
+    desktopSessionCatalogRefresher.admit(projected);
+  }
+  return projected;
+}
+
+async function listDesktopSessions(
+  filter?: SessionListFilter,
+): Promise<DesktopSessionSummary[]> {
+  if (filter?.subagentParentSessionId) {
+    const parent = await runtimeHostSessionRef(filter.subagentParentSessionId);
+    const sessions = await ipcRenderer.invoke(
+      'sessions:list',
+      parent.scope,
+      { ...filter, subagentParentSessionId: parent.sessionId },
+    ) as DesktopSessionSummaryInput[];
+    return sessions.map((session) => projectSessionSummary(parent.scope, session));
+  }
+  return (await desktopSessionCatalogRefresher.refresh()).sessions;
+}
+
+async function listDesktopOwnerSessionsWithCoverage(): Promise<{
+  sessions: DesktopSessionSummary[];
+  completeHostIds: string[];
+}> {
+  await runtimeHostScopeList();
+  const catalog = await ipcRenderer.invoke('session-local:catalog') as { scope: DesktopTargetScope; sessions: DesktopSessionSummaryInput[]; authoritative: boolean }[];
+  return {
+    sessions: catalog.flatMap(({ scope, sessions }) => sessions.map((session) => projectSessionSummary(scope, session))),
+    completeHostIds: catalog.filter((entry) => entry.authoritative).map((entry) => entry.scope.hostId),
+  };
+}
+
+async function listGuestSessionMountCatalog(): Promise<DesktopSessionSummary[]> {
+  const mounts: unknown = await ipcRenderer.invoke('session-collaboration:mount:list');
+  if (!Array.isArray(mounts)) {
+    throw new Error('Desktop shared Session mounts are unavailable');
+  }
+  const sessions: DesktopSessionSummary[] = [];
+  for (const mount of mounts) {
+    if (
+      !mount ||
+      typeof mount !== 'object' ||
+      !('mountId' in mount) ||
+      typeof mount.mountId !== 'string' ||
+      !('name' in mount) ||
+      typeof mount.name !== 'string' ||
+      !('hostId' in mount) ||
+      typeof mount.hostId !== 'string'
+    ) {
+      throw new Error('Desktop shared Session mount is invalid');
+    }
+    if (!('session' in mount) || mount.session === undefined) continue;
+    const session = decodeSharedSessionCatalogProjection(mount.session);
+    const summary = projectDesktopSharedSessionSummary(session);
+    const projected = projectDesktopSessionSummary(
+      {
+        hostId: mount.hostId,
+        profileId: mount.mountId,
+        profileName: mount.name,
+        profileKind: 'remote',
+      },
+      summary,
+    );
+    sessions.push(projected);
+  }
+  return sessions;
+}
+
+async function createDesktopSessionOnScope(
+  scope: DesktopTargetScope,
+  input?: CreateSessionRequestInput,
+): Promise<DesktopSessionSummary> {
+  const session = await ipcRenderer.invoke('sessions:create', scope, input) as DesktopSessionSummaryInput;
+  return projectCreatedSessionSummary(scope, session);
+}
+
+function sendActiveRuntimeHost(channel: string, ...args: unknown[]): void {
+  void activeRuntimeHostRef()
+    .then((scope) => ipcRenderer.send(channel, scope, ...args))
+    .catch(() => undefined);
+}
+
+function subscribeActiveRuntimeHostEvent<T extends readonly unknown[]>(
+  channel: string,
+  handler: (...args: T) => void,
+): () => void {
+  const listener = (
+    _event: Electron.IpcRendererEvent,
+    scope: unknown,
+    ...args: unknown[]
+  ): void => {
+    let host: DesktopTargetScope;
+    try {
+      host = requireDesktopTargetScope(scope);
+    } catch {
+      return;
+    }
+    if (
+      !activeRuntimeHost ||
+      host.hostId !== activeRuntimeHost.hostId ||
+      host.targetEpoch !== activeRuntimeHost.targetEpoch
+    ) return;
+    handler(...(args as unknown as T));
+  };
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.off(channel, listener);
+}
+
+function subscribeSelectedRuntimeHostEvent<T extends readonly unknown[]>(
+  channel: string,
+  host: DesktopRuntimeHostRef | undefined,
+  handler: (...args: T) => void,
+): () => void {
+  if (!host) return subscribeActiveRuntimeHostEvent(channel, handler);
+  return subscribeEveryRuntimeHostEvent(channel, (scope, ...args: T) => {
+    if (
+      scope.hostId !== host.hostId ||
+      runtimeHostProfiles.get(host.profileId) !== runtimeHostScopeKey(scope)
+    ) return;
+    handler(...args);
+  });
+}
+
+const runtimeHost: MakaBridge['runtimeHost'] = {
+  query(operation, input) {
+    return invokeActiveRuntimeHost('runtime-host:query', operation, input) as Promise<
+      OperationOutput<typeof operation>
+    >;
+  },
+  command(operation, input) {
+    return invokeActiveRuntimeHost('runtime-host:command', operation, input) as Promise<
+      OperationOutput<typeof operation>
+    >;
+  },
+};
+
+async function listScheduledTasks(target?: DesktopRuntimeHostRef): Promise<ScheduledTask[]> {
+  const host = scopedRuntimeHost(await selectedRuntimeHostScope(target));
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const tasks: ScheduledTask[] = [];
+    const taskIds = new Set<string>();
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    let revision: number | undefined;
+    let retry = false;
+    do {
+      const result = await host.query('scheduled-task.query', {
+        kind: 'list',
+        ...(cursor === undefined ? {} : { cursor, expectedRevision: revision! }),
+      });
+      if (result.kind === 'revision_changed') {
+        retry = true;
+        break;
+      }
+      if (result.kind !== 'page') throw new Error('Invalid ScheduledTask catalog page');
+      revision ??= result.revision;
+      if (result.revision !== revision) {
+        throw new Error('ScheduledTask catalog revision changed without a restart signal');
+      }
+      for (const task of result.tasks) {
+        if (taskIds.has(task.id)) throw new Error('ScheduledTask catalog repeated a task');
+        taskIds.add(task.id);
+      }
+      tasks.push(...result.tasks);
+      if (tasks.length > SCHEDULED_TASK_CATALOG_MAX_ITEMS) {
+        throw new Error('ScheduledTask catalog exceeds its item limit');
+      }
+      cursor = result.nextCursor ?? undefined;
+      if (cursor !== undefined) {
+        if (result.tasks.length === 0 || cursors.has(cursor)) {
+          throw new Error('ScheduledTask catalog repeated a page cursor');
+        }
+        cursors.add(cursor);
+      }
+    } while (cursor !== undefined);
+    if (!retry) return tasks;
+  }
+  throw new Error('ScheduledTask catalog kept changing while Desktop read it');
+}
+
+async function mutateScheduledTask(
+  input: OperationInput<'scheduled-task.mutate'>,
+  target?: DesktopRuntimeHostRef,
+): Promise<ScheduledTask> {
+  const host = scopedRuntimeHost(await selectedRuntimeHostScope(target));
+  const result = await host.command('scheduled-task.mutate', input);
+  if (result.kind !== 'task') throw new Error('Runtime Host returned no ScheduledTask');
+  return result.task;
+}
+
+async function loadSessionTracePage(
+  sessionId: string,
+  cursor?: string,
+): Promise<DesktopSessionTracePage> {
+  const session = await runtimeHostSessionRef(sessionId);
+  const host = scopedRuntimeHost(session.scope);
+  const page = await host.query(
+    'execution.inspect.query',
+    cursor
+      ? {
+          kind: 'session_trace_continue',
+          sessionId: session.sessionId,
+          cursor,
+        }
+      : { kind: 'session_trace_start', sessionId: session.sessionId },
+  );
+  if (page.kind !== 'session_trace_page') throw new Error('Invalid Session trace page');
+  const trace = {
+    schemaVersion: page.schemaVersion,
+    sessionId,
+    turns: [...page.turns],
+    coverage: page.coverage,
+  };
+  if (!isSessionTrace(trace)) throw new Error('Invalid Session trace projection');
+  return { trace, nextCursor: page.nextCursor };
+}
+
+async function loadSessionUsageSummary(
+  sessionId: string,
+): Promise<Result<DesktopSessionUsageSummary>> {
+  const session = await runtimeHostSessionRef(sessionId);
+  return ipcRenderer.invoke(
+    'usage:summary',
+    session.scope,
+    { range: 'all', sessionId: session.sessionId },
+  ) as Promise<Result<DesktopSessionUsageSummary>>;
+}
+
+async function updateDailyReviewConfig(
+  patch: Partial<DailyReviewConfig>,
+  target?: DesktopRuntimeHostRef,
+): Promise<DailyReviewConfig> {
+  const host = scopedRuntimeHost(await selectedRuntimeHostScope(target));
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const current = await host.query('daily-review.query', { kind: 'config' });
+    if (current.kind !== 'config') throw new Error('Invalid Daily Review config');
+    const config = normalizeDailyReviewConfig({ ...current.config, ...patch });
+    const result = await host.command('daily-review.mutate', {
+      kind: 'update_config',
+      expectedRevision: current.revision,
+      config,
+    });
+    if (result.kind === 'config_committed' || result.kind === 'config_unchanged') {
+      return result.config;
+    }
+  }
+  throw new Error('Daily Review config kept changing while Desktop updated it');
+}
+
+async function listDailyReviewArchives(): Promise<DailyReviewArchiveSummary[]> {
+  const host = scopedRuntimeHost(await activeRuntimeHostRef());
+  const archives: DailyReviewArchiveSummary[] = [];
+  let beforeArchiveId: string | null = null;
+  do {
+    const result: OperationOutput<'daily-review.query'> = await host.query(
+      'daily-review.query', {
+      kind: 'archives',
+      beforeArchiveId,
+      limit: 32,
+      },
+    );
+    if (result.kind !== 'archives') throw new Error('Invalid Daily Review archive page');
+    archives.push(...result.archives);
+    beforeArchiveId = result.nextBeforeArchiveId;
+  } while (beforeArchiveId !== null);
+  return archives;
+}
+
+function executeWebSearchQuery(input: {
+  query: string;
+  limit?: number;
+  provider?: WebSearchProvider;
+  apiKey?: string;
+}, host?: DesktopRuntimeHostRef): Promise<WebSearchResponse> {
+  if (input.provider !== undefined && !isWebSearchProvider(input.provider)) {
+    return Promise.resolve(unsupportedWebSearchProvider());
+  }
+  if (input.provider === 'model') {
+    return Promise.resolve({
+      ok: false,
+      reason: 'unsupported_provider',
+      message: 'web search runs through the primary model inside tasks',
+    });
+  }
+  const query = normalizeWebSearchQuery(input.query);
+  if (!query) {
+    return Promise.resolve({
+      ok: false,
+      reason: 'invalid_query',
+      message: 'the query is empty after normalization',
+    });
+  }
+  const apiKey = webSearchCredentialOverride(input.apiKey);
+  return selectedRuntimeHostScope(host).then((scope) =>
+    scopedRuntimeHost(scope).command('web-search.execute', {
+      kind: 'query',
+      query,
+      limit: normalizeWebSearchLimit(input.limit),
+      ...(apiKey ? { apiKey } : {}),
+    }));
+}
+
+function executeWebSearchTest(input: {
+  provider?: WebSearchProvider;
+  apiKey?: string;
+}, host?: DesktopRuntimeHostRef): Promise<WebSearchResponse> {
+  if (input.provider !== undefined && !isWebSearchProvider(input.provider)) {
+    return Promise.resolve(unsupportedWebSearchProvider());
+  }
+  if (input.provider === 'model') {
+    return Promise.resolve({
+      ok: false,
+      reason: 'unsupported_provider',
+      message: 'web search runs through the primary model inside tasks',
+    });
+  }
+  const apiKey = webSearchCredentialOverride(input.apiKey);
+  return selectedRuntimeHostScope(host).then((scope) =>
+    scopedRuntimeHost(scope).command('web-search.execute', {
+      kind: 'test',
+      provider: 'tavily',
+      ...(apiKey ? { apiKey } : {}),
+    }));
+}
+
+function unsupportedWebSearchProvider(): WebSearchResponse {
+  return {
+    ok: false,
+    reason: 'unsupported_provider',
+    message: 'no web search provider is configured',
+  };
+}
+
+function webSearchCredentialOverride(value: unknown): string | undefined {
+  return typeof value === 'string' &&
+    value.length > 0 &&
+    value !== MASKED_TOKEN_SENTINEL &&
+    value !== SENSITIVE_PLACEHOLDER
+    ? value
+    : undefined;
+}
+
+function integer(value: unknown, fallback: number): number {
+  return Number.isFinite(value) ? Math.trunc(value as number) : fallback;
+}
+
+async function bridgeResult<T>(operation: () => Promise<T>, code: string): Promise<Result<T>> {
+  try {
+    return { ok: true, data: await operation() };
+  } catch (error) {
+    return {
+      ok: false,
+      error: {
+        code,
+        message: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+}
+
+const browserDocumentId = crypto.randomUUID();
+ipcRenderer.send('browser:document-ready', browserDocumentId);
+const browserSelection = createBrowserSelectionCoordinator(runtimeHostSessionRef, {
+  show(documentId, generation, session) {
+    ipcRenderer.send(
+      'browser:active-session',
+      session.scope,
+      session.sessionId,
+      documentId,
+      generation,
+    );
+  },
+  hide(documentId, generation) {
+    ipcRenderer.send('browser:hide-active-session', documentId, generation);
+  },
+  setViewport(documentId, generation, session, rect) {
+    ipcRenderer.send(
+      'browser:setViewport',
+      session.scope,
+      { sessionId: session.sessionId, rect },
+      documentId,
+      generation,
+    );
+  },
+}, browserDocumentId);
 
 const makaBridge = {
-  tasks: {
-    list(sessionId: string): Promise<Task[]> {
-      return ipcRenderer.invoke('tasks:list', sessionId);
+  workHubControl: workHubControlBridge,
+  workHubPresentation: workHubPresentationBridge,
+  runtimeHost,
+  sessionCollaboration: {
+    async prepareInvitation(sessionId, preset, allowInsecure = false) {
+      const session = await runtimeHostSessionRef(sessionId);
+      return ipcRenderer.invoke(
+        'session-collaboration:prepare',
+        session.scope,
+        session.sessionId,
+        preset,
+        allowInsecure,
+      );
     },
-    subscribeChanges(handler: (event: TaskLedgerChangedEvent) => void): () => void {
-      const listener = (_event: Electron.IpcRendererEvent, payload: TaskLedgerChangedEvent) => handler(payload);
-      ipcRenderer.on('tasks:changed', listener);
-      return () => ipcRenderer.off('tasks:changed', listener);
+    async getAccess(sessionId) {
+      const session = await runtimeHostSessionRef(sessionId);
+      return ipcRenderer.invoke(
+        'session-collaboration:getAccess',
+        session.scope,
+        session.sessionId,
+      );
+    },
+    async revokePrincipal(sessionId, principalId) {
+      const session = await runtimeHostSessionRef(sessionId);
+      return ipcRenderer.invoke(
+        'session-collaboration:revokePrincipal',
+        session.scope,
+        principalId,
+      );
+    },
+    async renamePrincipal(sessionId, principalId, displayName) {
+      const session = await runtimeHostSessionRef(sessionId);
+      return ipcRenderer.invoke('session-collaboration:renamePrincipal', session.scope, principalId, displayName);
+    },
+    async revokeGrant(sessionId, grantId) {
+      const session = await runtimeHostSessionRef(sessionId);
+      return ipcRenderer.invoke(
+        'session-collaboration:revokeGrant',
+        session.scope,
+        grantId,
+      );
+    },
+    async importInvitation({ code, allowInsecure = false, operationId }, onProgress) {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        progressOperationId: string,
+        phase: Parameters<NonNullable<typeof onProgress>>[0],
+      ) => {
+        if (progressOperationId === operationId) onProgress?.(phase);
+      };
+      ipcRenderer.on('session-collaboration:import:progress', listener);
+      try {
+        return await ipcRenderer.invoke(
+          'session-collaboration:import',
+          code,
+          allowInsecure,
+          operationId,
+        );
+      } finally {
+        ipcRenderer.off('session-collaboration:import:progress', listener);
+      }
+    },
+    cancelImport(operationId) {
+      return ipcRenderer.invoke('session-collaboration:import:cancel', operationId);
+    },
+    readInvitationClipboard() {
+      return ipcRenderer.invoke('session-collaboration:invitation:read-clipboard');
+    },
+    listMounts() {
+      return ipcRenderer.invoke('session-collaboration:mount:list');
+    },
+    subscribeMountChanges(handler) {
+      return subscribeGuestSessionMountChanges(() => handler());
+    },
+    removeMount(mountId) {
+      return ipcRenderer.invoke('session-collaboration:mount:remove', mountId);
+    },
+    retryMount(mountId) {
+      return ipcRenderer.invoke('session-collaboration:mount:retry', mountId);
+    },
+    renameMount(mountId, name) {
+      return ipcRenderer.invoke('session-collaboration:mount:rename', mountId, name);
+    },
+    async requestTurn(sessionId, input) {
+      const session = await runtimeHostSessionRef(sessionId);
+      return ipcRenderer.invoke(
+        'session-collaboration:turn-request:create',
+        session.scope,
+        input.kind === 'start'
+          ? {
+              sessionId: session.sessionId,
+              turnId: input.turnId,
+              content: { text: input.text },
+            }
+          : {
+              sessionId: session.sessionId,
+              turnId: input.turnId,
+              sourceTurnId: input.sourceTurnId,
+            },
+      );
+    },
+    async getTurnRequests(sessionId) {
+      const session = await runtimeHostSessionRef(sessionId);
+      return ipcRenderer.invoke(
+        'session-collaboration:turn-request:query',
+        session.scope,
+        session.sessionId,
+      );
+    },
+    async getPendingTurnRequests() {
+      const scopes = await readyOwnerRuntimeHostScopes();
+      return collectAvailablePendingTurnRequests(
+        scopes.map(async (scope) => {
+          const result = await ipcRenderer.invoke(
+            'session-collaboration:turn-request:query',
+            scope,
+          ) as CollaborationTurnRequestQueryResult;
+          return result.requests
+            .filter((request) => request.state.kind === 'pending')
+            .map((request): SessionTurnAccessRequest => ({
+              ...request,
+              intent: {
+                ...request.intent,
+                sessionId: recordRuntimeHostSessionScope(scope, request.intent.sessionId),
+              },
+            }));
+        }),
+      );
+    },
+    async acknowledgeTurnRequest(sessionId, requestId) {
+      const session = await runtimeHostSessionRef(sessionId);
+      return ipcRenderer.invoke(
+        'session-collaboration:turn-request:acknowledge',
+        session.scope,
+        requestId,
+      );
+    },
+    async withdrawTurnRequest(sessionId, requestId) {
+      const session = await runtimeHostSessionRef(sessionId);
+      return ipcRenderer.invoke(
+        'session-collaboration:turn-request:withdraw',
+        session.scope,
+        requestId,
+      ) as Promise<CollaborationTurnRequestWithdrawResult>;
+    },
+    async decideTurnRequest(sessionId, requestId, decision) {
+      const session = await runtimeHostSessionRef(sessionId);
+      return ipcRenderer.invoke(
+        'session-collaboration:turn-request:decide',
+        session.scope,
+        requestId,
+        decision,
+      );
+    },
+  },
+  runtimeHostProfiles: {
+    getSnapshot() {
+      return ipcRenderer.invoke('runtime-host-profiles:getSnapshot');
+    },
+    async getDefaultHost(): Promise<DesktopRuntimeHostRef> {
+      const scope = await activeRuntimeHostRef();
+      const metadata = runtimeHostMetadataFor(scope);
+      if (!metadata) throw new Error('The default Runtime Host identity is unavailable');
+      return { profileId: metadata.profileId, hostId: scope.hostId };
+    },
+    addAndEnable(input: DesktopRuntimeHostProfileAddInput) {
+      return ipcRenderer.invoke('runtime-host-profiles:add-and-enable', input);
+    },
+    importConnectionCode(code: string) {
+      return ipcRenderer.invoke('runtime-host-profiles:import-connection-code', code);
+    },
+    remove(profileId: string) {
+      return ipcRenderer.invoke('runtime-host-profiles:remove', profileId);
+    },
+    discardPairing(profileId: string) {
+      return ipcRenderer.invoke('runtime-host-profiles:discard-pairing', profileId);
+    },
+    setEnabled(profileId: string, enabled: boolean) {
+      return ipcRenderer.invoke('runtime-host-profiles:set-enabled', profileId, enabled);
+    },
+    setDefault(profileId: string) {
+      return ipcRenderer.invoke('runtime-host-profiles:set-default', profileId);
+    },
+    resolvePairingRecovery(profileId?: string) {
+      return ipcRenderer.invoke('runtime-host-profiles:resolve-pairing-recovery', profileId);
+    },
+    subscribeChanges(handler: (event: DesktopRuntimeHostProfileChangedEvent) => void) {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        payload: RuntimeHostProfileWireEvent,
+      ) => {
+        handler(payload);
+      };
+      ipcRenderer.on('runtime-host-profiles:changed', listener);
+      return () => ipcRenderer.off('runtime-host-profiles:changed', listener);
+    },
+  },
+  localRuntimeHostRemoteAccess: {
+    getSnapshot() {
+      return ipcRenderer.invoke('local-runtime-host-remote-access:get-snapshot');
+    },
+    enable(input: {
+      readonly allowInterruptActiveTasks: boolean;
+      readonly coordinationRelays: readonly string[];
+    }) {
+      return ipcRenderer.invoke('local-runtime-host-remote-access:enable', input);
+    },
+    createConnectionCode() {
+      return ipcRenderer.invoke(
+        'local-runtime-host-remote-access:create-connection-code',
+      );
+    },
+    revokeSharedAccess() {
+      return ipcRenderer.invoke('local-runtime-host-remote-access:revoke-shared-access');
+    },
+    disable() {
+      return ipcRenderer.invoke('local-runtime-host-remote-access:disable');
+    },
+  },
+  runtimeHostSshTerminal: {
+    getSnapshot(): Promise<DesktopRuntimeHostSshTerminalSnapshot> {
+      return ipcRenderer.invoke('runtime-host-ssh-terminal:getSnapshot');
+    },
+    write(sessionId: string, data: string) {
+      return ipcRenderer.invoke('runtime-host-ssh-terminal:write', {
+        sessionId,
+        data,
+      });
+    },
+    resize(sessionId: string, cols: number, rows: number) {
+      return ipcRenderer.invoke('runtime-host-ssh-terminal:resize', {
+        sessionId,
+        cols,
+        rows,
+      });
+    },
+    cancel(sessionId: string) {
+      return ipcRenderer.invoke('runtime-host-ssh-terminal:cancel', sessionId);
+    },
+    subscribe(handler: (event: DesktopRuntimeHostSshTerminalEvent) => void) {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        payload: DesktopRuntimeHostSshTerminalEvent,
+      ) => handler(payload);
+      ipcRenderer.on('runtime-host-ssh-terminal:event', listener);
+      return () => ipcRenderer.off('runtime-host-ssh-terminal:event', listener);
+    },
+  },
+  runtimeHostOnboarding: {
+    listWslDistributions(): Promise<readonly string[]> {
+      return ipcRenderer.invoke('runtime-host-onboarding:listWslDistributions');
+    },
+    getSnapshot(): Promise<DesktopRuntimeHostOnboardingSnapshot> {
+      return ipcRenderer.invoke('runtime-host-onboarding:getSnapshot');
+    },
+    start(input: DesktopRuntimeHostOnboardingInput): Promise<DesktopRuntimeHostOnboardingSnapshot> {
+      return ipcRenderer.invoke('runtime-host-onboarding:start', input);
+    },
+    cancel(): Promise<boolean> {
+      return ipcRenderer.invoke('runtime-host-onboarding:cancel');
+    },
+    reset(): Promise<void> {
+      return ipcRenderer.invoke('runtime-host-onboarding:reset');
+    },
+    subscribe(handler: (snapshot: DesktopRuntimeHostOnboardingSnapshot) => void) {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        snapshot: DesktopRuntimeHostOnboardingSnapshot,
+      ) => handler(snapshot);
+      ipcRenderer.on('runtime-host-onboarding:changed', listener);
+      return () => ipcRenderer.off('runtime-host-onboarding:changed', listener);
+    },
+  },
+  runtimeHostManagement: {
+    run(
+      profileId: string,
+      action: DesktopRuntimeHostManagementAction,
+      allowInterruptActiveTasks = false,
+    ): Promise<DesktopRuntimeHostManagementResponse> {
+      return ipcRenderer.invoke(
+        'runtime-host-management:run',
+        profileId,
+        action,
+        allowInterruptActiveTasks,
+      );
+    },
+    update(
+      profileId: string,
+      allowInterruptActiveTasks: boolean,
+    ): Promise<DesktopRuntimeHostManagementResponse> {
+      return ipcRenderer.invoke(
+        'runtime-host-management:update',
+        profileId,
+        allowInterruptActiveTasks,
+      );
+    },
+    configureProjectDirectories(
+      profileId: string,
+      roots: readonly { readonly label: string; readonly path: string }[],
+      expectedConfigFingerprint: string,
+      allowInterruptActiveTasks: boolean,
+    ): Promise<DesktopRuntimeHostManagementResponse> {
+      return ipcRenderer.invoke(
+        'runtime-host-management:configure-project-directories',
+        profileId,
+        roots,
+        expectedConfigFingerprint,
+        allowInterruptActiveTasks,
+      );
+    },
+    subscribeProgress(handler: (progress: DesktopRuntimeHostManagementProgress) => void) {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        progress: DesktopRuntimeHostManagementProgress,
+      ) => handler(progress);
+      ipcRenderer.on('runtime-host-management:progress', listener);
+      return () => ipcRenderer.off('runtime-host-management:progress', listener);
+    },
+    getUpdatePolicy(profileId: string) {
+      return ipcRenderer.invoke('runtime-host-management:get-update-policy', profileId);
+    },
+    setUpdatePolicy(
+      profileId: string,
+      policy: import('@maka/runtime-host/operator').RuntimeHostManagedUpdatePolicy,
+    ) {
+      return ipcRenderer.invoke('runtime-host-management:set-update-policy', profileId, policy);
+    },
+    reconcileUpdate(profileId: string) {
+      return ipcRenderer.invoke('runtime-host-management:reconcile-update', profileId);
+    },
+    getResources(profileId: string) {
+      return ipcRenderer.invoke('runtime-host-management:get-resources', profileId);
+    },
+    getDirectPeer(profileId: string) {
+      return ipcRenderer.invoke('runtime-host-management:get-direct-peer', profileId);
+    },
+    configureDirectPeer(
+      profileId: string,
+      enabled: boolean,
+      coordinationRelays: readonly string[],
+      automaticRelayDiscovery: boolean,
+      webRtcStunPolicy?: import('@maka/runtime-host/operator').RuntimeHostWebRtcStunPolicy,
+    ) {
+      return ipcRenderer.invoke(
+        'runtime-host-management:configure-direct-peer',
+        profileId,
+        enabled,
+        coordinationRelays,
+        automaticRelayDiscovery,
+        webRtcStunPolicy,
+      );
+    },
+    createConnectionCode(profileId: string): Promise<string> {
+      return ipcRenderer.invoke('runtime-host-management:create-connection-code', profileId);
+    },
+    listCredentials(profileId: string): Promise<DesktopRuntimeHostAccessSnapshot> {
+      return ipcRenderer.invoke('runtime-host-management:list-credentials', profileId);
+    },
+    rotateCredential(profileId: string): Promise<DesktopRuntimeHostAccessSnapshot> {
+      return ipcRenderer.invoke('runtime-host-management:rotate-credential', profileId);
+    },
+    revokeCredential(
+      profileId: string,
+      credentialId: string,
+    ): Promise<DesktopRuntimeHostAccessSnapshot> {
+      return ipcRenderer.invoke(
+        'runtime-host-management:revoke-credential',
+        profileId,
+        credentialId,
+      );
+    },
+  },
+  runtimeHostPeerMesh: {
+    getConnectivityPolicy() {
+      return ipcRenderer.invoke('runtime-host-peer-mesh:get-connectivity-policy');
+    },
+    setConnectivityPolicy(
+      policy: import('@maka/runtime-host/client').RuntimeHostWebRtcStunPolicy,
+    ) {
+      return ipcRenderer.invoke('runtime-host-peer-mesh:set-connectivity-policy', policy);
+    },
+    execute(
+      target: import('./bridge-contract.js').DesktopRuntimeHostPeerMeshTarget,
+      action: import('./bridge-contract.js').DesktopRuntimeHostPeerMeshAction,
+      input: {
+        readonly meshId?: string | null;
+        readonly peerId?: string;
+        readonly invitation?: string;
+        readonly displayName?: string | null;
+        readonly operationId: string;
+      },
+    ) {
+      return ipcRenderer.invoke(
+        'runtime-host-peer-mesh:execute',
+        target,
+        action,
+        input.meshId,
+        input.peerId,
+        input.invitation,
+        input.displayName,
+        input.operationId,
+      );
+    },
+    cancel(operationId: string) {
+      return ipcRenderer.invoke('runtime-host-peer-mesh:cancel', operationId);
+    },
+  },
+  newTasks: {
+    getCatalog(): Promise<DesktopNewTaskCatalog> {
+      return loadNewTaskCatalog();
+    },
+    subscribeChanges(handler: () => void): () => void {
+      newTaskChangeListeners.add(handler);
+      const unsubscribes = [
+        subscribeEveryRuntimeHostEvent('projects:changed', handler),
+        subscribeEveryRuntimeHostEvent('connections:event', handler),
+        subscribeEveryRuntimeHostEvent('mcp:changed', handler),
+        subscribeEveryRuntimeHostEvent('settings:externalChanged', handler),
+      ];
+      return () => {
+        newTaskChangeListeners.delete(handler);
+        for (const unsubscribe of unsubscribes) unsubscribe();
+      };
+    },
+    async addProject(host: DesktopNewTaskHostRef) {
+      const result = await ipcRenderer.invoke(
+        'projects:add',
+        await runtimeHostScope(host),
+        { select: false },
+      ) as
+        | { ok: true; project: ProjectRecord; path: string }
+        | { ok: false; reason: 'cancelled' };
+      return result.ok ? { ok: true as const, project: result.project } : result;
+    },
+    async relinkProject(host: DesktopNewTaskHostRef, projectId: string) {
+      return ipcRenderer.invoke(
+        'projects:relink',
+        await runtimeHostScope(host),
+        projectId,
+      );
+    },
+    async getConnections(host: DesktopNewTaskHostRef) {
+      return ipcRenderer.invoke(
+        'connections:getSnapshot',
+        await runtimeHostScope(host),
+      );
+    },
+    async listInvocableSkills(
+      target: DesktopNewTaskTarget,
+      context?: {
+        llmConnectionSlug?: string;
+        model?: string;
+        collaborationMode?: 'agent' | 'plan';
+        permissionMode?: import('@maka/core/settings').ChatDefaultPermissionMode;
+      },
+    ) {
+      return ipcRenderer.invoke(
+        'skills:listInvocable',
+        await runtimeHostScope(target),
+        undefined,
+        { ...context, projectId: target.projectId },
+      );
+    },
+    async getReadiness(
+      target: DesktopNewTaskTarget,
+      input?: DesktopTaskSubmissionReadinessRequest,
+    ) {
+      return ipcRenderer.invoke(
+        'taskReadiness:getSnapshot',
+        await runtimeHostScope(target),
+        input,
+      );
+    },
+    async searchFiles(
+      target: DesktopNewTaskTarget,
+      query: string,
+      options?: { limit?: number },
+    ) {
+      return ipcRenderer.invoke(
+        'workspace:searchFiles',
+        await runtimeHostScope(target),
+        { query, projectId: target.projectId, ...options },
+      );
+    },
+    async create(
+      target: DesktopNewTaskTarget,
+      input?: CreateSessionRequestInput,
+    ): Promise<DesktopSessionSummary> {
+      const scope = await runtimeHostScope(target);
+      const session = await ipcRenderer.invoke('session-local:create', scope, {
+        ...input,
+        projectId: target.projectId,
+      }) as DesktopSessionSummaryInput;
+      return projectCreatedSessionSummary(scope, session);
+    },
+  },
+  pets: {
+    list() {
+      return ipcRenderer.invoke('pets:list');
+    },
+    getSelection() {
+      return ipcRenderer.invoke('pets:getSelection');
+    },
+    select(petId: string | null) {
+      return ipcRenderer.invoke('pets:select', petId);
+    },
+    readSpriteSheet(petId: string) {
+      return ipcRenderer.invoke('pets:readSpriteSheet', petId);
+    },
+    remove(petId: string) {
+      return ipcRenderer.invoke('pets:remove', petId);
+    },
+    importLocalDirectory() {
+      return ipcRenderer.invoke('pets:importLocalDirectory');
+    },
+    subscribeChanges(handler: (event: PetPackChangedEvent) => void): () => void {
+      const listener = (_event: Electron.IpcRendererEvent, payload: PetPackChangedEvent) =>
+        handler(payload);
+      ipcRenderer.on('pets:changed', listener);
+      return () => ipcRenderer.off('pets:changed', listener);
+    },
+  },
+  workBoard: {
+    list(query) {
+      return ipcRenderer.invoke('workBoard:list', query);
+    },
+    create(item) {
+      return ipcRenderer.invoke('workBoard:create', item);
+    },
+    update(id, patch, options) {
+      return ipcRenderer.invoke('workBoard:update', id, patch, options);
+    },
+    archive(id, options) {
+      return ipcRenderer.invoke('workBoard:archive', id, options);
+    },
+    unarchive(id, options) {
+      return ipcRenderer.invoke('workBoard:unarchive', id, options);
+    },
+    remove(id, options) {
+      return ipcRenderer.invoke('workBoard:remove', id, options);
+    },
+    subscribeChanges(handler: (event: WorkBoardChangedEvent) => void): () => void {
+      const listener = (_event: Electron.IpcRendererEvent, payload: WorkBoardChangedEvent) =>
+        handler(payload);
+      ipcRenderer.on('workBoard:changed', listener);
+      return () => ipcRenderer.off('workBoard:changed', listener);
+    },
+  },
+  todo: {
+    read(sessionId: string): Promise<SessionTodoItem[]> {
+      return invokeProjectedSessionRuntimeHost('todo:read', sessionId);
+    },
+    subscribeChanges(handler: (event: { sessionId: string; at: number }) => void): () => void {
+      return subscribeEveryRuntimeHostEvent('todo:changed', (scope, event: { sessionId: string; at: number }) =>
+        handler({
+          ...event,
+          sessionId: recordRuntimeHostSessionScope(scope, event.sessionId),
+        }),
+      );
     },
   },
   deepResearch: {
     get(sessionId: string): Promise<DeepResearchClientProgress | undefined> {
-      return ipcRenderer.invoke('deepResearch:get', sessionId);
+      return invokeProjectedSessionRuntimeHost('deepResearch:get', sessionId);
     },
     subscribeChanges(handler: (event: DeepResearchChangedEvent) => void): () => void {
-      const listener = (_event: Electron.IpcRendererEvent, payload: DeepResearchChangedEvent) =>
-        handler(payload);
-      ipcRenderer.on('deepResearch:changed', listener);
-      return () => ipcRenderer.off('deepResearch:changed', listener);
+      return subscribeEveryRuntimeHostEvent('deepResearch:changed', (scope, event: DeepResearchChangedEvent) =>
+        handler({
+          ...event,
+          sessionId: recordRuntimeHostSessionScope(scope, event.sessionId),
+        }),
+      );
     },
   },
   graphs: {
-    getSnapshot(
-      rootSessionId: string,
-      options?: AgentGraphClientSnapshotOptions,
-    ): Promise<AgentGraphClientSnapshot> {
-      return ipcRenderer.invoke('graphs:getSnapshot', rootSessionId, options);
+    async listEpochs(rootSessionId: string): Promise<AgentGraphEpochDirectory> {
+      const session = await runtimeHostSessionRef(rootSessionId);
+      return ipcRenderer.invoke(
+        'graphs:listEpochs', session.scope, session.sessionId,
+      ) as Promise<AgentGraphEpochDirectory>;
     },
-    inspectOperator(
+    async listCurrentEpochs(rootSessionId: string): Promise<AgentGraphEpochDirectory> {
+      const session = await runtimeHostSessionRef(rootSessionId);
+      return ipcRenderer.invoke(
+        'graphs:listCurrentEpochs', session.scope, session.sessionId,
+      ) as Promise<AgentGraphEpochDirectory>;
+    },
+    async getSnapshot(
+      rootSessionId: string,
+      options?: AgentGraphClientSnapshotOptions & { graphId?: string },
+    ): Promise<AgentGraphClientSnapshot> {
+      const session = await runtimeHostSessionRef(rootSessionId);
+      const snapshot = await ipcRenderer.invoke(
+        'graphs:getSnapshot', session.scope, session.sessionId, options,
+      ) as AgentGraphClientSnapshot;
+      return projectProtocolSessionIds(session.scope.hostId, snapshot);
+    },
+    async inspectOperator(
       rootSessionId: string,
       operatorId: string,
+      graphId?: string,
     ): Promise<AgentGraphOperatorInspection> {
-      return ipcRenderer.invoke('graphs:inspectOperator', rootSessionId, operatorId);
+      const session = await runtimeHostSessionRef(rootSessionId);
+      const inspection = await ipcRenderer.invoke(
+        'graphs:inspectOperator',
+        session.scope,
+        session.sessionId,
+        operatorId,
+        graphId,
+      ) as AgentGraphOperatorInspection;
+      return projectProtocolSessionIds(session.scope.hostId, inspection);
     },
-    stop(rootSessionId: string): Promise<void> {
-      return ipcRenderer.invoke('graphs:stop', rootSessionId);
+    stop(rootSessionId: string, expectedGraphId: string): Promise<void> {
+      return invokeSessionRuntimeHost('graphs:stop', rootSessionId, expectedGraphId);
     },
     subscribe(
       rootSessionId: string,
-      handler: (event: AgentGraphClientChangedEvent) => void,
+      handler: () => void,
     ): () => void {
-      const listener = (
-        _event: Electron.IpcRendererEvent,
-        payload: AgentGraphClientChangedEvent,
-      ) => {
-        if (payload.rootSessionId === rootSessionId) handler(payload);
+      let disposed = false;
+      const unsubscribes: Array<() => void> = [];
+      void runtimeHostSessionRef(rootSessionId)
+        .then(({ scope, sessionId }) => {
+          if (disposed) return;
+          const onChanged = (payload: { rootSessionId: string }): void => {
+            if (payload.rootSessionId === sessionId) handler();
+          };
+          unsubscribes.push(
+            subscribeRuntimeHostEvent('graphs:changed', scope, onChanged),
+            subscribeRuntimeHostEvent('graphs:resync', scope, onChanged),
+          );
+        })
+        .catch(() => undefined);
+      return () => {
+        disposed = true;
+        for (const unsubscribe of unsubscribes) unsubscribe();
       };
-      ipcRenderer.on('graphs:changed', listener);
-      return () => ipcRenderer.off('graphs:changed', listener);
     },
   },
+  workHub: {
+    async getSession(coordinationSessionId: string) {
+      const scope = await resolveDesktopWorkHubCoordinationCreateScope(coordinationSessionId, runtimeHostSessionRef);
+      return projectSessionSummary(scope, await ipcRenderer.invoke('workhub:getSession', scope));
+    },
+    async prepareAttachments(coordinationSessionId: string, items: Parameters<MakaBridge['workHub']['prepareAttachments']>[1]) {
+      const scope = await resolveDesktopWorkHubCoordinationCreateScope(coordinationSessionId, runtimeHostSessionRef);
+      const attachments = await ipcRenderer.invoke('workhub:prepareAttachments', scope, await encodeIngestItems(items)) as AttachmentRef[];
+      return projectDesktopAttachmentRefs(scope, attachments);
+    },
+    async answer(coordinationSessionId: string, input: WorkHubAnswerInput) {
+      const scope = await resolveDesktopWorkHubCoordinationCreateScope(coordinationSessionId, runtimeHostSessionRef);
+      return ipcRenderer.invoke('workhub:answer', scope, {
+        ...input,
+        ...(input.attachments ? { attachments: hostAttachmentRefs({ scope, sessionId: parseDesktopSessionKey(coordinationSessionId).sessionId }, input.attachments) } : {}),
+      }) as Promise<WorkHubAnswerResult>;
+    },
+    async configureModel(coordinationSessionId: string, input: OperationInput<'workhub.coordination.configureModel'>) {
+      const scope = await resolveDesktopWorkHubCoordinationCreateScope(coordinationSessionId, runtimeHostSessionRef);
+      return ipcRenderer.invoke('workhub:configureModel', scope, input) as Promise<OperationOutput<'workhub.coordination.configureModel'>>;
+    },
+    resolveCoordinationSession(): Promise<string> {
+      return resolveDesktopWorkHubCoordinationSession(
+        activeRuntimeHostRef,
+        (scope) => ipcRenderer.invoke('workhub:resolveCoordinationSession', scope),
+      );
+    },
+
+  },
+  sessionLocal: {
+    async listMessages(sessionId) {
+      const session = await runtimeHostSessionRef(sessionId);
+      const records = await ipcRenderer.invoke('session-local:messages', session.scope, session.sessionId) as import('../shared/session-local-contract.js').DesktopLocalMessage[];
+      return records.map((record) => ({ ...record, sessionId, attachments: projectDesktopAttachmentRefs(session.scope, record.attachments) }));
+    },
+    async cancelMessage(sessionId, messageId) {
+      const session = await runtimeHostSessionRef(sessionId);
+      await ipcRenderer.invoke('session-local:cancel', session.scope, session.sessionId, messageId);
+    },
+    async reconcileMessage(sessionId, messageId) {
+      const session = await runtimeHostSessionRef(sessionId);
+      await ipcRenderer.invoke('session-local:reconcile', session.scope, session.sessionId, messageId);
+    },
+    async readTranscript(sessionId) {
+      const session = await runtimeHostSessionRef(sessionId);
+      return ipcRenderer.invoke('session-local:transcript', session.scope, session.sessionId);
+    },
+    subscribeChanges(handler) {
+      return subscribeEveryRuntimeHostEvent('session-local:changed', (scope, event: { sessionId?: string }) => {
+        if (event.sessionId) handler(recordRuntimeHostSessionScope(scope, event.sessionId));
+      });
+    },
+  } satisfies import('../shared/session-local-contract.js').DesktopSessionLocalBridge,
   sessions: {
-    list(filter?: SessionListFilter): Promise<SessionSummary[]> {
-      return ipcRenderer.invoke('sessions:list', filter);
+    list(filter?: SessionListFilter): Promise<DesktopSessionSummary[]> {
+      return listDesktopSessions(filter);
+    },
+    listWithCoverage() {
+      return desktopSessionCatalogRefresher.refresh();
     },
     /**
      * The single session-creation channel (#1433). `mode` names a
@@ -186,86 +2103,162 @@ const makaBridge = {
      * labels it implies (`create-session-input.ts`); the renderer cannot
      * reach a boundary like `explore` by asking for it directly.
      */
-    create(input?: CreateSessionRequestInput): Promise<SessionSummary> {
-      return ipcRenderer.invoke('sessions:create', input);
+    async create(input?: CreateSessionRequestInput): Promise<DesktopSessionSummary> {
+      const scope = await activeRuntimeHostRef();
+      return createDesktopSessionOnScope(scope, input);
     },
-    async send(
-      sessionId: string,
-      command:
-        | SessionCommand
-        | {
-            type: 'send';
-            turnId: string;
-            text: string;
-            displayText?: string;
-            voiceOperationId?: string;
-            skillIds?: string[];
-            attachmentItems?: RendererIngestInput[];
-            turnOrchestration?: TurnOrchestration;
-            quotes?: QuoteRef[];
-            workspaceFileReferences?: Array<Pick<InlineReference, 'value' | 'start'>>;
-          },
-    ): Promise<
-      | {
-          ok: true;
-          turnId: string;
-          attachments: AttachmentRef[];
-          inlineReferences: InlineReference[];
-          skillInvocation: import('@maka/runtime').SkillInvocationResult;
-        }
-      | {
-          ok: false;
-          reason: 'skill_invocation_failed';
-          skillInvocation: import('@maka/runtime').SkillInvocationResult;
-        }
-    > {
-      if (command.type === 'send' && 'attachmentItems' in command && command.attachmentItems) {
-        const encoded = await encodeIngestItems(command.attachmentItems as RendererIngestInput[]);
-        return ipcRenderer.invoke('sessions:send', sessionId, { ...command, attachmentItems: encoded });
+    async send(sessionId, command) {
+      const session = await runtimeHostSessionRef(sessionId);
+      if (command.directoryReferences?.some((ref) => ref.hostId !== session.scope.hostId)) {
+        throw new Error('Directory references belong to a different Runtime Host. Select the folder on the target Host.');
       }
-      return ipcRenderer.invoke('sessions:send', sessionId, command);
+      const encoded =
+        'attachmentItems' in command && command.attachmentItems
+          ? { ...command, attachmentItems: await encodeIngestItems(command.attachmentItems) }
+          : command;
+      const result = (await ipcRenderer.invoke(
+        'sessions:send',
+        session.scope,
+        session.sessionId,
+        encoded,
+      )) as Awaited<ReturnType<MakaBridge['sessions']['send']>>;
+      return result.ok
+        ? { ...result, attachments: projectDesktopAttachmentRefs(session.scope, result.attachments) }
+        : result;
     },
-    compact(sessionId: string): Promise<void> {
-      return ipcRenderer.invoke('sessions:compact', sessionId);
+    compact(sessionId: string): Promise<OperationOutput<'context.compact'>> {
+      return invokeSessionRuntimeHost('sessions:compact', sessionId);
     },
     resumeLatest(sessionId: string): Promise<
       | { disposition: 'started'; runId: string; turnId: string }
       | { disposition: 'park'; rejectionReasons: string[]; diagnostics: unknown[] }
     > {
-      return ipcRenderer.invoke('sessions:resumeLatest', sessionId);
+      return invokeSessionRuntimeHost('sessions:resumeLatest', sessionId);
     },
-    stop(sessionId: string, input?: { source?: 'stop_button' }): Promise<void> {
-      return ipcRenderer.invoke('sessions:stop', sessionId, input);
+    stop(
+      sessionId: string,
+      input?: {
+        source?: 'stop_button';
+        expectedTurnId?: string;
+        expectedAdmissionId?: string;
+      },
+    ): Promise<DesktopSessionStopResult> {
+      return invokeSessionRuntimeHost('sessions:stop', sessionId, input);
     },
-    steer(sessionId: string, text: string): Promise<QueueEnqueueOutcome> {
-      return ipcRenderer.invoke('sessions:steer', sessionId, text);
+    async submitMessage(sessionId, placement, command, options) {
+      const session = await runtimeHostSessionRef(sessionId);
+      if (command.directoryReferences?.some((ref) => ref.hostId !== session.scope.hostId)) {
+        throw new Error('Directory references belong to a different Runtime Host. Select the folder on the target Host.');
+      }
+      const attachmentItems = command.attachmentItems
+        ? await encodeIngestItems(command.attachmentItems)
+        : undefined;
+      const result = (await ipcRenderer.invoke(
+        options?.waitForHostAdmission ? 'sessions:submitMessage' : 'session-local:submit',
+        session.scope,
+        session.sessionId,
+        placement,
+        {
+          ...command,
+          ...(command.retainedAttachments ? { retainedAttachments: hostAttachmentRefs(session, command.retainedAttachments) } : {}),
+          ...(attachmentItems ? { attachmentItems } : {}),
+        },
+      )) as Awaited<ReturnType<MakaBridge['sessions']['submitMessage']>>;
+      return result.ok
+        ? { ...result, attachments: projectDesktopAttachmentRefs(session.scope, result.attachments) }
+        : result;
     },
-    readMessages(sessionId: string): Promise<StoredMessage[]> {
-      return ipcRenderer.invoke('sessions:readMessages', sessionId);
+    queryCancelledMessages(sessionId, messageIds) {
+      return invokeSessionRuntimeHost('sessions:queryCancelledMessages', sessionId, messageIds);
+    },
+    queryMessageExecutions(sessionId, messageIds) {
+      return invokeSessionRuntimeHost('sessions:queryMessageExecutions', sessionId, messageIds);
+    },
+    retractQueueEntry(sessionId: string, entryId: string): Promise<void> {
+      return invokeSessionRuntimeHost('sessions:retractQueueEntry', sessionId, entryId);
+    },
+    promoteQueueEntry(sessionId: string, entryId: string): Promise<void> {
+      return invokeSessionRuntimeHost('sessions:promoteQueueEntry', sessionId, entryId);
+    },
+    updateQueueEntry(
+      sessionId: string,
+      entryId: string,
+      expectedQueueRevision: number,
+      text: string,
+    ): Promise<void> {
+      return invokeSessionRuntimeHost(
+        'sessions:updateQueueEntry',
+        sessionId,
+        entryId,
+        expectedQueueRevision,
+        text,
+      );
+    },
+    reorderQueueEntries(sessionId: string, entryIds: readonly string[]): Promise<void> {
+      return invokeSessionRuntimeHost('sessions:reorderQueueEntries', sessionId, [...entryIds]);
     },
     readExecutionBoundary(sessionId: string): Promise<ExecutionBoundaryReadModel> {
-      return ipcRenderer.invoke('sessions:readExecutionBoundary', sessionId);
+      return invokeSessionRuntimeHost('sessions:readExecutionBoundary', sessionId);
     },
     listActiveInteractions(sessionId: string): Promise<ActiveInteractionRequestEvent[]> {
-      return ipcRenderer.invoke('sessions:listActiveInteractions', sessionId);
+      return invokeSessionRuntimeHost('sessions:listActiveInteractions', sessionId);
     },
-    listTurns(sessionId: string): Promise<TurnRecord[]> {
-      return ipcRenderer.invoke('sessions:listTurns', sessionId);
+    subscribeActiveInteractions(
+      handler: (event: {
+        sessionId: string;
+        interactions: ActiveInteractionRequestEvent[];
+      }) => void,
+    ): () => void {
+      return subscribeEveryRuntimeHostEvent(
+        'sessions:active-interactions-changed',
+        (scope, event: { sessionId: string; interactions: ActiveInteractionRequestEvent[] }) =>
+          handler({
+            ...event,
+            sessionId: recordRuntimeHostSessionScope(scope, event.sessionId),
+          }),
+      );
+    },
+    async listTurns(sessionId: string): Promise<TurnRecord[]> {
+      const session = await runtimeHostSessionRef(sessionId);
+      const turns = await ipcRenderer.invoke(
+        'sessions:listTurns',
+        session.scope,
+        session.sessionId,
+      ) as TurnRecord[];
+      return turns.map((turn) => projectDesktopTurnRecord(session.scope, turn));
+    },
+    listTurnLandmarks(sessionId) {
+      return invokeProjectedSessionRuntimeHost('sessions:listTurnLandmarks', sessionId);
     },
     regenerateTurn(sessionId: string, input: RegenerateTurnInput): Promise<void> {
-      return ipcRenderer.invoke('sessions:regenerateTurn', sessionId, input);
+      return invokeSessionRuntimeHost('sessions:regenerateTurn', sessionId, input);
     },
-    branchFromTurn(sessionId: string, input: BranchFromTurnInput): Promise<SessionSummary> {
-      return ipcRenderer.invoke('sessions:branchFromTurn', sessionId, input);
-    },
-    reviseBeforeTurn(sessionId: string, input: ReviseBeforeTurnInput): Promise<SessionSummary> {
-      return ipcRenderer.invoke('sessions:reviseBeforeTurn', sessionId, input);
+    branchFromTurn: invokeBranchFromTurn,
+    async reviseBeforeTurn(sessionId: string, input: DesktopReviseBeforeTurnInput): Promise<DesktopSessionSummary> {
+      const ref = await runtimeHostSessionRef(sessionId);
+      const summary = await ipcRenderer.invoke(
+        'sessions:reviseBeforeTurn', ref.scope, ref.sessionId, input,
+      ) as DesktopSessionSummaryInput;
+      return projectCreatedSessionSummary(ref.scope, summary);
     },
     respondToSandboxBoundary(sessionId: string, response: SandboxBoundaryResponse): Promise<void> {
-      return ipcRenderer.invoke('sessions:respondToSandboxBoundary', sessionId, response);
+      return invokeSessionRuntimeHost('sessions:respondToSandboxBoundary', sessionId, response);
+    },
+    respondToClientCapability(
+      sessionId: string,
+      response: ClientCapabilityResponse,
+    ): Promise<void> {
+      return invokeSessionRuntimeHost(
+        'sessions:respondToClientCapability',
+        sessionId,
+        response,
+      );
     },
     respondToUserQuestion(sessionId: string, response: UserQuestionResponse): Promise<void> {
-      return ipcRenderer.invoke('sessions:respondToUserQuestion', sessionId, response);
+      return invokeSessionRuntimeHost('sessions:respondToUserQuestion', sessionId, response);
+    },
+    respondToUserForm(sessionId: string, response: InteractionFormResponse): Promise<void> {
+      return invokeSessionRuntimeHost('sessions:respondToUserForm', sessionId, response);
     },
     /**
      * PR-CMD-PALETTE-SAVE-CONVERSATION-FILE-0: write the renderer-formatted
@@ -281,398 +2274,921 @@ const makaBridge = {
     > {
       return ipcRenderer.invoke('chat:saveConversationToFile', input);
     },
-    subscribeEvents(sessionId: string, handler: (event: SessionEvent) => void): () => void {
-      const channel = `sessions:event:${sessionId}`;
-      const listener = (_event: Electron.IpcRendererEvent, payload: SessionEvent) => handler(payload);
-      ipcRenderer.on(channel, listener);
+    subscribeEvents(
+      sessionId: string,
+      handler: (event: SessionEvent) => void,
+      onObservationSeed?: (phase: 'pending' | 'ready') => void,
+      onSeedError?: (error: unknown) => void,
+      onExecution?: (projection: import('../shared/session-execution-projection.js').SessionExecutionProjection | undefined) => void,
+    ): () => void {
       const observerId = crypto.randomUUID();
-      void ipcRenderer.invoke('sessions:observe', sessionId, observerId).catch(() => undefined);
+      let lastExecution: import('../shared/session-execution-projection.js').SessionExecutionProjection | undefined;
+      let disposed = false;
+      let unsubscribeEvents = () => {};
+      const acceptExecution = (projection: import('../shared/session-execution-projection.js').SessionExecutionProjection) => {
+        lastExecution = { ...projection, rootTurn: projection.rootTurn ? { ...projection.rootTurn, sessionId } : null };
+        onExecution?.(lastExecution);
+      };
+      const observeDispatch = runtimeHostSessionRef(sessionId).then((session) => {
+        if (disposed) {
+          return {
+            completion: Promise.resolve({ kind: 'cancelled' } as const),
+          };
+        }
+        const profileId = runtimeHostMetadataFor(session.scope)?.profileId;
+        if (!profileId) throw new Error('The Runtime Host profile for this task is unavailable');
+        // Keep the renderer listener across Host target epochs. The observer
+        // registry restores this observer on the replacement target. Profile
+        // identity admits that replacement without accepting another Host's
+        // same-named Session channel.
+        unsubscribeEvents = subscribeEveryRuntimeHostEvent(
+          `sessions:event:${session.sessionId}`,
+          (scope, event: SessionEvent | SessionObservationMessage) => {
+            if (disposed) return;
+            if (runtimeHostMetadataFor(scope)?.profileId !== profileId) return;
+            if (event.type === 'host_observation_seed') {
+              if (!event.observerIds.includes(observerId)) return;
+              // Seed and live updates share this ordered channel. Readiness
+              // follows consumption, never the separate registration reply.
+              acceptExecution(event.execution);
+              for (const seededEvent of event.events) {
+                if (disposed) return;
+                handler(projectDesktopSessionEvent(scope, seededEvent));
+              }
+              if (!disposed) onObservationSeed?.('ready');
+              return;
+            }
+            if (event.type === 'host_observation_pending') {
+              if (lastExecution) lastExecution = { ...lastExecution, available: false };
+              onExecution?.(lastExecution);
+              onObservationSeed?.('pending');
+              return;
+            }
+            if (event.type === 'host_execution') {
+              acceptExecution(event);
+              return;
+            }
+            if (event.type === 'host_observation_error') {
+              onSeedError?.(new Error(event.message));
+              return;
+            }
+            handler(projectDesktopSessionEvent(scope, event));
+          },
+        );
+        return {
+          completion: ipcRenderer.invoke(
+            'sessions:observe',
+            session.scope,
+            session.sessionId,
+            observerId,
+          ) as Promise<RuntimeHostObservationIpcResult<void>>,
+        };
+      });
+      const observing = observeDispatch.then(({ completion }) => completion);
+      void observing.then(
+        (result) => {
+          if (result.kind === 'cancelled') {
+            disposed = true;
+            unsubscribeEvents();
+          }
+        },
+        (error: unknown) => {
+          if (!disposed) onSeedError?.(error);
+        },
+      );
       return () => {
-        ipcRenderer.off(channel, listener);
-        void ipcRenderer.invoke('sessions:unobserve', observerId).catch(() => undefined);
+        disposed = true;
+        unsubscribeEvents();
+        void releaseSessionObservation(observeDispatch, () =>
+          ipcRenderer.invoke('sessions:unobserve', observerId),
+        ).catch(() => undefined);
       };
     },
     subscribeChanges(handler: (event: SessionChangedEvent) => void): () => void {
-      const listener = (_event: Electron.IpcRendererEvent, payload: SessionChangedEvent) => handler(payload);
-      ipcRenderer.on('sessions:changed', listener);
-      return () => ipcRenderer.off('sessions:changed', listener);
+      const unsubscribeRuntimeHosts = subscribeEveryRuntimeHostEvent(
+        'sessions:changed',
+        (scope, event: SessionChangedEvent) => {
+          if (!event.sessionId) {
+            handler(event);
+            return;
+          }
+          const observed = observeRuntimeHostSessionScope(scope, event.sessionId);
+          handler(observed.authorityAccepted
+            ? { ...event, sessionId: observed.sessionId }
+            : { reason: 'updated', ts: event.ts });
+        },
+      );
+      const unsubscribeMounts = subscribeGuestSessionMountChanges(() => {
+        handler({ reason: 'updated', ts: Date.now() });
+      });
+      return () => {
+        unsubscribeRuntimeHosts();
+        unsubscribeMounts();
+      };
     },
     archive(sessionId: string, options?: { revisionFamily?: boolean }): Promise<void> {
-      return ipcRenderer.invoke('sessions:archive', sessionId, options);
+      return invokeSessionRuntimeHost('sessions:archive', sessionId, options);
     },
     unarchive(sessionId: string, options?: { revisionFamily?: boolean }): Promise<void> {
-      return ipcRenderer.invoke('sessions:unarchive', sessionId, options);
+      return invokeSessionRuntimeHost('sessions:unarchive', sessionId, options);
     },
     setFlagged(sessionId: string, isFlagged: boolean, options?: { revisionFamily?: boolean }): Promise<void> {
-      return ipcRenderer.invoke('sessions:setFlagged', sessionId, isFlagged, options);
+      return invokeSessionRuntimeHost('sessions:setFlagged', sessionId, isFlagged, options);
     },
     rename(sessionId: string, name: string, options?: { revisionFamily?: boolean }): Promise<void> {
-      return ipcRenderer.invoke('sessions:rename', sessionId, name, options);
+      return invokeSessionRuntimeHost('sessions:rename', sessionId, name, options);
     },
-    setPermissionMode(sessionId: string, mode: PermissionMode): Promise<SessionSummary> {
-      return ipcRenderer.invoke('sessions:setPermissionMode', sessionId, mode);
+    setPermissionMode(sessionId: string, mode: PermissionMode): Promise<DesktopSessionSummary> {
+      return invokeSessionSummary('sessions:setPermissionMode', sessionId, mode);
     },
-    setCollaborationMode(sessionId: string, mode: CollaborationMode): Promise<SessionSummary> {
-      return ipcRenderer.invoke('sessions:setCollaborationMode', sessionId, mode);
+    setCollaborationMode(sessionId: string, mode: CollaborationMode): Promise<DesktopSessionSummary> {
+      return invokeSessionSummary('sessions:setCollaborationMode', sessionId, mode);
     },
-    setOrchestrationMode(sessionId: string, mode: OrchestrationMode): Promise<SessionSummary> {
-      return ipcRenderer.invoke('sessions:setOrchestrationMode', sessionId, mode);
+    setOrchestrationMode(sessionId: string, mode: OrchestrationMode): Promise<DesktopSessionSummary> {
+      return invokeSessionSummary('sessions:setOrchestrationMode', sessionId, mode);
     },
     getPlanState(sessionId: string): Promise<PlanSessionState> {
-      return ipcRenderer.invoke('plan-mode:getState', sessionId);
+      return invokeProjectedSessionRuntimeHost('plan-mode:getState', sessionId);
     },
     subscribePlanChanges(sessionId: string, handler: () => void): () => void {
-      const channel = 'plan-mode:changed';
-      const listener = (_event: Electron.IpcRendererEvent, payload: { sessionId: string }) => {
-        if (payload.sessionId === sessionId) handler();
+      let disposed = false;
+      let unsubscribe = () => {};
+      void runtimeHostSessionRef(sessionId)
+        .then((session) => {
+          if (disposed) return;
+          unsubscribe = subscribeRuntimeHostEvent(
+            'plan-mode:changed',
+            session.scope,
+            (payload: { sessionId: string }) => {
+              if (payload.sessionId === session.sessionId) handler();
+            },
+          );
+        })
+        .catch(() => undefined);
+      return () => {
+        disposed = true;
+        unsubscribe();
       };
-      ipcRenderer.on(channel, listener);
-      return () => ipcRenderer.off(channel, listener);
     },
-    requestPlanRevision(sessionId: string, proposalId: string): Promise<PlanSessionState> {
-      return ipcRenderer.invoke('plan-mode:requestRevision', sessionId, proposalId);
+    requestPlanRevision(sessionId: string, proposalId: string): Promise<PlanControlIpcResult<PlanSessionState>> {
+      return invokeProjectedSessionRuntimeHost('plan-mode:requestRevision', sessionId, proposalId);
     },
     abandonPlanProposal(
       sessionId: string,
       proposalId: string,
     ): Promise<PlanSessionState> {
-      return ipcRenderer.invoke('plan-mode:abandon', sessionId, proposalId);
+      return invokeProjectedSessionRuntimeHost<PlanSessionState>('plan-mode:abandon', sessionId, proposalId);
     },
     approvePlan(sessionId: string, input: {
       proposalId: string;
       expectedRevision: number;
       expectedStoreVersion: number;
       turnId: string;
-    }): Promise<{ turnId: string; executionId: string }> {
-      return ipcRenderer.invoke('plan-mode:approve', sessionId, input);
+    }): Promise<PlanControlIpcResult<{ turnId: string; executionId: string }>> {
+      return invokeSessionRuntimeHost('plan-mode:approve', sessionId, input);
     },
-    resumePlan(sessionId: string, executionId: string, turnId: string): Promise<{
+    resumePlan(sessionId: string, executionId: string, turnId: string): Promise<PlanControlIpcResult<{
       turnId: string;
       executionId: string;
+    }>> {
+      return invokeSessionRuntimeHost('plan-mode:resume', sessionId, executionId, turnId);
+    },
+    abandonPlanExecution(sessionId: string, executionId: string): Promise<PlanControlIpcResult<PlanSessionState>> {
+      return invokeProjectedSessionRuntimeHost('plan-mode:abandonExecution', sessionId, executionId);
+    },
+    setModelConfiguration(sessionId: string, input: {
+      llmConnectionId: string;
+      llmConnectionSlug: string;
+      model: string;
+      thinkingLevel: ThinkingLevel | null;
+    }): Promise<DesktopSessionSummary> {
+      return invokeSessionSummary('sessions:setModelConfiguration', sessionId, input);
+    },
+    setThinkingLevel(sessionId: string, level: ThinkingLevel | undefined | null): Promise<DesktopSessionSummary> {
+      return invokeSessionSummary('sessions:setThinkingLevel', sessionId, level ?? undefined);
+    },
+    async remove(
+      sessionId: string,
+      options?: { revisionFamily?: boolean; requireArchived?: boolean },
+    ): Promise<{ disposition: 'removed' | 'restored'; archivedSubtaskCount: number }> {
+      const session = await runtimeHostSessionRef(sessionId);
+      if (await ipcRenderer.invoke('session-local:discard', session.scope, session.sessionId)) {
+        return { disposition: 'removed', archivedSubtaskCount: 0 };
+      }
+      return invokeSessionRuntimeHost('sessions:remove', sessionId, options);
+    },
+    previewRemoval(sessionId: string): Promise<number> {
+      return invokeSessionRuntimeHost('sessions:removePreview', sessionId);
+    },
+    cleanupSessionCopy(sessionId: string): Promise<void> {
+      return invokeSessionRuntimeHost('sessions:cleanupSessionCopy', sessionId);
+    },
+    async abandonSessionCopy(sourceSessionId: string, copyId: string): Promise<void> {
+      const source = await runtimeHostSessionRef(sourceSessionId);
+      await ipcRenderer.invoke('sessions:abandonSessionCopy', source.scope, copyId);
+    },
+  },
+  transcripts: {
+    async open(
+      sessionId: string,
+      handler: (batch: DesktopTranscriptBatch) => void,
+      registerCancellation?: (cancel: () => void) => void,
+    ): Promise<DesktopTranscriptHandle> {
+      const consumerId = crypto.randomUUID();
+      const channel = `sessions:transcript:${consumerId}`;
+      let identity: DesktopTranscriptIdentity | undefined;
+      let cachedIdentity: DesktopTranscriptIdentity | undefined;
+      const retiredGenerations = new Set<string>();
+      let closed = false;
+      let requestClose = () => {};
+      let consumerScope: DesktopTargetScope | undefined;
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        scope: unknown,
+        value: unknown,
+      ) => {
+        if (closed) return;
+        let batch: DesktopTranscriptBatch;
+        try {
+          const host = requireDesktopTargetScope(scope);
+          if (
+            !consumerScope ||
+            host.hostId !== consumerScope.hostId ||
+            host.targetEpoch !== consumerScope.targetEpoch
+          ) return;
+          batch = assertDesktopTranscriptBatch(value);
+          if (!retiredGenerations.has(batch.generation)) {
+            const adopted = adoptTranscriptIdentity(identity, batch);
+            if (adopted !== identity) {
+              if (identity && identity.generation !== adopted.generation) retiredGenerations.add(identity.generation);
+              identity = adopted;
+              consumerScope = host;
+            }
+            if (identity !== undefined && batch.generation === identity.generation) handler(batch);
+          }
+        } catch (error) {
+          requestClose();
+          throw error;
+        }
+        if (consumerScope) {
+          void ipcRenderer.invoke(
+            'sessions:transcript:ack',
+            consumerScope,
+            consumerId,
+            batch.generation,
+            batch.deliverySequence,
+          ).catch(requestClose);
+        }
+      };
+      ipcRenderer.on(channel, listener);
+      const openDispatch = runtimeHostSessionRef(sessionId).then(async (session) => {
+        consumerScope = session.scope;
+        const cached = await ipcRenderer.invoke(
+          'session-local:transcript', session.scope, session.sessionId,
+        ).catch(() => null) as import('../shared/session-local-contract.js').DesktopCachedTranscript | null;
+        if (closed) throw new Error('Desktop transcript open was cancelled');
+        // Local frames do not participate in the live consumer identity or ACK window.
+        for (const [index, batch] of (cached?.batches ?? []).entries()) {
+          handler({ ...batch, deliverySequence: index + 1 });
+          if (batch.ready) cachedIdentity = { generation: batch.generation, hostEpoch: batch.hostEpoch };
+        }
+        return {
+          completion: ipcRenderer.invoke(
+            'sessions:transcript:open',
+            session.scope,
+            session.sessionId,
+            consumerId,
+          ) as Promise<RuntimeHostObservationIpcResult<DesktopTranscriptOpenResult>>,
+        };
+      });
+      let closeTask: Promise<void> | undefined;
+      requestClose = () => {
+        if (closed) return;
+        closed = true;
+        ipcRenderer.off(channel, listener);
+        closeTask = releaseSessionObservation(openDispatch, () =>
+          ipcRenderer.invoke('sessions:transcript:close', consumerId),
+        );
+        void closeTask.catch(() => undefined);
+      };
+      registerCancellation?.(requestClose);
+      let openResult: RuntimeHostObservationIpcResult<DesktopTranscriptOpenResult>;
+      try {
+        openResult = await openDispatch.then(({ completion }) => completion);
+      } catch (error) {
+        const cancelled = closed;
+        closed = true;
+        ipcRenderer.off(channel, listener);
+        if (!cancelled && cachedIdentity && !identity) {
+          const unavailable = async () => { throw new Error('Reconnect the Host to load uncached history'); };
+          return {
+            ...cachedIdentity, sessionId, readThroughMessageId: null,
+            acknowledgeTail: unavailable,
+            loadBefore: unavailable, loadAfter: unavailable, loadAround: unavailable,
+            loadLatest: unavailable,
+            close: async () => {},
+          };
+        }
+        throw error;
+      }
+      if (openResult.kind === 'cancelled') {
+        closed = true;
+        ipcRenderer.off(channel, listener);
+        throw new Error('Desktop transcript open was cancelled');
+      }
+      const opened = openResult.value;
+      if (closed) throw new Error('Desktop transcript open was cancelled');
+      identity ??= { generation: opened.generation, hostEpoch: opened.hostEpoch };
+      const range = (
+        operation:
+          | 'sessions:transcript:load-before'
+          | 'sessions:transcript:load-after'
+          | 'sessions:transcript:load-around'
+          | 'sessions:transcript:load-latest',
+        anchorSequence: number | null,
+        maxBytes: number,
+        navigation: number,
+      ): Promise<void> => {
+        const currentIdentity = identity;
+        if (!currentIdentity) {
+          throw new Error('Desktop transcript identity is unavailable');
+        }
+        return ipcRenderer.invoke(operation, consumerScope, {
+          consumerId,
+          sessionId: opened.sessionId,
+          hostEpoch: currentIdentity.hostEpoch,
+          anchorSequence,
+          maxBytes,
+          navigation,
+        }) as Promise<void>;
+      };
+      return {
+        ...opened,
+        sessionId,
+        acknowledgeTail: (through) => {
+          const currentIdentity = identity;
+          if (!currentIdentity) {
+            throw new Error('Desktop transcript identity is unavailable');
+          }
+          return ipcRenderer.invoke('sessions:transcript:acknowledge-tail', consumerScope, {
+            consumerId,
+            sessionId: opened.sessionId,
+            hostEpoch: currentIdentity.hostEpoch,
+            through,
+          }) as Promise<void>;
+        },
+        loadBefore: (anchorSequence, maxBytes, navigation) =>
+          range('sessions:transcript:load-before', anchorSequence, maxBytes, navigation),
+        loadAfter: (anchorSequence, maxBytes, navigation) =>
+          range('sessions:transcript:load-after', anchorSequence, maxBytes, navigation),
+        loadAround: (sequence, maxBytes, navigation) =>
+          range('sessions:transcript:load-around', sequence, maxBytes, navigation),
+        loadLatest: (navigation) =>
+          range('sessions:transcript:load-latest', null, DESKTOP_TRANSCRIPT_FRAGMENT_MAX_BYTES, navigation),
+        async close() {
+          if (closed) return;
+          requestClose();
+          await closeTask;
+        },
+      };
+    },
+  },
+  externalSessions: {
+    listSources(host?: DesktopRuntimeHostRef): Promise<{ adapterIds: string[] }> {
+      return invokeSelectedRuntimeHost(host, 'external-sessions:listSources');
+    },
+    async list(input: {
+      adapterId: string;
+      includeArchived?: boolean;
+      cursor?: string;
+      text?: string;
+    }, host?: DesktopRuntimeHostRef): Promise<{
+      sessions: DesktopExternalSessionCatalogItem[];
+      nextCursor: string | null;
     }> {
-      return ipcRenderer.invoke('plan-mode:resume', sessionId, executionId, turnId);
+      const scope = await selectedRuntimeHostScope(host);
+      const result = await ipcRenderer.invoke(
+        'external-sessions:list', scope, input,
+      ) as {
+        sessions: DesktopHostExternalSessionCatalogItem[];
+        nextCursor: string | null;
+      };
+      return {
+        ...result,
+        sessions: result.sessions.map((session) =>
+          projectDesktopExternalSessionCatalogItem(scope, session),
+        ),
+      };
     },
-    abandonPlanExecution(sessionId: string, executionId: string): Promise<PlanSessionState> {
-      return ipcRenderer.invoke('plan-mode:abandonExecution', sessionId, executionId);
+    async import(input: {
+      adapterId: string;
+      sourceSessionId: string;
+    }, host?: DesktopRuntimeHostRef): Promise<ExternalSessionImportIpcResult<DesktopSessionSummary>> {
+      const scope = await selectedRuntimeHostScope(host);
+      const result = await ipcRenderer.invoke(
+        'external-sessions:import', scope, input,
+      ) as ExternalSessionImportIpcResult;
+      return result.ok
+        ? { ...result, session: projectCreatedSessionSummary(scope, result.session as DesktopSessionSummaryInput) }
+        : result;
     },
-    setModel(sessionId: string, input: { llmConnectionSlug: string; model: string }): Promise<SessionSummary> {
-      return ipcRenderer.invoke('sessions:setModel', sessionId, input);
+  },
+  sessionBundles: {
+    // Both halves name a path the Electron picker chose, which is a path on
+    // THIS machine, and the protocol interprets it on the Host's filesystem.
+    // Those are the same filesystem only for the Local Host, so both are routed
+    // there explicitly -- not to whichever Host is active, and not to whichever
+    // one Settings happens to be pointed at. Carrying a bundle to or from a
+    // remote Host needs a byte transfer, not a path string.
+    async export(input: {
+      sessionId: string;
+      suggestedName: string;
+      confirmedSubtree?: readonly string[];
+    }): Promise<SessionBundleExportIpcResult> {
+      const scope = await localRuntimeHostRef();
+      const { sessionId } = parseDesktopSessionKey(input.sessionId);
+      // Unprojected here, where the boundary already is: the renderer holds
+      // host-scoped ids and the Host knows only its own, so a digest computed
+      // upstream would compare two different alphabets and never match.
+      const confirmed = input.confirmedSubtree?.map(
+        (projected) => parseDesktopSessionKey(projected).sessionId,
+      );
+      return (await ipcRenderer.invoke(
+        'session-bundle:export', scope, sessionId, input.suggestedName, confirmed,
+      )) as SessionBundleExportIpcResult;
     },
-    setThinkingLevel(sessionId: string, level: ThinkingLevel | undefined | null): Promise<SessionSummary> {
-      return ipcRenderer.invoke('sessions:setThinkingLevel', sessionId, level ?? undefined);
-    },
-    remove(sessionId: string, options?: { revisionFamily?: boolean }): Promise<void> {
-      return ipcRenderer.invoke('sessions:remove', sessionId, options);
-    },
-    cleanupQuoteCompanion(sessionId: string): Promise<void> {
-      return ipcRenderer.invoke('sessions:cleanupQuoteCompanion', sessionId);
+    async import(): Promise<SessionBundleImportIpcResult> {
+      const scope = await localRuntimeHostRef();
+      return (await ipcRenderer.invoke('session-bundle:import', scope)) as SessionBundleImportIpcResult;
     },
   },
   projects: {
-    list(): Promise<ProjectRecord[]> {
-      return ipcRenderer.invoke('projects:list');
+    async getDefaultContext(host?: DesktopRuntimeHostRef): Promise<{
+      snapshot: DesktopProjectSnapshot;
+      info: DesktopAppInfo;
+    }> {
+      const scope = await selectedRuntimeHostScope(host);
+      const [snapshot, info] = await Promise.all([
+        ipcRenderer.invoke('projects:getSnapshot', scope) as Promise<DesktopProjectSnapshot>,
+        ipcRenderer.invoke('app:info', scope) as Promise<DesktopAppInfo>,
+      ]);
+      return { snapshot, info };
     },
-    add(): Promise<
+    getSnapshot(sessionId?: string, host?: DesktopRuntimeHostRef): Promise<DesktopProjectSnapshot> {
+      return sessionId
+        ? invokeSessionRuntimeHost('projects:getSnapshot', sessionId)
+        : invokeSelectedRuntimeHost(host, 'projects:getSnapshot');
+    },
+    subscribeChanges(handler: () => void, sessionId?: string, host?: DesktopRuntimeHostRef): () => void {
+      if (!sessionId) return subscribeSelectedRuntimeHostEvent('projects:changed', host, handler);
+      let disposed = false;
+      let unsubscribe = (): void => {};
+      void runtimeHostSessionRef(sessionId).then((session) => {
+        if (disposed) return;
+        unsubscribe = subscribeRuntimeHostEvent('projects:changed', session.scope, handler);
+      }).catch(() => undefined);
+      return () => {
+        disposed = true;
+        unsubscribe();
+      };
+    },
+    async getLocalSnapshot(): Promise<DesktopProjectSnapshot> {
+      return ipcRenderer.invoke(
+        'projects:getSnapshot',
+        await localRuntimeHostRef(),
+      ) as Promise<DesktopProjectSnapshot>;
+    },
+    subscribeLocalChanges(handler: () => void): () => void {
+      return subscribeEveryRuntimeHostEvent('projects:changed', (scope) => {
+        if (runtimeHostMetadataFor(scope)?.profileKind === 'local') handler();
+      });
+    },
+    add(host?: DesktopRuntimeHostRef): Promise<
       { ok: true; project: ProjectRecord; path: string } | { ok: false; reason: 'cancelled' }
     > {
-      return ipcRenderer.invoke('projects:add');
+      return invokeSelectedRuntimeHost(host, 'projects:add');
+    },
+    getDirectoryRoots(host: DesktopRuntimeHostRef) {
+      return invokeSelectedRuntimeHost(host, 'projects:directoryRoots');
+    },
+    listDirectory(
+      input: { readonly rootId: string; readonly segments: readonly string[] },
+      host: DesktopRuntimeHostRef,
+    ) {
+      return invokeSelectedRuntimeHost(host, 'projects:listDirectory', input);
+    },
+    registerDirectory(
+      input: { readonly rootId: string; readonly segments: readonly string[] },
+      host: DesktopRuntimeHostRef,
+    ) {
+      return invokeSelectedRuntimeHost(host, 'projects:registerDirectory', input);
     },
     select(
       projectId: string | null,
+      host?: DesktopRuntimeHostRef,
     ): Promise<{ project: ProjectRecord | null; path: string }> {
-      return ipcRenderer.invoke('projects:select', projectId);
+      return invokeSelectedRuntimeHost(host, 'projects:select', projectId);
     },
-    relink(projectId: string): Promise<
+    relink(projectId: string, host?: DesktopRuntimeHostRef): Promise<
       { ok: true; project: ProjectRecord } | { ok: false; reason: 'cancelled' }
     > {
-      return ipcRenderer.invoke('projects:relink', projectId);
+      return invokeSelectedRuntimeHost(host, 'projects:relink', projectId);
     },
-    rename(projectId: string, name: string): Promise<ProjectRecord> {
-      return ipcRenderer.invoke('projects:rename', projectId, name);
+    reveal(projectId: string, host?: DesktopRuntimeHostRef): Promise<
+      | { ok: true; opened: string }
+      | {
+          ok: false;
+          reason: 'unknown-key' | 'not-allowed' | 'missing' | 'not-a-directory' | 'open-failed';
+        }
+    > {
+      return invokeSelectedRuntimeHost(host, 'projects:reveal', projectId);
     },
-    archive(projectId: string): Promise<ProjectRecord> {
-      return ipcRenderer.invoke('projects:archive', projectId);
+    rename(projectId: string, name: string, host?: DesktopRuntimeHostRef): Promise<ProjectRecord> {
+      return invokeSelectedRuntimeHost(host, 'projects:rename', projectId, name);
     },
-    restore(projectId: string): Promise<ProjectRecord> {
-      return ipcRenderer.invoke('projects:restore', projectId);
+    archive(projectId: string, host?: DesktopRuntimeHostRef): Promise<ProjectRecord> {
+      return invokeSelectedRuntimeHost(host, 'projects:archive', projectId);
+    },
+    restore(projectId: string, host?: DesktopRuntimeHostRef): Promise<ProjectRecord> {
+      return invokeSelectedRuntimeHost(host, 'projects:restore', projectId);
     },
   },
   shellRuns: {
-    list(sessionId: string): Promise<ShellRunUpdate[]> {
-      return ipcRenderer.invoke('shell-runs:list', sessionId);
+    async list(sessionId: string): Promise<ShellRunUpdate[]> {
+      const session = await runtimeHostSessionRef(sessionId);
+      const updates = await ipcRenderer.invoke(
+        'shell-runs:list', session.scope, session.sessionId,
+      ) as ShellRunUpdate[];
+      return updates.map((update) => projectShellRunUpdate(session.scope, update));
+    },
+    async attach(input: {
+      sessionId: string;
+      ref: string;
+    }): Promise<ShellRunPtySnapshot | null> {
+      const session = await runtimeHostSessionRef(input.sessionId);
+      const snapshot = await ipcRenderer.invoke('shell-runs:attach', session.scope, {
+        ...input,
+        sessionId: session.sessionId,
+      }) as ShellRunPtySnapshot | null;
+      return snapshot
+        ? {
+            ...snapshot,
+            sessionId: recordRuntimeHostSessionScope(session.scope, snapshot.sessionId),
+          }
+        : null;
+    },
+    detach(input: { sessionId: string; ref: string }): Promise<void> {
+      return invokeSessionInput('shell-runs:detach', input);
+    },
+    async start(sessionId: string): Promise<ShellRunUpdate> {
+      const session = await runtimeHostSessionRef(sessionId);
+      const update = await ipcRenderer.invoke(
+        'shell-runs:start', session.scope, session.sessionId,
+      ) as ShellRunUpdate;
+      return projectShellRunUpdate(session.scope, update);
+    },
+    async write(input: {
+      sessionId: string;
+      ref: string;
+      input?: string;
+      size?: { cols: number; rows: number };
+    }): Promise<ShellRunUpdate | null> {
+      const session = await runtimeHostSessionRef(input.sessionId);
+      const update = await ipcRenderer.invoke('shell-runs:write', session.scope, {
+        ...input,
+        sessionId: session.sessionId,
+      }) as ShellRunUpdate | null;
+      return update ? projectShellRunUpdate(session.scope, update) : null;
+    },
+    async stop(input: {
+      sessionId: string;
+      ref: string;
+    }): Promise<ShellRunUpdate | null> {
+      const session = await runtimeHostSessionRef(input.sessionId);
+      const update = await ipcRenderer.invoke('shell-runs:stop', session.scope, {
+        ...input,
+        sessionId: session.sessionId,
+      }) as ShellRunUpdate | null;
+      return update ? projectShellRunUpdate(session.scope, update) : null;
     },
     subscribeUpdates(handler: (update: ShellRunUpdate) => void): () => void {
-      const listener = (_event: Electron.IpcRendererEvent, update: ShellRunUpdate) => handler(update);
-      ipcRenderer.on('shell-runs:update', listener);
-      return () => ipcRenderer.off('shell-runs:update', listener);
+      return subscribeEveryRuntimeHostEvent('shell-runs:update', (scope, update: ShellRunUpdate) =>
+        handler(projectShellRunUpdate(scope, update)),
+      );
+    },
+    subscribePtyData(handler: (event: ShellRunPtyDataEvent) => void): () => void {
+      return subscribeEveryRuntimeHostEvent('shell-runs:pty-data', (scope, event: ShellRunPtyDataEvent) =>
+        handler({
+          ...event,
+          sessionId: recordRuntimeHostSessionScope(scope, event.sessionId),
+        }),
+      );
+    },
+    subscribeResync(handler: (event: { sessionId: string }) => void): () => void {
+      return subscribeEveryRuntimeHostEvent('shell-runs:resync', (scope, event: { sessionId: string }) =>
+        handler({
+          sessionId: recordRuntimeHostSessionScope(scope, event.sessionId),
+        }),
+      );
+    },
+  },
+  gitReview: {
+    read(input: {
+      sessionId: string;
+      source: GitReviewSource;
+      baseBranch?: string;
+    }): Promise<GitReviewReadResult> {
+      return invokeSessionInput('git-review:read', input);
     },
   },
   goal: {
     get(sessionId: string): Promise<GoalState | null> {
-      return ipcRenderer.invoke('goal:get', sessionId);
+      return invokeProjectedSessionRuntimeHost('goal:get', sessionId);
+    },
+    arm(sessionId: string, goal: GoalArmRequest): Promise<GoalArmOutcome> {
+      return invokeProjectedSessionRuntimeHost('goal:arm', sessionId, goal);
     },
     clear(sessionId: string): Promise<void> {
-      return ipcRenderer.invoke('goal:clear', sessionId);
+      return invokeSessionRuntimeHost('goal:clear', sessionId);
+    },
+    pause(sessionId: string): Promise<void> {
+      return invokeSessionRuntimeHost('goal:pause', sessionId);
+    },
+    resume(sessionId: string): Promise<void> {
+      return invokeSessionRuntimeHost('goal:resume', sessionId);
     },
   },
   connections: {
-    list(): Promise<LlmConnection[]> {
-      return ipcRenderer.invoke('connections:list');
+    getSnapshot(sessionId?: string, host?: DesktopRuntimeHostRef) {
+      return sessionId
+        ? invokeRuntimeHostForSession('connections:getSnapshot', sessionId)
+        : invokeSelectedRuntimeHost(host, 'connections:getSnapshot');
     },
-    getDefault(): Promise<string | null> {
-      return ipcRenderer.invoke('connections:getDefault');
+    setDefault(connection: import('../shared/desktop-connection-snapshot.js').DesktopConnectionIdentity | string | null, host?: DesktopRuntimeHostRef): Promise<void> {
+      return invokeSelectedRuntimeHost(
+        host,
+        typeof connection === 'string' ? 'connections:setDefaultBySlug' : 'connections:setDefault',
+        connection,
+      );
     },
-    setDefault(slug: string | null): Promise<void> {
-      return ipcRenderer.invoke('connections:setDefault', slug);
+    setDefaultModel(input: { slug: string; model: string } | null, host?: DesktopRuntimeHostRef): Promise<void> {
+      return invokeSelectedRuntimeHost(host, 'connections:setDefaultModel', input);
     },
-    setDefaultModel(input: { slug: string; model: string } | null): Promise<void> {
-      return ipcRenderer.invoke('connections:setDefaultModel', input);
+    create(input: CreateConnectionInput, host?: DesktopRuntimeHostRef): Promise<import('@maka/core/llm-connections').IdentifiedLlmConnection> {
+      return invokeSelectedRuntimeHost(host, 'connections:create', input);
     },
-    create(input: CreateConnectionInput): Promise<LlmConnection> {
-      return ipcRenderer.invoke('connections:create', input);
+    verifyOnboarding(input, host) {
+      return invokeSelectedRuntimeHost(host, 'connections:onboardingVerify', input);
     },
-    update(slug: string, patch: UpdateConnectionInput): Promise<LlmConnection> {
-      return ipcRenderer.invoke('connections:update', slug, patch);
+    saveOnboarding(input, host) {
+      return invokeSelectedRuntimeHost(host, 'connections:onboardingSave', input);
     },
-    delete(slug: string): Promise<void> {
-      return ipcRenderer.invoke('connections:delete', slug);
+    update(connection: import('../shared/desktop-connection-snapshot.js').DesktopConnectionIdentity, patch: UpdateConnectionInput, host?: DesktopRuntimeHostRef): Promise<LlmConnection> {
+      return invokeSelectedRuntimeHost(host, 'connections:update', connection, patch);
     },
-    test(slug: string, opts?: { model?: string }): Promise<ConnectionTestResult> {
-      return ipcRenderer.invoke('connections:test', slug, opts);
+    delete(connection: import('../shared/desktop-connection-snapshot.js').DesktopConnectionIdentity, host?: DesktopRuntimeHostRef): Promise<void> {
+      return invokeSelectedRuntimeHost(host, 'connections:delete', connection);
     },
-    fetchModels(slug: string): Promise<ModelDiscoveryResult> {
-      return ipcRenderer.invoke('connections:fetchModels', slug);
+    test(connection: import('../shared/desktop-connection-snapshot.js').DesktopConnectionIdentity | string, opts?: { model?: string }, host?: DesktopRuntimeHostRef): Promise<ConnectionTestResult> {
+      return invokeSelectedRuntimeHost(
+        host,
+        typeof connection === 'string' ? 'connections:testBySlug' : 'connections:test',
+        connection,
+        opts,
+      );
     },
-    hasSecret(slug: string): Promise<boolean> {
-      return ipcRenderer.invoke('connections:hasSecret', slug);
+    fetchModels(connection: import('../shared/desktop-connection-snapshot.js').DesktopConnectionIdentity, host?: DesktopRuntimeHostRef): Promise<Pick<ModelDiscoveryResult, 'models' | 'source'>> {
+      return invokeSelectedRuntimeHost(host, 'connections:fetchModels', connection);
     },
-    subscribeEvents(handler: (event: ConnectionEvent) => void): () => void {
-      const listener = (_event: Electron.IpcRendererEvent, payload: ConnectionEvent) => handler(payload);
-      ipcRenderer.on('connections:event', listener);
-      return () => ipcRenderer.off('connections:event', listener);
+    hasSecret(connection: import('../shared/desktop-connection-snapshot.js').DesktopConnectionIdentity, host?: DesktopRuntimeHostRef): Promise<boolean> {
+      return invokeSelectedRuntimeHost(host, 'connections:hasSecret', connection);
+    },
+    getRequestHeaders(connection: import('../shared/desktop-connection-snapshot.js').DesktopConnectionIdentity, host?: DesktopRuntimeHostRef): Promise<import('@maka/core/llm-connections').SavedRequestHeaders> {
+      return invokeSelectedRuntimeHost(host, 'connections:getRequestHeaders', connection);
+    },
+    setRequestHeaders(
+      connection: import('../shared/desktop-connection-snapshot.js').DesktopConnectionIdentity,
+      headers: readonly import('@maka/core/llm-connections').RequestHeaderUpdate[],
+      host?: DesktopRuntimeHostRef,
+    ): Promise<import('@maka/core/llm-connections').SavedRequestHeaders> {
+      return invokeSelectedRuntimeHost(host, 'connections:setRequestHeaders', connection, headers);
+    },
+    subscribeEvents(handler: (event: ConnectionEvent) => void, host?: DesktopRuntimeHostRef): () => void {
+      return host
+        ? subscribeSelectedRuntimeHostEvent('connections:event', host, handler)
+        : subscribeEveryRuntimeHostEvent(
+            'connections:event',
+            (_scope, event: ConnectionEvent) => handler(event),
+          );
     },
   },
   mcp: {
-    getConfig(): Promise<McpConfigFile> {
-      return ipcRenderer.invoke('mcp:getConfig');
+    getConfig(host?: DesktopRuntimeHostRef): Promise<McpConfigFile> {
+      return invokeSelectedRuntimeHost(host, 'mcp:getConfig');
     },
-    listStatuses(): Promise<McpServerStatus[]> {
-      return ipcRenderer.invoke('mcp:listStatuses');
+    listStatuses(host?: DesktopRuntimeHostRef): Promise<McpServerStatus[]> {
+      return invokeSelectedRuntimeHost(host, 'mcp:listStatuses');
     },
-    setConfig(config: McpConfigFile): Promise<McpConfigFile> {
-      return ipcRenderer.invoke('mcp:setConfig', config);
+    importConfig(source: string, host?: DesktopRuntimeHostRef): Promise<McpConfigImportResult> {
+      return invokeSelectedRuntimeHost(host, 'mcp:importConfig', source);
     },
-    upsert(serverId: string, config: McpServerConfig): Promise<McpConfigFile> {
-      return ipcRenderer.invoke('mcp:upsert', serverId, config);
+    add(serverId: string, config: McpServerConfig, host?: DesktopRuntimeHostRef): Promise<McpConfigAddResult> {
+      return invokeSelectedRuntimeHost(host, 'mcp:add', serverId, config);
     },
-    install(serverId: string, config: McpServerConfig): Promise<McpConfigFile> {
-      return ipcRenderer.invoke('mcp:install', serverId, config);
+    upsert(serverId: string, config: McpServerConfig, host?: DesktopRuntimeHostRef): Promise<McpConfigFile> {
+      return invokeSelectedRuntimeHost(host, 'mcp:upsert', serverId, config);
     },
-    remove(serverId: string): Promise<McpConfigFile> {
-      return ipcRenderer.invoke('mcp:remove', serverId);
+    install(serverId: string, config: McpServerConfig, host?: DesktopRuntimeHostRef): Promise<McpConfigFile> {
+      return invokeSelectedRuntimeHost(host, 'mcp:install', serverId, config);
     },
-    cancelInstall(serverId: string): Promise<McpConfigFile> {
-      return ipcRenderer.invoke('mcp:cancelInstall', serverId);
+    remove(serverId: string, host?: DesktopRuntimeHostRef): Promise<McpConfigFile> {
+      return invokeSelectedRuntimeHost(host, 'mcp:remove', serverId);
     },
-    test(serverId: string): Promise<McpTestResult> {
-      return ipcRenderer.invoke('mcp:test', serverId);
+    cancelInstall(serverId: string, host?: DesktopRuntimeHostRef): Promise<McpConfigFile> {
+      return invokeSelectedRuntimeHost(host, 'mcp:cancelInstall', serverId);
     },
-    reconnect(serverId: string): Promise<McpServerStatus> {
-      return ipcRenderer.invoke('mcp:reconnect', serverId);
+    test(serverId: string, host?: DesktopRuntimeHostRef): Promise<McpTestResult> {
+      return invokeSelectedRuntimeHost(host, 'mcp:test', serverId);
+    },
+    // Same scoped seam as every other MCP method: the handlers live on the
+    // Runtime Host's ScopedIpcMain, whose first argument is the host ref —
+    // a raw invoke would put serverId in that slot and fail the scope check
+    // before the handler ever ran.
+    login(serverId: string, host?: DesktopRuntimeHostRef): Promise<McpServerStatus> {
+      return invokeSelectedRuntimeHost(host, 'mcp:login', serverId);
+    },
+    cancelLogin(serverId: string, host?: DesktopRuntimeHostRef): Promise<boolean> {
+      return invokeSelectedRuntimeHost(host, 'mcp:cancelLogin', serverId);
+    },
+    logout(serverId: string, host?: DesktopRuntimeHostRef): Promise<McpServerStatus> {
+      return invokeSelectedRuntimeHost(host, 'mcp:logout', serverId);
     },
     subscribeChanges(handler: (statuses: McpServerStatus[]) => void): () => void {
-      const listener = (_event: Electron.IpcRendererEvent, payload: McpServerStatus[]) => handler(payload);
-      ipcRenderer.on('mcp:changed', listener);
-      return () => ipcRenderer.off('mcp:changed', listener);
+      return subscribeActiveRuntimeHostEvent('mcp:changed', handler);
     },
   },
   // PR110b: onboarding snapshot + milestone IPCs. Renderer polls
-  // `getSnapshot()` on app load and re-polls when
-  // `sessions:changed` / `connections:changed` / settings change
-  // events fire. There is no push event for OnboardingState — it is
-  // a derived projection and refresh latency is acceptable.
+  // `getSnapshot()` on app load and re-polls on existing invalidations.
+  // Onboarding state and connection setup belong to the default Host; bounded
+  // Owner send outcomes are merged from ready Owner Hosts; Guest summaries
+  // come from the separate, authorized mount catalog.
   onboarding: {
     getSnapshot(): Promise<OnboardingSnapshot> {
-      return ipcRenderer.invoke('onboarding:getSnapshot');
+      return loadDesktopOnboardingSnapshot();
     },
-    setMilestone(
+    async setMilestone(
       id: OnboardingMilestoneId,
       status: 'completed' | 'skipped',
+      host?: DesktopRuntimeHostRef,
     ): Promise<OnboardingSnapshot> {
-      return ipcRenderer.invoke('onboarding:setMilestone', id, status);
+      const scope = await selectedRuntimeHostScope(host);
+      const snapshot = await ipcRenderer.invoke(
+        'onboarding:setMilestone', scope, id, status,
+      ) as OnboardingSnapshot;
+      return projectOnboardingSnapshot(scope, snapshot);
     },
-    clearMilestone(id: OnboardingMilestoneId): Promise<OnboardingSnapshot> {
-      return ipcRenderer.invoke('onboarding:clearMilestone', id);
+  },
+  taskReadiness: {
+    getSnapshot(input?: DesktopTaskSubmissionReadinessRequest, sessionId?: string) {
+      return sessionId
+        ? invokeRuntimeHostForSession('taskReadiness:getSnapshot', sessionId, input)
+        : invokeActiveRuntimeHost('taskReadiness:getSnapshot', input);
     },
   },
   permissions: {
-    getSnapshot(): Promise<PermissionSnapshot> {
-      return ipcRenderer.invoke('permissions:getSnapshot');
+    getSnapshot(host?: DesktopRuntimeHostRef): Promise<PermissionSnapshot> {
+      return invokeSelectedRuntimeHost(host, 'permissions:getSnapshot');
     },
-    openSystemSettings(permId: string): Promise<PermissionActionResult> {
-      return ipcRenderer.invoke('permissions:openSystemSettings', permId);
+    openSystemSettings(permId: string, host?: DesktopRuntimeHostRef): Promise<PermissionActionResult> {
+      return invokeSelectedRuntimeHost(host, 'permissions:openSystemSettings', permId);
     },
-    requestAccess(permId: string): Promise<PermissionActionResult> {
-      return ipcRenderer.invoke('permissions:requestAccess', permId);
+    requestAccess(permId: string, host?: DesktopRuntimeHostRef): Promise<PermissionActionResult> {
+      return invokeSelectedRuntimeHost(host, 'permissions:requestAccess', permId);
     },
-    startDragOnboarding(permId: string): Promise<PermissionOverlayStartResult> {
-      return ipcRenderer.invoke('permissions:startDragOnboarding', permId);
+    startDragOnboarding(permId: string, host?: DesktopRuntimeHostRef): Promise<PermissionOverlayStartResult> {
+      return invokeSelectedRuntimeHost(host, 'permissions:startDragOnboarding', permId);
     },
   },
   capabilities: {
-    getSnapshot(): Promise<CapabilitySnapshotCollection> {
-      return ipcRenderer.invoke('capabilities:getSnapshot');
+    getSnapshot(host?: DesktopRuntimeHostRef): Promise<CapabilitySnapshotCollection> {
+      return invokeSelectedRuntimeHost(host, 'capabilities:getSnapshot');
     },
   },
   health: {
-    getSnapshot(): Promise<HealthSnapshot> {
-      return ipcRenderer.invoke('health:getSnapshot');
+    getSnapshot(host?: DesktopRuntimeHostRef): Promise<HealthSnapshot> {
+      return invokeSelectedRuntimeHost(host, 'health:getSnapshot');
     },
   },
   memory: {
-    getState(): Promise<LocalMemoryState> {
-      return ipcRenderer.invoke('memory:getState');
+    getState(sessionId?: string, host?: DesktopRuntimeHostRef): Promise<LocalMemoryState> {
+      return sessionId
+        ? invokeRuntimeHostForSession('memory:getState', sessionId)
+        : invokeSelectedRuntimeHost(host, 'memory:getState');
     },
-    listProposals(): Promise<ReadonlyArray<LocalMemoryEntryPreview>> {
-      return ipcRenderer.invoke('memory:listProposals');
+    save(content: string, host?: DesktopRuntimeHostRef): Promise<LocalMemoryState> {
+      return invokeSelectedRuntimeHost(host, 'memory:save', content);
     },
-    propose(input: { title: string; content: string; scope?: 'workspace' | 'session'; sessionId?: string }): Promise<LocalMemoryMutationResult> {
-      return ipcRenderer.invoke('memory:propose', input);
+    reset(host?: DesktopRuntimeHostRef): Promise<LocalMemoryState> {
+      return invokeSelectedRuntimeHost(host, 'memory:reset');
     },
-    remember(input: { title: string; content: string; scope?: 'workspace' | 'session'; sessionId?: string }): Promise<LocalMemoryMutationResult> {
-      return ipcRenderer.invoke('memory:remember', input);
+    restoreLatestBackup(host?: DesktopRuntimeHostRef): Promise<{ ok: true; state: LocalMemoryState } | { ok: false; state: LocalMemoryState; code: string }> {
+      return invokeSelectedRuntimeHost(host, 'memory:restoreLatestBackup');
     },
-    approveProposal(proposalId: string): Promise<LocalMemoryMutationResult> {
-      return ipcRenderer.invoke('memory:approveProposal', proposalId);
+    restoreBackup(kind: 'save' | 'reset' | 'restore', host?: DesktopRuntimeHostRef): Promise<{ ok: true; state: LocalMemoryState } | { ok: false; state: LocalMemoryState; code: string }> {
+      return invokeSelectedRuntimeHost(host, 'memory:restoreBackup', kind);
     },
-    rejectProposal(proposalId: string): Promise<LocalMemoryMutationResult> {
-      return ipcRenderer.invoke('memory:rejectProposal', proposalId);
+    setEnabled(enabled: boolean, host?: DesktopRuntimeHostRef): Promise<LocalMemoryState> {
+      return invokeSelectedRuntimeHost(host, 'memory:setEnabled', enabled);
     },
-    archiveEntry(entryId: string, reason?: string): Promise<LocalMemoryMutationResult> {
-      return ipcRenderer.invoke('memory:archiveEntry', entryId, reason);
+    setAgentReadEnabled(enabled: boolean, host?: DesktopRuntimeHostRef): Promise<LocalMemoryState> {
+      return invokeSelectedRuntimeHost(host, 'memory:setAgentReadEnabled', enabled);
     },
-    restoreEntry(entryId: string): Promise<LocalMemoryMutationResult> {
-      return ipcRenderer.invoke('memory:restoreEntry', entryId);
+    openFile(host?: DesktopRuntimeHostRef): Promise<{ ok: true } | { ok: false; code: string }> {
+      return invokeSelectedRuntimeHost(host, 'memory:openFile');
     },
-    save(content: string): Promise<LocalMemoryState> {
-      return ipcRenderer.invoke('memory:save', content);
+    openLatestBackup(host?: DesktopRuntimeHostRef): Promise<{ ok: true } | { ok: false; code: string }> {
+      return invokeSelectedRuntimeHost(host, 'memory:openLatestBackup');
     },
-    reset(): Promise<LocalMemoryState> {
-      return ipcRenderer.invoke('memory:reset');
-    },
-    restoreLatestBackup(): Promise<{ ok: true; state: LocalMemoryState } | { ok: false; state: LocalMemoryState; message: string }> {
-      return ipcRenderer.invoke('memory:restoreLatestBackup');
-    },
-    restoreBackup(kind: 'save' | 'reset' | 'restore'): Promise<{ ok: true; state: LocalMemoryState } | { ok: false; state: LocalMemoryState; message: string }> {
-      return ipcRenderer.invoke('memory:restoreBackup', kind);
-    },
-    setEnabled(enabled: boolean): Promise<LocalMemoryState> {
-      return ipcRenderer.invoke('memory:setEnabled', enabled);
-    },
-    setAgentReadEnabled(enabled: boolean): Promise<LocalMemoryState> {
-      return ipcRenderer.invoke('memory:setAgentReadEnabled', enabled);
-    },
-    openFile(): Promise<{ ok: true } | { ok: false; message: string }> {
-      return ipcRenderer.invoke('memory:openFile');
-    },
-    openLatestBackup(): Promise<{ ok: true } | { ok: false; message: string }> {
-      return ipcRenderer.invoke('memory:openLatestBackup');
-    },
-    openBackup(kind: 'save' | 'reset' | 'restore'): Promise<{ ok: true } | { ok: false; message: string }> {
-      return ipcRenderer.invoke('memory:openBackup', kind);
+    openBackup(kind: 'save' | 'reset' | 'restore', host?: DesktopRuntimeHostRef): Promise<{ ok: true } | { ok: false; code: string }> {
+      return invokeSelectedRuntimeHost(host, 'memory:openBackup', kind);
     },
   },
   attachments: {
+    pickDirectory: () => ipcRenderer.invoke('directories:pick'),
     pickFiles(): Promise<
-      | { ok: true; files: { approvalId: string; name: string; mimeType?: string; size: number }[] }
+      | {
+          ok: true;
+          files: {
+            approvalId: string;
+            name: string;
+            mimeType?: string;
+            size: number;
+          }[];
+        }
       | { ok: false; reason: 'cancelled' }
     > {
       return ipcRenderer.invoke('attachments:pickFiles');
     },
-    readBytes(sessionId: string, relativePath: string): Promise<
+    // Staged-attachment thumbnail for the composer drawer. Peeks the approval
+    // (never consumes it) so the token stays redeemable for the actual send.
+    previewApproval(approvalId: string): Promise<
       | { ok: true; base64: string; mimeType: string }
       | { ok: false; reason: string }
     > {
-      return ipcRenderer.invoke('attachments:readBytes', sessionId, relativePath);
+      return ipcRenderer.invoke('attachments:previewApproval', approvalId);
+    },
+    readBytes(sessionId: string, artifactId: string): Promise<ArtifactBinaryReadResult> {
+      return invokeSessionRuntimeHost('attachments:readBytes', sessionId, artifactId);
     },
   },
   search: {
-    // PR-SEARCH-2: local thread search. Renderer sends a `SearchRequest`
-    // (source must be 'thread'); main responds with `SearchResult[]` or
-    // an error envelope. The query body never leaves the device — the
-    // helper is local-only and the IPC handler never emits the query
-    // into telemetry.
-    thread(request: SearchRequest): Promise<SearchResult[] | { ok: false; reason: SearchErrorReason; message: string }> {
-      return ipcRenderer.invoke('search:thread', request);
+    // Search each ready Owner Host independently; Guests cannot search a workspace.
+    // Remote queries use that Host's authenticated connection, never telemetry.
+    async thread(request: SearchRequest): Promise<SearchResult[] | { ok: false; reason: SearchErrorReason; message: string }> {
+      const scopes = await readyOwnerRuntimeHostScopes();
+      return collectThreadSearchResponses(
+        scopes.map(async (scope) => {
+          const result = await ipcRenderer.invoke('search:thread', scope, request) as
+            | SearchResult[]
+            | { ok: false; reason: SearchErrorReason; message: string };
+          return Array.isArray(result)
+            ? result.map((entry) =>
+                entry.target?.kind === 'thread'
+                  ? {
+                      ...entry,
+                      target: {
+                        ...entry.target,
+                        sessionId: recordRuntimeHostSessionScope(scope, entry.target.sessionId),
+                      },
+                    }
+                  : entry,
+              )
+            : result;
+        }),
+        request.limit,
+      );
     },
   },
-  // PR-OAUTH-SUBSCRIPTION-0: Claude subscription OAuth bridge.
-  // NEVER returns raw OAuth credentials; renderer only sees account
-  // state + quota + action results (xuan G-X3 + the
-  // claude-subscription-ipc-boundary contract test enforces this).
+  // Browser-assisted Codex account bridge. NEVER returns raw OAuth
+  // credentials; the renderer only sees account state and action results.
   //
-  // kenji `1da909d5`/`45b31e16` hardening: `openAuthUrl` takes
-  // ONLY an `authRequestId`; the URL is held by main from the
-  // earlier `getAuthUrl` call. Renderer can never hand
-  // `shell.openExternal` an arbitrary URL.
-  //
-  // Whole feature is gated behind `MAKA_CLAUDE_SUBSCRIPTION_EXPERIMENTAL=1`
-  // until product/legal sign-off. `isExperimentalEnabled()` lets the
-  // Settings UI hide the card; even without that hide, all auth-flow
-  // handlers re-check the flag main-side (fail-closed via the
-  // `experimental_disabled` reason).
-  claudeSubscription: {
-    isExperimentalEnabled(): Promise<boolean> {
-      return ipcRenderer.invoke('claude-subscription:is-experimental-enabled');
-    },
-    getAuthUrl(): Promise<AuthorizationUrlPayload | SubscriptionActionResult> {
-      return ipcRenderer.invoke('claude-subscription:get-auth-url');
-    },
-    openAuthUrl(authRequestId: string): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('claude-subscription:open-auth-url', authRequestId);
-    },
-    completeAuthorization(authRequestId: string, pasted: string): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('claude-subscription:complete-authorization', authRequestId, pasted);
-    },
-    cancelAuthorization(authRequestId?: string): Promise<{ ok: true }> {
-      return ipcRenderer.invoke('claude-subscription:cancel-authorization', authRequestId);
-    },
-    getAccountState(): Promise<SubscriptionAccountState> {
-      return ipcRenderer.invoke('claude-subscription:get-account-state');
-    },
-    refreshQuota(): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('claude-subscription:refresh-quota');
-    },
-    refreshTokens(): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('claude-subscription:refresh-tokens');
-    },
-    logout(): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('claude-subscription:logout');
-    },
-  },
-  // PR-MODEL-OAUTH-ALL-0: Codex / Antigravity subscription
-  // bridges. Same shape as `claudeSubscription` (no token-shaped
-  // fields, opaque authRequestId, action-result envelopes). Each
-  // service's state snapshot is provider-specific because the
-  // upstream auth claims differ (Codex carries JWT account_id /
-  // plan; Antigravity is preview-only).
+  // kenji `1da909d5`/`45b31e16` hardening: `openAuthUrl` takes ONLY an
+  // `authRequestId`; the URL is held by main from the earlier `getAuthUrl`
+  // call. Renderer can never hand `shell.openExternal` an arbitrary URL.
   openAiCodex: {
-    isExperimentalEnabled(): Promise<boolean> {
-      return ipcRenderer.invoke('openai-codex:is-experimental-enabled');
+    getAuthUrl(host: DesktopRuntimeHostRef | undefined, target: DesktopOAuthLoginTarget) {
+      return invokeSelectedRuntimeHost(host, 'openai-codex:get-auth-url', target);
     },
-    getAuthUrl(): Promise<AuthorizationUrlPayload | SubscriptionActionResult> {
-      return ipcRenderer.invoke('openai-codex:get-auth-url');
+    openAuthUrl(authRequestId: string, host?: DesktopRuntimeHostRef): Promise<SubscriptionActionResult> {
+      return invokeSelectedRuntimeHost(host, 'openai-codex:open-auth-url', authRequestId);
     },
-    openAuthUrl(authRequestId: string): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('openai-codex:open-auth-url', authRequestId);
+    completeAuthorization(authRequestId: string, host?: DesktopRuntimeHostRef): Promise<DesktopOAuthAuthorizationResult> {
+      return invokeSelectedRuntimeHost(host, 'openai-codex:complete-authorization', authRequestId);
     },
-    completeAuthorization(authRequestId: string): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('openai-codex:complete-authorization', authRequestId);
+    cancelAuthorization(authRequestId?: string, host?: DesktopRuntimeHostRef): Promise<{ ok: true }> {
+      return invokeSelectedRuntimeHost(host, 'openai-codex:cancel-authorization', authRequestId);
     },
-    cancelAuthorization(authRequestId?: string): Promise<{ ok: true }> {
-      return ipcRenderer.invoke('openai-codex:cancel-authorization', authRequestId);
-    },
-    getAccountState(): Promise<{
+    getAccountState(host: DesktopRuntimeHostRef | undefined, connectionId: string): Promise<{
       provider: 'openai-codex';
       runtimeState: 'not_logged_in' | 'authorizing' | 'authenticated' | 'refreshing' | 'refresh_failed';
       accountId?: string;
@@ -681,29 +3197,32 @@ const makaBridge = {
       picture?: string;
       errorMessage?: string;
     }> {
-      return ipcRenderer.invoke('openai-codex:get-account-state');
+      return invokeSelectedRuntimeHost(host, 'openai-codex:get-account-state', connectionId);
     },
-    refreshTokens(): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('openai-codex:refresh-tokens');
+    getEnrollmentState(host?: DesktopRuntimeHostRef): Promise<{ enabled: boolean }> {
+      return invokeSelectedRuntimeHost(host, 'openai-codex:get-enrollment-state');
     },
-    logout(): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('openai-codex:logout');
+    refreshTokens(host: DesktopRuntimeHostRef | undefined, connectionId: string): Promise<SubscriptionActionResult> {
+      return invokeSelectedRuntimeHost(host, 'openai-codex:refresh-tokens', connectionId);
+    },
+    logout(host: DesktopRuntimeHostRef | undefined, connectionId: string): Promise<SubscriptionActionResult> {
+      return invokeSelectedRuntimeHost(host, 'openai-codex:logout', connectionId);
     },
   },
   xaiOAuth: {
-    getAuthUrl(): Promise<AuthorizationUrlPayload | SubscriptionActionResult> {
-      return ipcRenderer.invoke('xai-oauth:get-auth-url');
+    getAuthUrl(host: DesktopRuntimeHostRef | undefined, target: DesktopOAuthLoginTarget) {
+      return invokeSelectedRuntimeHost(host, 'xai-oauth:get-auth-url', target);
     },
-    openAuthUrl(authRequestId: string): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('xai-oauth:open-auth-url', authRequestId);
+    openAuthUrl(authRequestId: string, host?: DesktopRuntimeHostRef): Promise<SubscriptionActionResult> {
+      return invokeSelectedRuntimeHost(host, 'xai-oauth:open-auth-url', authRequestId);
     },
-    completeAuthorization(authRequestId: string): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('xai-oauth:complete-authorization', authRequestId);
+    completeAuthorization(authRequestId: string, host?: DesktopRuntimeHostRef): Promise<DesktopOAuthAuthorizationResult> {
+      return invokeSelectedRuntimeHost(host, 'xai-oauth:complete-authorization', authRequestId);
     },
-    cancelAuthorization(authRequestId?: string): Promise<{ ok: true }> {
-      return ipcRenderer.invoke('xai-oauth:cancel-authorization', authRequestId);
+    cancelAuthorization(authRequestId?: string, host?: DesktopRuntimeHostRef): Promise<{ ok: true }> {
+      return invokeSelectedRuntimeHost(host, 'xai-oauth:cancel-authorization', authRequestId);
     },
-    getAccountState(): Promise<{
+    getAccountState(host: DesktopRuntimeHostRef | undefined, connectionId: string): Promise<{
       provider: 'xai-oauth';
       runtimeState:
         | 'not_logged_in'
@@ -714,120 +3233,137 @@ const makaBridge = {
         | 'storage_failed';
       errorMessage?: string;
     }> {
-      return ipcRenderer.invoke('xai-oauth:get-account-state');
+      return invokeSelectedRuntimeHost(host, 'xai-oauth:get-account-state', connectionId);
     },
-    refreshTokens(): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('xai-oauth:refresh-tokens');
+    getEnrollmentState(host?: DesktopRuntimeHostRef): Promise<{ enabled: boolean }> {
+      return invokeSelectedRuntimeHost(host, 'xai-oauth:get-enrollment-state');
     },
-    logout(): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('xai-oauth:logout');
+    refreshTokens(host: DesktopRuntimeHostRef | undefined, connectionId: string): Promise<SubscriptionActionResult> {
+      return invokeSelectedRuntimeHost(host, 'xai-oauth:refresh-tokens', connectionId);
+    },
+    logout(host: DesktopRuntimeHostRef | undefined, connectionId: string): Promise<SubscriptionActionResult> {
+      return invokeSelectedRuntimeHost(host, 'xai-oauth:logout', connectionId);
     },
   },
   githubCopilotSubscription: {
-    connectExistingLogin(): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('github-copilot:connect-existing-login');
+    connectExistingLogin(host?: DesktopRuntimeHostRef): Promise<SubscriptionActionResult> {
+      return invokeSelectedRuntimeHost(host, 'github-copilot:connect-existing-login');
     },
-    getAccountState(): Promise<{
+    getAuthUrl(host: DesktopRuntimeHostRef | undefined, target: DesktopOAuthLoginTarget) {
+      return invokeSelectedRuntimeHost(host, 'github-copilot:get-auth-url', target);
+    },
+    openAuthUrl(authRequestId: string, host?: DesktopRuntimeHostRef): Promise<SubscriptionActionResult> {
+      return invokeSelectedRuntimeHost(host, 'github-copilot:open-auth-url', authRequestId);
+    },
+    completeAuthorization(authRequestId: string, host?: DesktopRuntimeHostRef): Promise<DesktopOAuthAuthorizationResult> {
+      return invokeSelectedRuntimeHost(host, 'github-copilot:complete-authorization', authRequestId);
+    },
+    cancelAuthorization(authRequestId?: string, host?: DesktopRuntimeHostRef): Promise<{ ok: true }> {
+      return invokeSelectedRuntimeHost(host, 'github-copilot:cancel-authorization', authRequestId);
+    },
+    getAccountState(host: DesktopRuntimeHostRef | undefined, connectionId: string): Promise<{
       provider: 'github-copilot';
-      runtimeState: 'not_logged_in' | 'authenticated' | 'refreshing' | 'refresh_failed' | 'storage_failed';
+      runtimeState: 'not_logged_in' | 'authorizing' | 'authenticated' | 'refreshing' | 'refresh_failed' | 'storage_failed';
       errorMessage?: string;
     }> {
-      return ipcRenderer.invoke('github-copilot:get-account-state');
+      return invokeSelectedRuntimeHost(host, 'github-copilot:get-account-state', connectionId);
     },
-    refreshTokens(): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('github-copilot:refresh-tokens');
+    getEnrollmentState(host?: DesktopRuntimeHostRef): Promise<{ enabled: boolean }> {
+      return invokeSelectedRuntimeHost(host, 'github-copilot:get-enrollment-state');
     },
-    logout(): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('github-copilot:logout');
+    refreshTokens(host: DesktopRuntimeHostRef | undefined, connectionId: string): Promise<SubscriptionActionResult> {
+      return invokeSelectedRuntimeHost(host, 'github-copilot:refresh-tokens', connectionId);
     },
-  },
-  antigravitySubscription: {
-    isExperimentalEnabled(): Promise<boolean> {
-      return ipcRenderer.invoke('antigravity-subscription:is-experimental-enabled');
-    },
-    getAuthUrl(): Promise<AuthorizationUrlPayload | SubscriptionActionResult> {
-      return ipcRenderer.invoke('antigravity-subscription:get-auth-url');
-    },
-    openAuthUrl(authRequestId: string): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('antigravity-subscription:open-auth-url', authRequestId);
-    },
-    completeAuthorization(authRequestId: string): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('antigravity-subscription:complete-authorization', authRequestId);
-    },
-    cancelAuthorization(authRequestId?: string): Promise<{ ok: true }> {
-      return ipcRenderer.invoke('antigravity-subscription:cancel-authorization', authRequestId);
-    },
-    getAccountState(): Promise<{
-      provider: 'antigravity-subscription';
-      status: 'preview';
-      runtimeState: 'not_logged_in' | 'authorizing' | 'authenticated' | 'refreshing' | 'refresh_failed';
-      errorMessage?: string;
-    }> {
-      return ipcRenderer.invoke('antigravity-subscription:get-account-state');
-    },
-    refreshTokens(): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('antigravity-subscription:refresh-tokens');
-    },
-    logout(): Promise<SubscriptionActionResult> {
-      return ipcRenderer.invoke('antigravity-subscription:logout');
+    logout(host: DesktopRuntimeHostRef | undefined, connectionId: string): Promise<SubscriptionActionResult> {
+      return invokeSelectedRuntimeHost(host, 'github-copilot:logout', connectionId);
     },
   },
-  plans: {
-    list(): Promise<PlanReminder[]> {
-      return ipcRenderer.invoke('plans:list');
+  scheduledTasks: {
+    list(host?: DesktopRuntimeHostRef): Promise<ScheduledTask[]> {
+      return listScheduledTasks(host);
     },
-    create(input: { title: string; note?: string; runAt: number | string; recurrence?: PlanReminderRecurrence; cronExpression?: string; delivery?: PlanReminderDeliveryTarget }): Promise<PlanReminder> {
-      return ipcRenderer.invoke('plans:create', input);
+    create(input: Omit<CreateScheduledTaskInput, 'createdBy'>, host?: DesktopRuntimeHostRef): Promise<ScheduledTask> {
+      return mutateScheduledTask({ kind: 'create', input }, host);
     },
-    update(id: string, patch: { title?: string; note?: string; runAt?: number | string; recurrence?: PlanReminderRecurrence; cronExpression?: string; delivery?: PlanReminderDeliveryTarget; enabled?: boolean }): Promise<PlanReminder> {
-      return ipcRenderer.invoke('plans:update', id, patch);
+    update(id: string, patch: UpdateScheduledTaskInput, host?: DesktopRuntimeHostRef): Promise<ScheduledTask> {
+      return mutateScheduledTask({ kind: 'update', taskId: id, patch }, host);
     },
-    setEnabled(id: string, enabled: boolean): Promise<PlanReminder> {
-      return ipcRenderer.invoke('plans:setEnabled', id, enabled);
+    setEnabled(id: string, enabled: boolean, host?: DesktopRuntimeHostRef): Promise<ScheduledTask> {
+      return mutateScheduledTask({
+        kind: enabled ? 'resume' : 'pause',
+        taskId: id,
+      }, host);
     },
-    triggerNow(id: string): Promise<PlanReminder> {
-      return ipcRenderer.invoke('plans:triggerNow', id);
+    triggerNow(id: string, host?: DesktopRuntimeHostRef): Promise<ScheduledTask> {
+      return mutateScheduledTask({ kind: 'trigger_now', taskId: id }, host);
     },
-    snooze(id: string): Promise<PlanReminder> {
-      return ipcRenderer.invoke('plans:snooze', id);
+    snooze(id: string, host?: DesktopRuntimeHostRef): Promise<ScheduledTask> {
+      return mutateScheduledTask({
+        kind: 'snooze',
+        taskId: id,
+        delayMs: 10 * 60 * 1000,
+      }, host);
     },
-    clearRunHistory(id: string): Promise<PlanReminder> {
-      return ipcRenderer.invoke('plans:clearRunHistory', id);
+    clearRunHistory(id: string, host?: DesktopRuntimeHostRef): Promise<ScheduledTask> {
+      return mutateScheduledTask({ kind: 'clear_history', taskId: id }, host);
     },
-    delete(id: string): Promise<void> {
-      return ipcRenderer.invoke('plans:delete', id);
+    async delete(id: string, host?: DesktopRuntimeHostRef): Promise<void> {
+      await scopedRuntimeHost(await selectedRuntimeHostScope(host)).command('scheduled-task.mutate', {
+        kind: 'delete',
+        taskId: id,
+      });
     },
-    subscribeChanges(handler: (event: { type: 'plans_changed'; reason: string; reminderId?: string; ts: number }) => void): () => void {
-      const listener = (_event: Electron.IpcRendererEvent, payload: { type: 'plans_changed'; reason: string; reminderId?: string; ts: number }) => handler(payload);
-      ipcRenderer.on('plans:changed', listener);
-      return () => ipcRenderer.off('plans:changed', listener);
+    subscribeChanges(handler: (event: { type: 'scheduled_tasks_changed'; reason: string; taskId?: string; ts: number }) => void): () => void {
+      return subscribeActiveRuntimeHostEvent('scheduled-tasks:changed', handler);
     },
-    subscribeDue(handler: (reminder: PlanReminder) => void): () => void {
-      const listener = (_event: Electron.IpcRendererEvent, payload: PlanReminder) => handler(payload);
-      ipcRenderer.on('plans:due', listener);
-      return () => ipcRenderer.off('plans:due', listener);
+    subscribeDue(handler: (task: Pick<ScheduledTask, 'id' | 'title'>) => void): () => void {
+      return subscribeEveryRuntimeHostEvent(
+        'scheduled-tasks:fired',
+        (_scope, task: Pick<ScheduledTask, 'id' | 'title'>) => handler(task),
+      );
     },
+  },
+  externalAgents: {
+    selectExecutable(host) { return invokeSelectedRuntimeHost(host, 'external-agents:select-executable'); },
+    start(input, host) { return invokeSelectedRuntimeHost(host, 'external-agents:setup:start', input); },
+    query(attemptId, host) { return invokeSelectedRuntimeHost(host, 'external-agents:setup:query', { attemptId }); },
+    cancel(attemptId, host) { return invokeSelectedRuntimeHost(host, 'external-agents:setup:cancel', { attemptId }); },
   },
   settings: {
-    get(): Promise<AppSettings> {
-      return ipcRenderer.invoke('settings:get');
+    getClient(): Promise<AppSettings> {
+      return ipcRenderer.invoke('settings:client:get');
     },
-    update(patch: UpdateAppSettingsInput): Promise<UpdateAppSettingsResult> {
-      return ipcRenderer.invoke('settings:update', patch);
+    get(host?: DesktopRuntimeHostRef): Promise<RuntimeHostAppSettings> {
+      return invokeSelectedRuntimeHost(host, 'settings:get');
     },
-    subscribeExternalChanged(handler: () => void): () => void {
+    updateClient(patch: UpdateAppSettingsInput): Promise<UpdateAppSettingsResult> {
+      return ipcRenderer.invoke('settings:client:update', patch);
+    },
+    update(
+      patch: UpdateAppSettingsInput,
+      host?: DesktopRuntimeHostRef,
+      guard?: RuntimeHostSettingsUpdateGuard,
+    ): Promise<UpdateAppSettingsResult<RuntimeHostAppSettings>> {
+      return invokeSelectedRuntimeHost(host, 'settings:update', patch, guard);
+    },
+    subscribeClientChanged(handler: () => void): () => void {
       const listener = () => handler();
-      ipcRenderer.on('settings:externalChanged', listener);
-      return () => ipcRenderer.off('settings:externalChanged', listener);
+      ipcRenderer.on('settings:clientChanged', listener);
+      return () => ipcRenderer.off('settings:clientChanged', listener);
     },
-    testNetworkProxy(input?: TestProxyInput): Promise<SettingsTestResult> {
-      return ipcRenderer.invoke('settings:testNetworkProxy', input);
+    subscribeExternalChanged(handler: () => void, host?: DesktopRuntimeHostRef): () => void {
+      return subscribeSelectedRuntimeHostEvent('settings:externalChanged', host, handler);
+    },
+    testNetworkProxy(input?: TestProxyInput, host?: DesktopRuntimeHostRef): Promise<SettingsTestResult> {
+      return invokeSelectedRuntimeHost(host, 'settings:testNetworkProxy', input);
     },
     testBotChannel(provider: BotProvider): Promise<SettingsTestResult> {
       return ipcRenderer.invoke('settings:testBotChannel', provider);
     },
-    usageStats(range?: UsageRange): Promise<UsageStats> {
-      return ipcRenderer.invoke('settings:usageStats', range);
+    async usageStats(range?: UsageRange, host?: DesktopRuntimeHostRef): Promise<UsageStats> {
+      const scope = await selectedRuntimeHostScope(host);
+      const stats = await ipcRenderer.invoke('settings:usageStats', scope, range) as UsageStats;
+      return projectDesktopUsageStats(scope, stats);
     },
     bots: {
       listStatuses(): Promise<Record<BotProvider, BotStatus>> {
@@ -840,7 +3376,7 @@ const makaBridge = {
         return ipcRenderer.invoke('settings:bots:wechatQrCode');
       },
       subscribeStatusChanges(handler: (status: BotStatus) => void): () => void {
-        const listener = (_event: Electron.IpcRendererEvent, payload: BotStatus) => handler(payload);
+        const listener = (_event: Electron.IpcRendererEvent, status: BotStatus) => handler(status);
         ipcRenderer.on('settings:bots:statusChanged', listener);
         return () => ipcRenderer.off('settings:bots:statusChanged', listener);
       },
@@ -860,29 +3396,6 @@ const makaBridge = {
       },
     },
   },
-  voice: {
-    begin(input: VoiceBeginRequest): Promise<VoiceBeginResult> {
-      return ipcRenderer.invoke('voice:begin', input);
-    },
-    finishCapture(
-      operationId: string,
-      audio: VoiceCapturedAudio,
-    ): Promise<VoiceFinishCaptureResult> {
-      return ipcRenderer.invoke('voice:finishCapture', operationId, audio);
-    },
-    cancel(operationId: string): Promise<void> {
-      return ipcRenderer.invoke('voice:cancel', operationId);
-    },
-    createRealtimeSession(offerSdp: string): Promise<VoiceRealtimeClientSession> {
-      return ipcRenderer.invoke('voice:createRealtimeSession', offerSdp);
-    },
-    closeRealtimeSession(sessionId: string): Promise<void> {
-      return ipcRenderer.invoke('voice:closeRealtimeSession', sessionId);
-    },
-    validateCoordinatorToolCall(input: unknown): Promise<VoiceCoordinatorToolCall> {
-      return ipcRenderer.invoke('voice:validateCoordinatorToolCall', input);
-    },
-  },
   notifications: {
     // Fire-and-forget signal that an agent turn reached a terminal
     // state. `title` is the session name, `body` the start of the reply
@@ -899,28 +3412,98 @@ const makaBridge = {
   },
   inspector: {
     /** Read-only per-session causal trace (#1625). Never writes runtime state. */
-    trace(sessionId: string): Promise<Result<SessionTrace>> {
-      return ipcRenderer.invoke('inspector:trace', sessionId);
+    trace(sessionId: string, cursor?: string): Promise<Result<DesktopSessionTracePage>> {
+      return bridgeResult(() => loadSessionTracePage(sessionId, cursor), 'INSPECTOR_TRACE_FAILED');
+    },
+    summary(sessionId: string): Promise<Result<DesktopSessionUsageSummary>> {
+      return loadSessionUsageSummary(sessionId);
+    },
+    subscribeUsageChanges(sessionId: string, handler: () => void): () => void {
+      let disposed = false;
+      let unsubscribe = () => {};
+      void runtimeHostSessionRef(sessionId)
+        .then(({ scope, sessionId: rawSessionId }) => {
+          if (disposed) return;
+          unsubscribe = subscribeRuntimeHostEvent(
+            'usage:changed',
+            scope,
+            (event: { sessionId: string }) => {
+              if (event.sessionId === rawSessionId) handler();
+            },
+          );
+        })
+        .catch(() => undefined);
+      return () => {
+        disposed = true;
+        unsubscribe();
+      };
+    },
+    /**
+     * What the session's context is made of right now (#2323).
+     *
+     * A different question from "what happened in this session", and it has
+     * its own typed owner on the Host — the same snapshot `/context` prints.
+     * The Inspector asks that owner rather than widening the trace, so the two
+     * surfaces cannot drift into two implementations of one fact.
+     */
+    context(sessionId: string): Promise<Result<ContextDiagnosticsResult>> {
+      return bridgeResult(
+        async () => {
+          const session = await runtimeHostSessionRef(sessionId);
+          return scopedRuntimeHost(session.scope).query('context.diagnostics.query', {
+            sessionId: session.sessionId,
+          });
+        },
+        'INSPECTOR_CONTEXT_FAILED',
+      );
     },
   },
   dailyReview: {
-    day(offsetDays: number, daySpan?: number): Promise<Result<DailyReviewSummary>> {
-      return ipcRenderer.invoke('daily-review:day', { offsetDays, daySpan });
+    day(offsetDays: number, daySpan?: number, host?: DesktopRuntimeHostRef): Promise<Result<DailyReviewSummary>> {
+      return bridgeResult(async () => {
+        const scope = await selectedRuntimeHostScope(host);
+        const result = await scopedRuntimeHost(scope).query('daily-review.query', {
+          kind: 'summary',
+          offsetDays: integer(offsetDays, 0),
+          daySpan: Math.max(1, Math.min(30, integer(daySpan, 1))),
+        });
+        if (result.kind !== 'summary') throw new Error('Invalid Daily Review summary');
+        return projectDesktopDailyReviewSummary(scope, result.summary);
+      }, 'DAILY_REVIEW_DAY_FAILED');
     },
-    getConfig(): Promise<DailyReviewConfig> {
-      return ipcRenderer.invoke('daily-review:getConfig');
+    async getConfig(host?: DesktopRuntimeHostRef): Promise<DailyReviewConfig> {
+      const result = await scopedRuntimeHost(
+        await selectedRuntimeHostScope(host),
+      ).query('daily-review.query', {
+        kind: 'config',
+      });
+      if (result.kind !== 'config') throw new Error('Invalid Daily Review config');
+      return result.config;
     },
-    setConfig(patch: Partial<DailyReviewConfig>): Promise<DailyReviewConfig> {
-      return ipcRenderer.invoke('daily-review:setConfig', patch);
+    setConfig(patch: Partial<DailyReviewConfig>, host?: DesktopRuntimeHostRef): Promise<DailyReviewConfig> {
+      return updateDailyReviewConfig(patch, host);
     },
-    runOnce(input: { range: DailyReviewRange; offsetDays?: number; modelKey?: string }): Promise<{ archiveId: string }> {
-      return ipcRenderer.invoke('daily-review:runOnce', input);
+    async runOnce(input: { range: DailyReviewRange; offsetDays?: number; modelKey?: string }): Promise<{ archiveId: string }> {
+      const result = await runtimeHost.command('daily-review.mutate', {
+        kind: 'run',
+        range: DAILY_REVIEW_RANGES.includes(input.range) ? input.range : 1,
+        offsetDays: integer(input.offsetDays, 0),
+        modelKeyOverride: input.modelKey ?? '',
+        replaceExisting: false,
+      });
+      if (result.kind !== 'archive') throw new Error('Invalid Daily Review run');
+      return { archiveId: result.archive.id };
     },
     listArchives(): Promise<DailyReviewArchiveSummary[]> {
-      return ipcRenderer.invoke('daily-review:list');
+      return listDailyReviewArchives();
     },
-    getArchive(archiveId: string): Promise<DailyReviewArchive | null> {
-      return ipcRenderer.invoke('daily-review:get', archiveId);
+    async getArchive(archiveId: string): Promise<DailyReviewArchive | null> {
+      const result = await runtimeHost.query('daily-review.query', {
+        kind: 'archive',
+        archiveId,
+      });
+      if (result.kind !== 'archive') throw new Error('Invalid Daily Review archive');
+      return result.archive;
     },
     /**
      * PR-DAILY-REVIEW-EXPORT-FILE-0: render the markdown in the renderer
@@ -943,11 +3526,11 @@ const makaBridge = {
       limit?: number;
       provider?: WebSearchProvider;
       apiKey?: string;
-    }): Promise<WebSearchResponse> {
-      return ipcRenderer.invoke('web-search:query', input);
+    }, host?: DesktopRuntimeHostRef): Promise<WebSearchResponse> {
+      return executeWebSearchQuery(input, host);
     },
-    test(input: { provider?: WebSearchProvider; apiKey?: string }): Promise<WebSearchResponse> {
-      return ipcRenderer.invoke('web-search:test', input);
+    test(input: { provider?: WebSearchProvider; apiKey?: string }, host?: DesktopRuntimeHostRef): Promise<WebSearchResponse> {
+      return executeWebSearchTest(input, host);
     },
   },
   appWindow: {
@@ -977,45 +3560,47 @@ const makaBridge = {
     },
   },
   config: {
-    export(input: { categories: ConfigCategory[] }): Promise<
+    export(input: { categories: ConfigCategory[] }, host?: DesktopRuntimeHostRef): Promise<
       | { ok: false; reason: 'no_categories' | 'canceled' }
       | { ok: true; path: string; includedData: ConfigCategory[] }
     > {
-      return ipcRenderer.invoke('config:export', input);
+      return invokeSelectedRuntimeHost(host, 'config:export', input);
     },
-    import(input: { strategy: 'skip' | 'overwrite' }): Promise<
+    import(input: { strategy: 'skip' | 'overwrite' }, host?: DesktopRuntimeHostRef): Promise<
       | { ok: false; reason: 'canceled' | 'not_json' | 'malformed' | 'unsupported_version'; message?: string }
       | {
           ok: true;
           includedData: ConfigCategory[];
           result: {
-            connections?: { created: number; overwritten: number; skipped: number };
+            connections?: {
+              created: number;
+              overwritten: number;
+              skipped: number;
+            };
             settings?: { applied: boolean };
             credentials?: { applied: number; skipped: number };
             memory?: { applied: boolean };
           };
         }
     > {
-      return ipcRenderer.invoke('config:import', input);
+      return invokeSelectedRuntimeHost(host, 'config:import', input);
     },
   },
   app: {
-    info(): Promise<{
-      appVersion: string;
-      electronVersion: string;
-      nodeVersion: string;
-      chromeVersion: string;
-      platform: string;
-      arch: string;
-      osRelease: string;
-      workspacePath: string;
-      projectId?: string | null;
-      projectPath: string;
-      projectGit: { isGitRepo: boolean; branch?: string };
-      buildMode: 'dev' | 'packaged';
-      buildCommit: string | null;
-    }> {
-      return ipcRenderer.invoke('app:info');
+    info(host?: DesktopRuntimeHostRef): Promise<DesktopAppInfo> {
+      return invokeSelectedRuntimeHost(host, 'app:info');
+    },
+    iconPreviews(): Promise<ReadonlyArray<{ id: AppIconChoice; dataUrl: string; removable?: boolean }>> {
+      return ipcRenderer.invoke('app:iconPreviews');
+    },
+    selectIcon(icon: AppIconChoice, target?: AppIconTarget): Promise<AppIconSelectResult> {
+      return ipcRenderer.invoke('app:selectIcon', icon, target);
+    },
+    importIcon(): Promise<AppIconImportResult> {
+      return ipcRenderer.invoke('app:importIcon');
+    },
+    removeIcon(icon: AppIconChoice): Promise<AppIconRemoveResult> {
+      return ipcRenderer.invoke('app:removeIcon', icon);
     },
     subscribeUpdateStatus(handler: (status: AppUpdateStatus) => void): () => void {
       const listener = (_event: Electron.IpcRendererEvent, status: AppUpdateStatus) => handler(status);
@@ -1024,6 +3609,9 @@ const makaBridge = {
     },
     updateStatus(): Promise<AppUpdateStatus> {
       return ipcRenderer.invoke('app:updateStatus');
+    },
+    checkForUpdates(): Promise<AppUpdateStatus> {
+      return ipcRenderer.invoke('app:checkForUpdates');
     },
     retryUpdateDownload(): Promise<AppUpdateStatus> {
       return ipcRenderer.invoke('app:retryUpdateDownload');
@@ -1035,11 +3623,12 @@ const makaBridge = {
       projectPath: string;
       projectGit: { isGitRepo: boolean; branch?: string };
     }> {
-      return ipcRenderer.invoke('app:sessionProjectInfo', sessionId);
+      return invokeSessionRuntimeHost('app:sessionProjectInfo', sessionId);
     },
     openPath(
       key: 'workspace' | 'skills' | 'memory' | 'project',
       sessionId?: string,
+      host?: DesktopRuntimeHostRef,
     ): Promise<
       | { ok: true; opened: string }
       | {
@@ -1047,13 +3636,16 @@ const makaBridge = {
           reason: 'unknown-key' | 'not-allowed' | 'missing' | 'not-a-directory' | 'open-failed';
         }
     > {
-      return ipcRenderer.invoke('app:openPath', key, sessionId);
+      if (!sessionId) return invokeSelectedRuntimeHost(host, 'app:openPath', key, undefined);
+      return runtimeHostSessionRef(sessionId).then((session) =>
+        ipcRenderer.invoke('app:openPath', session.scope, key, session.sessionId),
+      );
     },
-    resolveProjectGitInfo(projectPath: string): Promise<
+    resolveProjectGitInfo(projectPath: string, host?: DesktopRuntimeHostRef): Promise<
       | { ok: true; projectPath: string; projectGit: { isGitRepo: boolean; branch?: string } }
       | { ok: false; reason: 'invalid-path' | 'not-found' }
     > {
-      return ipcRenderer.invoke('app:resolveProjectGitInfo', projectPath);
+      return invokeSelectedRuntimeHost(host, 'app:resolveProjectGitInfo', projectPath);
     },
     openArtifactPath(
       sessionId: string,
@@ -1065,10 +3657,73 @@ const makaBridge = {
           reason: 'unknown-key' | 'not-allowed' | 'missing' | 'not-a-directory' | 'open-failed';
         }
     > {
-      return ipcRenderer.invoke('app:openArtifactPath', sessionId, artifactId);
+      return invokeSessionRuntimeHost('app:openArtifactPath', sessionId, artifactId);
     },
     saveArtifactAs(sessionId: string, artifactId: string): Promise<ArtifactSaveResult> {
-      return ipcRenderer.invoke('app:saveArtifactAs', sessionId, artifactId);
+      return invokeSessionRuntimeHost('app:saveArtifactAs', sessionId, artifactId);
+    },
+  },
+  diagnostics: {
+    takePreviousMainProcessInterruption(): Promise<boolean> {
+      previousMainProcessInterruptionRead ??= ipcRenderer.invoke(
+        'diagnostics:takePreviousMainProcessInterruption',
+      ) as Promise<boolean>;
+      return previousMainProcessInterruptionRead;
+    },
+    copyPreviousMainProcessInterruption(): Promise<void> {
+      return ipcRenderer.invoke('diagnostics:copyPreviousMainProcessInterruption');
+    },
+    async copyReport(input: DesktopDiagnosticInput): Promise<void> {
+      const rendererContext = {
+        rendererUserAgent: navigator.userAgent,
+        rendererLocale: navigator.language,
+      };
+      if (input.surface === 'manual') {
+        const { target, ...manualInput } = input;
+        const resolution = await resolveManualDiagnosticRuntimeHost(target);
+        const wireInput: DesktopManualDiagnosticWireInput = {
+          ...manualInput,
+          hostTarget: resolution.hostTarget,
+          ...rendererContext,
+        };
+        await ipcRenderer.invoke(
+          'diagnostics:copyReport',
+          resolution.scope,
+          wireInput,
+        );
+        return;
+      }
+      if (input.surface === 'renderer_crash') {
+        const wireInput: DesktopErrorDiagnosticWireInput = {
+          surface: 'renderer_crash',
+          title: input.title,
+          ...(input.description ? { description: input.description } : {}),
+          ...(input.details ? { details: input.details } : {}),
+          hostTarget: 'none',
+          ...rendererContext,
+        };
+        await ipcRenderer.invoke('diagnostics:copyReport', undefined, wireInput);
+        return;
+      }
+      const { target, ...errorInput } = input;
+      const parsedTarget = target ? parseDiagnosticTarget(target) : undefined;
+      if (!parsedTarget) {
+        const wireInput: DesktopErrorDiagnosticWireInput = {
+          ...errorInput,
+          hostTarget: 'none',
+          ...rendererContext,
+        };
+        await ipcRenderer.invoke('diagnostics:copyReport', undefined, wireInput);
+        return;
+      }
+      const resolution = await resolveTaskDiagnosticRuntimeHost(parsedTarget.selector);
+      const wireInput: DesktopErrorDiagnosticWireInput = {
+        ...errorInput,
+        hostTarget: 'task',
+        ...rendererContext,
+        ...(parsedTarget.execution ? { execution: parsedTarget.execution } : {}),
+      };
+      await ipcRenderer.invoke('diagnostics:copyReport', resolution.scope, wireInput);
     },
   },
   workspace: {
@@ -1080,39 +3735,43 @@ const makaBridge = {
       | { ok: true; files: Array<{ relativePath: string }> }
       | { ok: false; reason: 'no_project' | 'search_failed' }
     > {
-      return ipcRenderer.invoke('workspace:searchFiles', { query, ...options });
+      return options?.sessionId
+        ? invokeSessionInput('workspace:searchFiles', { query, ...options } as {
+            query: string;
+            sessionId: string;
+            limit?: number;
+          })
+        : invokeActiveRuntimeHost('workspace:searchFiles', { query, ...options });
     },
   },
   e2eFixture: {
-    getState(): Promise<E2eFixtureState | null> {
-      return ipcRenderer.invoke('e2eFixture:getState');
+    async getState(): Promise<E2eFixtureState | null> {
+      const state = await ipcRenderer.invoke('e2eFixture:getState') as E2eFixtureState | null;
+      if (!state?.activeSessionId) return state;
+      const scope = await activeRuntimeHostRef();
+      return {
+        ...state,
+        activeSessionId: recordRuntimeHostSessionScope(scope, state.activeSessionId),
+      };
     },
   },
   artifacts: {
-    list(sessionId: string, opts?: { includeDeleted?: boolean }): Promise<ArtifactDescriptor[]> {
-      return ipcRenderer.invoke('artifacts:list', sessionId, opts);
-    },
-    get(sessionId: string, artifactId: string): Promise<ArtifactDescriptor | null> {
-      return ipcRenderer.invoke('artifacts:get', sessionId, artifactId);
+    list(sessionId: string): Promise<ArtifactDescriptor[]> {
+      return invokeProjectedSessionRuntimeHost('artifacts:list', sessionId);
     },
     readText(sessionId: string, artifactId: string): Promise<ArtifactTextReadResult> {
-      return ipcRenderer.invoke('artifacts:readText', sessionId, artifactId);
+      return invokeSessionRuntimeHost('artifacts:readText', sessionId, artifactId);
     },
     readBinary(sessionId: string, artifactId: string): Promise<ArtifactBinaryReadResult> {
-      return ipcRenderer.invoke('artifacts:readBinary', sessionId, artifactId);
+      return invokeSessionRuntimeHost('artifacts:readBinary', sessionId, artifactId);
     },
     delete(sessionId: string, artifactId: string): Promise<void> {
-      return ipcRenderer.invoke('artifacts:delete', sessionId, artifactId);
-    },
-    subscribeChanges(handler: (event: ArtifactChangedEvent) => void): () => void {
-      const listener = (_event: Electron.IpcRendererEvent, payload: ArtifactChangedEvent) => handler(payload);
-      ipcRenderer.on('artifacts:changed', listener);
-      return () => ipcRenderer.off('artifacts:changed', listener);
+      return invokeSessionRuntimeHost('artifacts:delete', sessionId, artifactId);
     },
   },
   skills: {
-    list(): Promise<SkillEntry[]> {
-      return ipcRenderer.invoke('skills:list');
+    list(host?: DesktopRuntimeHostRef): Promise<SkillEntry[]> {
+      return invokeSelectedRuntimeHost(host, 'skills:list');
     },
     listInvocable(
       sessionId?: string,
@@ -1121,84 +3780,77 @@ const makaBridge = {
         model?: string;
         collaborationMode?: 'agent' | 'plan';
       },
-    ): Promise<import('@maka/runtime').InvocableSkillEntry[]> {
-      return ipcRenderer.invoke('skills:listInvocable', sessionId, newSessionContext);
+    ): Promise<import('@maka/runtime/skill-invocation').InvocableSkillEntry[]> {
+      return sessionId
+        ? invokeSessionRuntimeHost('skills:listInvocable', sessionId, newSessionContext)
+        : invokeActiveRuntimeHost('skills:listInvocable', undefined, newSessionContext);
     },
     catalog: {
-      list(): Promise<BundledSkillCatalogEntry[]> {
-        return ipcRenderer.invoke('skills:catalog:list');
+      list(host?: DesktopRuntimeHostRef): Promise<BundledSkillCatalogEntry[]> {
+        return invokeSelectedRuntimeHost(host, 'skills:catalog:list');
       },
-      install(id: string): Promise<
+      install(id: string, host?: DesktopRuntimeHostRef): Promise<
         | { ok: true; skill: SkillEntry }
         | { ok: false; reason: 'not_found' | 'already_exists' | 'blocked_path' | 'write_failed' }
       > {
-        return ipcRenderer.invoke('skills:catalog:install', id);
+        return invokeSelectedRuntimeHost(host, 'skills:catalog:install', id);
       },
     },
     sources: {
-      list(): Promise<ManagedSkillSourceEntry[]> {
-        return ipcRenderer.invoke('skills:sources:list');
+      list(host?: DesktopRuntimeHostRef): Promise<ManagedSkillSourceEntry[]> {
+        return invokeSelectedRuntimeHost(host, 'skills:sources:list');
       },
-      importLocalFile(): Promise<
+      importLocalFile(host?: DesktopRuntimeHostRef): Promise<
         | { ok: true; source: ManagedSkillSourceEntry }
         | { ok: false; reason: 'cancelled' | 'invalid_skill' | 'already_exists' | 'blocked_path' | 'write_failed' }
       > {
-        return ipcRenderer.invoke('skills:sources:importLocalFile');
+        return invokeSelectedRuntimeHost(host, 'skills:sources:importLocalFile');
       },
     },
-    installManaged(sourceId: string): Promise<
+    installManaged(sourceId: string, host?: DesktopRuntimeHostRef): Promise<
       | { ok: true; skill: SkillEntry }
       | { ok: false; reason: 'not_found' | 'already_exists' | 'blocked_path' | 'write_failed' }
     > {
-      return ipcRenderer.invoke('skills:installManaged', sourceId);
+      return invokeSelectedRuntimeHost(host, 'skills:installManaged', sourceId);
     },
-    details(skillId: string): Promise<
-      | { ok: true; details: SkillGovernanceDetails }
-      | { ok: false; reason: 'not_found' | 'invalid_id' }
-    > {
-      return ipcRenderer.invoke('skills:details', skillId);
-    },
-    previewUpdate(skillId: string): Promise<
+    previewUpdate(skillId: string, host?: DesktopRuntimeHostRef): Promise<
       | { ok: true; preview: ManagedSkillUpdatePreview }
       | { ok: false; reason: 'not_managed' | 'source_missing' | 'metadata_error' | 'blocked_path' | 'read_failed' }
     > {
-      return ipcRenderer.invoke('skills:previewUpdate', skillId);
+      return invokeSelectedRuntimeHost(host, 'skills:previewUpdate', skillId);
     },
-    updateManaged(skillId: string, options?: { force?: boolean; expectedCurrentSha256?: string; expectedSourceSha256?: string }): Promise<
+    updateManaged(skillId: string, options?: { force?: boolean; expectedCurrentSha256?: string; expectedSourceSha256?: string }, host?: DesktopRuntimeHostRef): Promise<
       | { ok: true; skill: SkillEntry }
       | { ok: false; reason: 'not_managed' | 'source_missing' | 'local_modified' | 'metadata_error' | 'blocked_path' | 'write_failed' }
     > {
-      return ipcRenderer.invoke('skills:updateManaged', skillId, options);
+      return invokeSelectedRuntimeHost(host, 'skills:updateManaged', skillId, options);
     },
-    setEnabled(skillId: string, enabled: boolean): Promise<
+    setEnabled(skillId: string, enabled: boolean, host?: DesktopRuntimeHostRef): Promise<
       | { ok: true; skill: SkillEntry }
       | { ok: false; reason: 'not_found' | 'blocked_path' | 'state_error' | 'write_failed' }
     > {
-      return ipcRenderer.invoke('skills:setEnabled', skillId, enabled);
+      return invokeSelectedRuntimeHost(host, 'skills:setEnabled', skillId, enabled);
     },
-    setPinned(skillRef: string, pinned: boolean): Promise<
+    setPinned(skillRef: string, pinned: boolean, host?: DesktopRuntimeHostRef): Promise<
       | { ok: true; skill: SkillEntry }
-      | { ok: false; reason: 'not_found' | 'blocked_path' | 'state_error' | 'write_failed' }
+      | {
+          ok: false;
+          reason: 'not_found' | 'blocked_path' | 'state_error' | 'write_failed';
+        }
     > {
-      return ipcRenderer.invoke('skills:setPinned', skillRef, pinned);
+      return invokeSelectedRuntimeHost(host, 'skills:setPinned', skillRef, pinned);
     },
-    createStarter(): Promise<
-      | { ok: true; created: boolean; skill: SkillEntry; filePath: string }
-      | { ok: false; reason: 'blocked_path' | 'already_exists' | 'write_failed' }
-    > {
-      return ipcRenderer.invoke('skills:createStarter');
-    },
-    delete(idOrRef: string): Promise<
+    delete(idOrRef: string, host?: DesktopRuntimeHostRef): Promise<
       | { ok: true }
       | { ok: false; reason: 'not_found' | 'blocked_path' | 'blocked_scope' | 'delete_failed' }
     > {
-      return ipcRenderer.invoke('skills:delete', idOrRef);
+      return invokeSelectedRuntimeHost(host, 'skills:delete', idOrRef);
     },
-    open(id: string, target: 'file' | 'directory' = 'file'): Promise<
+    open(id: string, target: 'file' | 'directory' = 'file', host?: DesktopRuntimeHostRef): Promise<
       | { ok: true; target: 'file' | 'directory' }
       | { ok: false; reason: 'invalid_id' | 'missing' | 'blocked_path' | 'not_file' | 'not_directory' | 'open_failed' }
     > {
-      return ipcRenderer.invoke('skills:open', id, target);
+      return invokeSelectedRuntimeHost(host, 'skills:open', id, target);
     },
   },
   // Embedded browser (P3). The native WebContentsView floats above the DOM; the
@@ -1207,45 +3859,180 @@ const makaBridge = {
   browser: {
     /** Tell main which conversation this window shows, so it can validate targets. */
     setActiveSession(sessionId: string | null): void {
-      ipcRenderer.send('browser:active-session', sessionId);
+      browserSelection.setActiveSession(sessionId);
     },
     /** Mirror the panel strip's on-screen rect (null hides the native view). */
     setViewport(input: { sessionId: string; rect: BrowserViewRect | null }): void {
-      ipcRenderer.send('browser:setViewport', input);
+      browserSelection.setViewport(input);
     },
     navigate(sessionId: string, url: string): Promise<void> {
-      return ipcRenderer.invoke('browser:navigate', sessionId, url);
+      return invokeSessionRuntimeHost('browser:navigate', sessionId, url);
     },
     back(sessionId: string): Promise<void> {
-      return ipcRenderer.invoke('browser:back', sessionId);
+      return invokeSessionRuntimeHost('browser:back', sessionId);
     },
     forward(sessionId: string): Promise<void> {
-      return ipcRenderer.invoke('browser:forward', sessionId);
+      return invokeSessionRuntimeHost('browser:forward', sessionId);
     },
     reload(sessionId: string): Promise<void> {
-      return ipcRenderer.invoke('browser:reload', sessionId);
+      return invokeSessionRuntimeHost('browser:reload', sessionId);
     },
     stop(sessionId: string): Promise<void> {
-      return ipcRenderer.invoke('browser:stop', sessionId);
+      return invokeSessionRuntimeHost('browser:stop', sessionId);
     },
     close(sessionId: string): Promise<void> {
-      return ipcRenderer.invoke('browser:close-page', sessionId);
+      return invokeSessionRuntimeHost('browser:close-page', sessionId);
     },
     getState(sessionId: string): Promise<BrowserState | null> {
-      return ipcRenderer.invoke('browser:get-state', sessionId);
+      return invokeSessionRuntimeHost('browser:get-state', sessionId);
     },
     onState(handler: (payload: { sessionId: string; state: BrowserState }) => void): () => void {
-      const listener = (_event: Electron.IpcRendererEvent, payload: { sessionId: string; state: BrowserState }) =>
-        handler(payload);
-      ipcRenderer.on('browser:state', listener);
-      return () => ipcRenderer.off('browser:state', listener);
+      return subscribeEveryRuntimeHostEvent(
+        'browser:state',
+        (scope, payload: { sessionId: string; state: BrowserState }) =>
+        handler({
+          ...payload,
+          sessionId: recordRuntimeHostSessionScope(scope, payload.sessionId),
+        }),
+      );
     },
     onLive(handler: (payload: { sessionIds: string[] }) => void): () => void {
-      const listener = (_event: Electron.IpcRendererEvent, payload: { sessionIds: string[] }) => handler(payload);
-      ipcRenderer.on('browser:live', listener);
-      return () => ipcRenderer.off('browser:live', listener);
+      return subscribeEveryRuntimeHostEvent(
+        'browser:live',
+        (scope, payload: { sessionIds: string[] }) =>
+        handler({
+          sessionIds: payload.sessionIds.map((sessionId) =>
+            recordRuntimeHostSessionScope(scope, sessionId),
+          ),
+        }),
+      );
     },
   },
 } satisfies MakaBridge;
+
+// E2E-only async controls. Real users never get these: the preload mirrors the
+// main process's isolated-E2E gate (startup-context.ts) — MAKA_E2E alone is
+// not enough without the throwaway profile dir. An armed latch holds the next
+// bridge call until the test releases
+// it, while a settled-call waiter exposes a deterministic completion boundary
+// for work whose visible result may intentionally keep the same DOM identity.
+// The wrappers must be installed BEFORE
+// exposeInMainWorld: the bridge is cloned into the main world at expose time,
+// and the exposed clone is sealed against later patching.
+if (process.env.MAKA_E2E === '1' && process.env.MAKA_E2E_USER_DATA_DIR) {
+  type LatchKey = 'newTasks.listInvocableSkills' | 'sessions.list' | 'sessions.observe';
+  const gates = new Map<LatchKey, { promise: Promise<void>; oneShot: boolean }>();
+  const releases = new Map<LatchKey, { resolve: () => void; reject: (error: Error) => void }>();
+  let nextSessionObservationError: Error | undefined;
+  let nextTranscriptOpenError: Error | undefined;
+  const invocableSkillsWaiters = new Map<string, Array<() => void>>();
+  const waitForLatch = async (key: LatchKey): Promise<void> => {
+    const gate = gates.get(key);
+    if (!gate) return;
+    if (gate.oneShot) gates.delete(key);
+    await gate.promise;
+  };
+  const wrapLatched = <Args extends unknown[], Result>(
+    call: (...args: Args) => Promise<Result>,
+    key: LatchKey,
+  ) => async (...args: Args): Promise<Result> => {
+    await waitForLatch(key);
+    return call(...args);
+  };
+  makaBridge.newTasks.listInvocableSkills = wrapLatched(
+    makaBridge.newTasks.listInvocableSkills.bind(makaBridge.newTasks),
+    'newTasks.listInvocableSkills',
+  );
+  makaBridge.sessions.list = wrapLatched(
+    makaBridge.sessions.list.bind(makaBridge.sessions),
+    'sessions.list',
+  );
+  const subscribeSessionEvents = makaBridge.sessions.subscribeEvents.bind(makaBridge.sessions);
+  makaBridge.sessions.subscribeEvents = (
+    sessionId,
+    handler,
+    onObservationSeed,
+    onSeedError,
+    onExecution,
+  ) => {
+    const nextError = nextSessionObservationError;
+    nextSessionObservationError = undefined;
+    let disposed = false;
+    if (!nextError) {
+      let unsubscribe = () => {};
+      void waitForLatch('sessions.observe').then(() => {
+        if (!disposed) unsubscribe = subscribeSessionEvents(
+          sessionId, handler, onObservationSeed, onSeedError, onExecution,
+        );
+      });
+      return () => { disposed = true; unsubscribe(); };
+    }
+    void Promise.resolve().then(() => {
+      if (!disposed) onSeedError?.(nextError);
+    });
+    return () => {
+      disposed = true;
+    };
+  };
+  const openTranscript = makaBridge.transcripts.open.bind(makaBridge.transcripts);
+  makaBridge.transcripts.open = (...args) => {
+    const nextError = nextTranscriptOpenError;
+    nextTranscriptOpenError = undefined;
+    return nextError ? Promise.reject(nextError) : openTranscript(...args);
+  };
+  const listInvocableSkills = makaBridge.skills.listInvocable.bind(makaBridge.skills);
+  makaBridge.skills.listInvocable = async (...args) => {
+    try {
+      return await listInvocableSkills(...args);
+    } finally {
+      const sessionId = args[0];
+      if (sessionId) {
+        const waiters = invocableSkillsWaiters.get(sessionId);
+        const resolve = waiters?.shift();
+        if (waiters?.length === 0) invocableSkillsWaiters.delete(sessionId);
+        if (resolve) {
+          // Let consumers of the bridge promise run their state updates before
+          // the test continues from the observed completion.
+          setTimeout(resolve, 0);
+        }
+      }
+    }
+  };
+  contextBridge.exposeInMainWorld('makaE2eLatch', {
+    arm(key: LatchKey, options?: { oneShot?: boolean }) {
+      let resolve: () => void = () => {};
+      let reject: (error: Error) => void = () => {};
+      const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+      });
+      gates.set(key, { promise, oneShot: options?.oneShot === true });
+      releases.set(key, { resolve, reject });
+    },
+    waitForInvocableSkillsCall(sessionId: string) {
+      return new Promise<void>((resolve) => {
+        const waiters = invocableSkillsWaiters.get(sessionId) ?? [];
+        waiters.push(resolve);
+        invocableSkillsWaiters.set(sessionId, waiters);
+      });
+    },
+    rejectNextSessionObservation(message: string) {
+      nextSessionObservationError = new Error(message);
+    },
+    rejectNextTranscriptOpen(message: string) {
+      nextTranscriptOpenError = new Error(message);
+    },
+    release(key: LatchKey) {
+      releases.get(key)?.resolve();
+      releases.delete(key);
+      gates.delete(key);
+    },
+    reject(key: LatchKey, message: string) {
+      releases.get(key)?.reject(new Error(message));
+      releases.delete(key);
+      gates.delete(key);
+    },
+  });
+}
 
 contextBridge.exposeInMainWorld('maka', makaBridge);

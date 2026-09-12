@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /**
  * PR-PERMISSION-PAGE-REDESIGN — actionable side of the Permission Center.
  *
@@ -10,7 +29,7 @@
  *     platforms the request resolves with a structured "unsupported"
  *     failure so the renderer can hide the button.
  *   - `requestPermissionAccess(id)` — when the OS exposes a real,
- *     result-bearing consent dialog (microphone) we ask directly;
+ *     result-bearing consent path (screen capture) we engage it;
  *     otherwise we deep-link to System Settings. Merely showing a
  *     notification is not treated as proof that notifications are allowed.
  *
@@ -20,8 +39,8 @@
  */
 
 import { desktopCapturer, shell, systemPreferences } from 'electron';
-import type { OsPermissionId } from '@maka/core';
-import { OS_PERMISSION_IDS } from '@maka/core';
+import type { OsPermissionId } from '@maka/core/capabilities';
+import { OS_PERMISSION_IDS } from '@maka/core/capabilities';
 import { planPermissionRequest, requestScreenCaptureConsent } from './os-permission-policy.js';
 
 export type PermissionActionResult =
@@ -48,7 +67,6 @@ export type PermissionActionResult =
 const MACOS_DEEP_LINKS: Record<OsPermissionId, string | null> = {
   accessibility: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
   screen_recording: 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
-  microphone: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone',
   automation: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Automation',
   notifications: 'x-apple.systempreferences:com.apple.preference.notifications',
 };
@@ -83,10 +101,6 @@ export async function requestPermissionAccess(input: unknown): Promise<Permissio
     const plan = planPermissionRequest({
       id,
       platform: process.platform,
-      microphoneStatus:
-        id === 'microphone' && process.platform === 'darwin'
-          ? systemPreferences.getMediaAccessStatus('microphone')
-          : undefined,
       screenStatus:
         id === 'screen_recording' && process.platform === 'darwin'
           ? systemPreferences.getMediaAccessStatus('screen')
@@ -117,12 +131,6 @@ export async function requestPermissionAccess(input: unknown): Promise<Permissio
       }
       case 'open_settings':
         return openSystemPermissionPane(id);
-      case 'request_microphone': {
-        const granted = await systemPreferences.askForMediaAccess('microphone');
-        return granted
-          ? { ok: true }
-          : { ok: false, reason: 'denied' };
-      }
     }
   } catch (err) {
     return { ok: false, reason: 'failed', message: errorMessage(err) };

@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /**
  * PR-BOT-DINGTALK-OPERATIONAL-0 (external bot research: DingTalk Stream):
  * full DingTalk (钉钉) bot lifecycle — access_token cache, Stream
@@ -10,6 +29,13 @@
  * inbound. No need to expose a public HTTP port — Maka can run as a
  * desktop app without a tunnel.
  *
+ * DingTalk's Stream protocol is NOT Discord/QQ-shaped (no opcodes,
+ * heartbeat, identify/resume — frames carry headers/messageId/topic
+ * and every delivery must be acked), so this class extends
+ * WsBridgeBase directly: only the WS transport lifecycle (connect,
+ * close policy, reconnect with backoff, stop) is shared with the
+ * gateway bridges.
+ *
  * Storage semantics (matches the credential-test PR):
  *   - `appId` = appKey (the self-built app's identifier)
  *   - `appSecret` = appsecret
@@ -17,22 +43,42 @@
  * from `appKey` (DingTalk's chatbot SDK uses appKey as robotCode).
  */
 
-import { WebSocket } from 'undici';
-import type { BotChannelSettings } from '@maka/core';
-import { BaseBotAdapter, botReadinessFromSettings } from './base-adapter.js';
 import { proxiedFetch } from './proxied-fetch.js';
-import type { BotPlatform, BotSendOptions, BotStatus, SendCapable } from './types.js';
+import type { BotSendOptions, SendCapable } from './types.js';
+import { WsBridgeBase, type WsCloseDecision } from './ws-bridge-base.js';
 
 const DINGTALK_API = 'https://api.dingtalk.com';
 const DINGTALK_OAPI = 'https://oapi.dingtalk.com';
 
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1_000; // refresh 5 min before expiry
-const RECONNECT_DELAY_MIN_MS = 1_000;
-const RECONNECT_DELAY_MAX_MS = 30_000;
 const SEND_RETRY_DELAY_MIN_MS = 1_000;
 const SEND_RETRY_DELAY_MAX_MS = 30_000;
 
 const DINGTALK_TOPIC_BOT_MESSAGES = '/v1.0/im/bot/messages/get';
+
+const DINGTALK_GROUP_SEND_PATH = '/v1.0/robot/groupMessages/send';
+const DINGTALK_SINGLE_SEND_PATH = '/v1.0/robot/oToMessages/batchSend';
+
+/**
+ * Route markers stamped onto `chatId` when a message is received, so the
+ * send side can pick an endpoint without re-deriving the conversation
+ * kind. Same approach as `qq-bridge.ts`, and for the same reason: the
+ * conversation kind is known exactly at receive time (DingTalk sends
+ * `conversationType`) and cannot be recovered later from the id alone.
+ *
+ * Guessing from DingTalk's own id shapes does not work — 1:1 and group
+ * `conversationId` values both begin with `cid`, so a prefix test sends
+ * every direct reply to the group endpoint.
+ */
+const DINGTALK_GROUP_CHAT_PREFIX = 'group:';
+const DINGTALK_SINGLE_CHAT_PREFIX = 'oto:';
+
+/**
+ * The discriminator this bridge used before chatIds carried a stamp.
+ * Retained only to route ids that predate stamping — see the unstamped
+ * branch of `pickDingTalkSendRoute`.
+ */
+const DINGTALK_LEGACY_GROUP_ID_PREFIX = 'cid';
 
 interface DingTalkConnectionOpenResponse {
   endpoint: string;
@@ -48,6 +94,12 @@ interface DingTalkStreamFrame {
 
 interface DingTalkBotMessagePayload {
   senderId?: string;
+  /**
+   * The org-scoped staff id of the sender. This is the only identifier
+   * `/v1.0/robot/oToMessages/batchSend` accepts in `userIds`: `senderId`
+   * (a `$:LWCP_v1:$…` handle) is rejected with `staffId.notExisted`.
+   */
+  senderStaffId?: string;
   senderNick?: string;
   conversationId?: string;
   conversationType?: '1' | '2'; // 1 = single chat, 2 = group
@@ -69,14 +121,6 @@ export function decideDingTalkClose(
 ): DingTalkCloseDecision {
   if (explicitlyStopped) return { kind: 'stopped' };
   return { kind: 'reconnect' };
-}
-
-/**
- * Pure helper: exponential backoff for stream reconnect.
- */
-export function dingTalkReconnectBackoffMs(attempts: number): number {
-  const exp = Math.min(2 ** attempts, RECONNECT_DELAY_MAX_MS / RECONNECT_DELAY_MIN_MS);
-  return Math.min(RECONNECT_DELAY_MIN_MS * exp, RECONNECT_DELAY_MAX_MS);
 }
 
 /**
@@ -113,6 +157,18 @@ export function buildDingTalkSingleSendBody(
   };
 }
 
+/**
+ * Pure helper: route a send to the right DingTalk REST endpoint based on
+ * the chatId prefix that `dingTalkPayloadToEvent` stamps.
+ *
+ * Unstamped ids are chatIds recorded before this bridge stamped a prefix
+ * — persisted scheduled-task delivery targets and ids typed by hand into
+ * the scheduled task form. They keep the pre-stamping discriminator, so
+ * both of its outcomes survive: a `cid…` conversation id still goes to
+ * the group endpoint, and a bare staff id still goes to the 1:1 endpoint,
+ * which is where it was delivering successfully. That guess was only ever
+ * wrong for a 1:1 *conversation* id, and the stamped path now covers it.
+ */
 export function pickDingTalkSendRoute(
   chatId: string,
   robotCode: string,
@@ -123,13 +179,31 @@ export function pickDingTalkSendRoute(
 } | null {
   const targetId = chatId.trim();
   if (!targetId) return null;
-  const isGroup = targetId.startsWith('cid');
-  return {
-    path: isGroup ? '/v1.0/robot/groupMessages/send' : '/v1.0/robot/oToMessages/batchSend',
-    body: isGroup
-      ? buildDingTalkGroupSendBody(targetId, robotCode, text)
-      : buildDingTalkSingleSendBody(targetId, robotCode, text),
-  };
+  if (targetId.startsWith(DINGTALK_SINGLE_CHAT_PREFIX)) {
+    const staffId = targetId.slice(DINGTALK_SINGLE_CHAT_PREFIX.length).trim();
+    if (!staffId) return null;
+    return {
+      path: DINGTALK_SINGLE_SEND_PATH,
+      body: buildDingTalkSingleSendBody(staffId, robotCode, text),
+    };
+  }
+  if (targetId.startsWith(DINGTALK_GROUP_CHAT_PREFIX)) {
+    const openConversationId = targetId.slice(DINGTALK_GROUP_CHAT_PREFIX.length).trim();
+    if (!openConversationId) return null;
+    return {
+      path: DINGTALK_GROUP_SEND_PATH,
+      body: buildDingTalkGroupSendBody(openConversationId, robotCode, text),
+    };
+  }
+  return targetId.startsWith(DINGTALK_LEGACY_GROUP_ID_PREFIX)
+    ? {
+        path: DINGTALK_GROUP_SEND_PATH,
+        body: buildDingTalkGroupSendBody(targetId, robotCode, text),
+      }
+    : {
+        path: DINGTALK_SINGLE_SEND_PATH,
+        body: buildDingTalkSingleSendBody(targetId, robotCode, text),
+      };
 }
 
 /**
@@ -196,21 +270,38 @@ export function dingTalkPayloadToEvent(
   if (!payload || typeof payload !== 'object') return null;
   const content = payload.text?.content;
   if (typeof content !== 'string' || content.length === 0) return null;
-  const chatId = payload.conversationId;
+  const conversationId = payload.conversationId;
   const userId = payload.senderId;
-  if (typeof chatId !== 'string' || chatId.length === 0) return null;
+  if (typeof conversationId !== 'string' || conversationId.length === 0) return null;
   if (typeof userId !== 'string' || userId.length === 0) return null;
+  const isGroup = payload.conversationType === '2';
+  const staffId = typeof payload.senderStaffId === 'string' ? payload.senderStaffId.trim() : '';
+  // Stamp the route while the conversation kind is still known. A 1:1
+  // reply must address the sender's staff id, not the conversation, so
+  // that is what the chatId carries.
+  //
+  // When the payload omits `senderStaffId` there is nothing a 1:1 reply
+  // can be addressed to. Fall back to the bare conversationId so the
+  // message still reaches the agent under a stable per-conversation key,
+  // but a reply to it will take the unstamped `cid…` branch and fail at
+  // the group endpoint — the same dead end as before this change, not a
+  // working path.
+  const chatId = isGroup
+    ? `${DINGTALK_GROUP_CHAT_PREFIX}${conversationId}`
+    : staffId
+      ? `${DINGTALK_SINGLE_CHAT_PREFIX}${staffId}`
+      : conversationId;
   return {
     platform: 'dingtalk',
     userId,
     userName: payload.senderNick ?? userId,
     chatId,
-    isGroup: payload.conversationType === '2',
+    isGroup,
     text: content,
     // DingTalk Stream callbacks do not carry the original message id;
     // use a synthetic key so downstream contracts that key off
     // `sourceMessageId` still get a unique value.
-    sourceMessageId: `${chatId}:${receivedAt}`,
+    sourceMessageId: `${conversationId}:${receivedAt}`,
     receivedAt,
   };
 }
@@ -243,59 +334,128 @@ interface CachedToken {
   expiresAt: number;
 }
 
-export class DingTalkBotBridge extends BaseBotAdapter implements SendCapable {
-  private ws: WebSocket | null = null;
+export class DingTalkBotBridge extends WsBridgeBase implements SendCapable {
   private token: CachedToken | null = null;
-  private explicitlyStopped = false;
-  private reconnectAttempts = 0;
-  private reconnectTimer: NodeJS.Timeout | null = null;
 
-  constructor(platform: BotPlatform, settings: BotChannelSettings) {
-    super(platform, settings);
+  protected override readonly closeReasonPrefix = 'stream';
+
+  protected override checkCredentials(): 'dingtalk_credentials_missing' | null {
+    return this.settings.appId?.trim() && this.settings.appSecret?.trim()
+      ? null
+      : 'dingtalk_credentials_missing';
   }
 
-  async start(): Promise<void> {
-    if (this.running) return;
-    if (!this.settings.enabled) {
-      this.reason = 'disabled';
-      this.readiness = 'scaffolded';
-      return;
-    }
-    if (!this.settings.appId?.trim() || !this.settings.appSecret?.trim()) {
-      this.reason = 'no-credentials';
-      this.readiness = 'scaffolded';
-      return;
-    }
-    this.explicitlyStopped = false;
-    await this.startStream();
+  protected override decideClose(code: number, explicitlyStopped: boolean): WsCloseDecision {
+    const decision = decideDingTalkClose(code, explicitlyStopped);
+    return decision.kind === 'stopped' ? decision : { kind: 'reconnect', resumable: true };
   }
 
-  async stop(): Promise<void> {
-    this.explicitlyStopped = true;
-    this.running = false;
-    this.clearReconnect();
-    if (this.ws) {
-      try {
-        this.ws.close(1000);
-      } catch {
-        /* swallow */
-      }
-      this.ws = null;
-    }
-    this.reason = 'stopped';
-    this.readiness = botReadinessFromSettings(this.settings);
+  protected override onWsOpen(): void {
+    super.onWsOpen();
+    // DingTalk's Stream has no READY dispatch — connections/open
+    // accepting the subscription IS the operational signal.
+    this.readiness = 'operational';
+    this.reason = undefined;
+    this.reconnectAttempts = 0;
     this.emitStatusChange();
   }
 
+  protected override async openConnection(): Promise<void> {
+    const token = await this.refreshTokenIfNeeded();
+    if (!token) {
+      this.readiness = 'configured';
+      this.emitStatusChange();
+      this.scheduleReconnect();
+      return;
+    }
+    try {
+      const response = await proxiedFetch(`${DINGTALK_API}/v1.0/gateway/connections/open`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-acs-dingtalk-access-token': token,
+        },
+        body: JSON.stringify({
+          clientId: this.settings.appId?.trim(),
+          clientSecret: this.settings.appSecret?.trim(),
+          subscriptions: [
+            { type: 'EVENT', topic: '*' },
+            { type: 'CALLBACK', topic: DINGTALK_TOPIC_BOT_MESSAGES },
+          ],
+          ua: 'Maka/0.1',
+          localIp: '127.0.0.1',
+        }),
+        timeoutMs: 10_000,
+      });
+      const json = (await response
+        .json()
+        .catch(() => null)) as DingTalkConnectionOpenResponse | null;
+      if (
+        !response.ok ||
+        !json ||
+        typeof json.endpoint !== 'string' ||
+        typeof json.ticket !== 'string'
+      ) {
+        this.reason = `connections-open-${response.status}`;
+        this.readiness = 'configured';
+        this.emitStatusChange();
+        this.scheduleReconnect();
+        return;
+      }
+      this.connect(`${json.endpoint}?ticket=${encodeURIComponent(json.ticket)}`);
+    } catch (error) {
+      this.recordFailure(error);
+      this.readiness = 'configured';
+      this.emitStatusChange();
+      this.scheduleReconnect();
+    }
+  }
+
+  protected override handleWsMessage(raw: string): void {
+    let frame: DingTalkStreamFrame;
+    try {
+      frame = JSON.parse(raw) as DingTalkStreamFrame;
+    } catch {
+      return;
+    }
+    const messageId = frame.headers?.messageId;
+    if (!messageId) return;
+    if (frame.type === 'CALLBACK' && frame.headers?.topic === DINGTALK_TOPIC_BOT_MESSAGES) {
+      let payload: DingTalkBotMessagePayload | null = null;
+      try {
+        payload =
+          typeof frame.data === 'string'
+            ? (JSON.parse(frame.data) as DingTalkBotMessagePayload)
+            : null;
+      } catch {
+        payload = null;
+      }
+      if (payload) {
+        const event = dingTalkPayloadToEvent(payload, Date.now());
+        if (event) {
+          this.lastEventAt = event.receivedAt;
+          this.emitIncomingMessage(event);
+          this.emitStatusChange();
+        }
+      }
+      this.sendAck(messageId);
+      return;
+    }
+    // System / unrelated event types — still ack so the gateway does
+    // not redeliver, but do not emit a message event.
+    this.sendAck(messageId);
+  }
+
+  private sendAck(messageId: string): void {
+    this.sendWs(buildDingTalkAckFrame(messageId));
+  }
+
   /**
-   * DingTalk REST send. We treat any chatId with a `cidp` prefix as a
-   * group conversation; pure-numeric or other prefixes route to the
-   * single-user batch API. The caller (main.ts) already knows whether
-   * the bot conversation is a group via the BotMessageEvent.isGroup
-   * flag, but the bridge's `sendMessage` only sees the chatId — so we
-   * make a conservative split based on the `conversationType` hint
-   * baked into the chatId structure: group conversation IDs start with
-   * `cid` per DingTalk's open platform docs.
+   * DingTalk REST send. `sendMessage` only sees the chatId, so the
+   * conversation kind travels inside it: `dingTalkPayloadToEvent`
+   * stamps `group:` or `oto:` at receive time, where DingTalk's
+   * `conversationType` is still available, and
+   * `pickDingTalkSendRoute` decodes it here.
    */
   async sendMessage(
     chatId: string,
@@ -316,7 +476,10 @@ export class DingTalkBotBridge extends BaseBotAdapter implements SendCapable {
     }
     if (classification.kind !== 'ok') {
       this.readiness = this.readiness === 'operational' ? 'degraded' : 'credentials_valid';
-      this.reason = classification.kind === 'retry' ? 'rate-limited' : classification.description;
+      this.recordFailure(
+        classification.kind === 'retry' ? 'rate-limited' : classification.description,
+        classification.kind === 'retry' ? 'rate-limited' : 'send-failed',
+      );
       this.emitStatusChange();
       return null;
     }
@@ -325,10 +488,6 @@ export class DingTalkBotBridge extends BaseBotAdapter implements SendCapable {
     this.lastEventAt = Date.now();
     this.emitStatusChange();
     return classification.messageId;
-  }
-
-  protected override connectionKind(): BotStatus['connection'] {
-    return 'gateway';
   }
 
   private async performSend(
@@ -375,7 +534,7 @@ export class DingTalkBotBridge extends BaseBotAdapter implements SendCapable {
         errmsg?: string;
       } | null;
       if (!json || (json.errcode !== undefined && json.errcode !== 0)) {
-        this.reason = json?.errmsg ?? 'gettoken failed';
+        this.recordFailure(json?.errmsg ?? 'gettoken failed', 'dingtalk_no_access_token');
         return null;
       }
       if (typeof json.access_token !== 'string') return null;
@@ -386,172 +545,14 @@ export class DingTalkBotBridge extends BaseBotAdapter implements SendCapable {
       };
       return this.token.value;
     } catch (error) {
-      this.reason = error instanceof Error ? error.message : String(error);
+      this.recordFailure(error);
       return null;
     }
-  }
-
-  private async startStream(): Promise<void> {
-    const token = await this.refreshTokenIfNeeded();
-    if (!token) {
-      this.readiness = 'configured';
-      this.emitStatusChange();
-      this.scheduleReconnect();
-      return;
-    }
-    try {
-      const response = await proxiedFetch(`${DINGTALK_API}/v1.0/gateway/connections/open`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-acs-dingtalk-access-token': token,
-        },
-        body: JSON.stringify({
-          clientId: this.settings.appId?.trim(),
-          clientSecret: this.settings.appSecret?.trim(),
-          subscriptions: [
-            { type: 'EVENT', topic: '*' },
-            { type: 'CALLBACK', topic: DINGTALK_TOPIC_BOT_MESSAGES },
-          ],
-          ua: 'Maka/0.1',
-          localIp: '127.0.0.1',
-        }),
-        timeoutMs: 10_000,
-      });
-      const json = (await response
-        .json()
-        .catch(() => null)) as DingTalkConnectionOpenResponse | null;
-      if (
-        !response.ok ||
-        !json ||
-        typeof json.endpoint !== 'string' ||
-        typeof json.ticket !== 'string'
-      ) {
-        this.reason = `connections-open-${response.status}`;
-        this.readiness = 'configured';
-        this.emitStatusChange();
-        this.scheduleReconnect();
-        return;
-      }
-      this.connect(`${json.endpoint}?ticket=${encodeURIComponent(json.ticket)}`);
-    } catch (error) {
-      this.reason = error instanceof Error ? error.message : String(error);
-      this.readiness = 'configured';
-      this.emitStatusChange();
-      this.scheduleReconnect();
-    }
-  }
-
-  private connect(url: string): void {
-    let ws: WebSocket;
-    try {
-      ws = new WebSocket(url);
-    } catch (error) {
-      this.reason = error instanceof Error ? error.message : String(error);
-      this.readiness = 'configured';
-      this.emitStatusChange();
-      this.scheduleReconnect();
-      return;
-    }
-    this.ws = ws;
-    ws.addEventListener('open', () => {
-      this.running = true;
-      this.startedAt = Date.now();
-      this.readiness = 'operational';
-      this.reason = undefined;
-      this.reconnectAttempts = 0;
-      this.emitStatusChange();
-    });
-    ws.addEventListener('message', (event: { data: unknown }) => {
-      const data = event.data;
-      this.handlePayload(typeof data === 'string' ? data : String(data));
-    });
-    ws.addEventListener('close', (event: { code: number; reason: string }) => {
-      this.handleClose(event.code, event.reason);
-    });
-    ws.addEventListener('error', () => {
-      // The close event fires immediately after; no separate handling.
-    });
-  }
-
-  private handlePayload(raw: string): void {
-    let frame: DingTalkStreamFrame;
-    try {
-      frame = JSON.parse(raw) as DingTalkStreamFrame;
-    } catch {
-      return;
-    }
-    const messageId = frame.headers?.messageId;
-    if (!messageId) return;
-    if (frame.type === 'CALLBACK' && frame.headers?.topic === DINGTALK_TOPIC_BOT_MESSAGES) {
-      let payload: DingTalkBotMessagePayload | null = null;
-      try {
-        payload =
-          typeof frame.data === 'string'
-            ? (JSON.parse(frame.data) as DingTalkBotMessagePayload)
-            : null;
-      } catch {
-        payload = null;
-      }
-      if (payload) {
-        const event = dingTalkPayloadToEvent(payload, Date.now());
-        if (event) {
-          this.lastEventAt = event.receivedAt;
-          this.emitIncomingMessage(event);
-          this.emitStatusChange();
-        }
-      }
-      this.sendAck(messageId);
-      return;
-    }
-    // System / unrelated event types — still ack so the gateway does
-    // not redeliver, but do not emit a message event.
-    this.sendAck(messageId);
-  }
-
-  private sendAck(messageId: string): void {
-    if (!this.ws || this.ws.readyState !== 1) return;
-    try {
-      this.ws.send(JSON.stringify(buildDingTalkAckFrame(messageId)));
-    } catch {
-      // Swallow — close handler will fire if the socket died.
-    }
-  }
-
-  private clearReconnect(): void {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-  }
-
-  private handleClose(code: number, reason: string): void {
-    this.ws = null;
-    this.running = false;
-    const decision = decideDingTalkClose(code, this.explicitlyStopped);
-    if (decision.kind === 'stopped') return;
-    this.readiness = 'degraded';
-    this.reason = reason || `stream-closed-${code}`;
-    this.emitStatusChange();
-    this.scheduleReconnect();
-  }
-
-  private scheduleReconnect(): void {
-    if (this.explicitlyStopped) return;
-    this.clearReconnect();
-    const delay = dingTalkReconnectBackoffMs(this.reconnectAttempts);
-    this.reconnectAttempts += 1;
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      void this.startStream();
-    }, delay);
-    this.reconnectTimer.unref?.();
   }
 }
 
 export const __TEST__ = {
   decideDingTalkClose,
-  dingTalkReconnectBackoffMs,
   buildDingTalkGroupSendBody,
   buildDingTalkSingleSendBody,
   pickDingTalkSendRoute,

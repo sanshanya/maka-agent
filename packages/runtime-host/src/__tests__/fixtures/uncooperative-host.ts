@@ -1,3 +1,23 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { defineInteractiveRuntimeHostComposition } from '../../server/host-composition.js';
 import {
   resolveExistingStorageRoot,
   tryAcquireInteractiveRootOwner,
@@ -27,59 +47,61 @@ const host = await RuntimeHostKernel.start({
   owner,
   idleGraceMs: 60_000,
   shutdownGraceMs,
-  compositionFactory: async (context): Promise<RuntimeHostComposition> => ({
-    handlers: {
-      ...createUnavailableDomainOperationHandlers(),
-      'turn.start': async () => {
-        context.acquireResidency();
-        process.send?.({ type: 'operation-blocked' });
-        return new Promise<never>(() => undefined);
+  composition: defineInteractiveRuntimeHostComposition(
+    async (context): Promise<RuntimeHostComposition> => ({
+      handlers: {
+        ...createUnavailableDomainOperationHandlers(),
+        'turn.start': async () => {
+          context.acquireResidency('uncooperative-test');
+          process.send?.({ type: 'operation-blocked' });
+          return new Promise<never>(() => undefined);
+        },
+        'turn.query': async () => ({
+          ok: false,
+          error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
+        }),
+        'turn.stop': async () => ({
+          ok: false,
+          error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
+        }),
+        'turn.message.submit': async () => ({
+          ok: false,
+          error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
+        }),
+        'queue.retract': async () => ({
+          ok: false,
+          error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
+        }),
+        'turn.interrupt': async () => ({
+          ok: false,
+          error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
+        }),
+        'interaction.query': async () => ({
+          ok: false,
+          error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
+        }),
+        'interaction.answer': async () => ({
+          ok: false,
+          error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
+        }),
+        'subscription.open': async () => ({
+          ok: false,
+          error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
+        }),
+        'subscription.close': async () => ({
+          ok: false,
+          error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
+        }),
+        'session.todo.query': async () => ({
+          ok: false,
+          error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
+        }),
       },
-      'turn.query': async () => ({
-        ok: false,
-        error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
-      }),
-      'turn.stop': async () => ({
-        ok: false,
-        error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
-      }),
-      'turn.message.submit': async () => ({
-        ok: false,
-        error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
-      }),
-      'queue.retract': async () => ({
-        ok: false,
-        error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
-      }),
-      'turn.interrupt': async () => ({
-        ok: false,
-        error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
-      }),
-      'interaction.query': async () => ({
-        ok: false,
-        error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
-      }),
-      'interaction.answer': async () => ({
-        ok: false,
-        error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
-      }),
-      'subscription.open': async () => ({
-        ok: false,
-        error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
-      }),
-      'subscription.close': async () => ({
-        ok: false,
-        error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
-      }),
-      'task.ledger.query': async () => ({
-        ok: false,
-        error: { code: 'operation_unavailable', message: 'Operation unavailable in test Host' },
-      }),
-    },
-    beginDrain() {},
-    async recover() {},
-    async close() {},
-  }),
+      beginDrain() {},
+      async recover() {},
+      async close() {},
+    }),
+  ),
 });
 
 process.on('message', (message: unknown) => {

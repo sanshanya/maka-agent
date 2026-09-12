@@ -1,8 +1,27 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
 # @maka/ui
 
 Shared UI layer for the Maka desktop app. Astryx is the authority for generic components; Maka keeps product-specific composition and state. The package is consumed by `apps/desktop`'s renderer, while the preload bridge imports types only.
 
-The published Astryx API is a fixed dependency boundary. Consumers adapt to its taxonomy instead of recreating retired Maka APIs or styling its internal DOM.
+The published Astryx API is a fixed dependency boundary. New consumers adapt to its taxonomy instead of recreating retired Maka APIs or styling its internal DOM; existing renderer overrides are acknowledged transitional states documented in `apps/desktop/src/renderer/README.md`.
 
 ## Layer map
 
@@ -21,12 +40,12 @@ Four export surfaces, in the order to look:
 ## Consuming
 
 ```ts
-import { Badge, Button, ChatView, Composer, PageHeader, useToast } from '@maka/ui';
+import { Badge, Button, ChatView, Composer, useToast } from '@maka/ui';
 ```
 
 Sub-path exports (declared in `package.json` `exports`): `@maka/ui/artifact-preview-registry`, `@maka/ui/assistant-stream`, `@maka/ui/icons`, and `@maka/ui/maka-uri`. (`@maka/ui/icons` re-exports Lucide symbols; model-provider brand logos live in the renderer's `settings/provider-*`, not here — bot-provider logos are in `@maka/ui`'s `bot-brand-logo`.)
 
-Renderer CSS owns product layout containers only. It must not target Astryx internal elements, roles, slots, or generated classes to restyle component chrome.
+New renderer CSS owns product layout containers only. It must not target Astryx internal elements, roles, slots, or generated classes to restyle component chrome.
 
 ## Where new code goes
 
@@ -40,6 +59,6 @@ Renderer CSS owns product layout containers only. It must not target Astryx inte
 
 Product design intent lives in `DESIGN.md`.
 
-Component behavior, ARIA, keyboard, tone, and token contracts are enforced by source and the focused contract tests (`*-converge-contract.test.ts`, `state-token-governance-*`, and related suites). `docs/frontend-css-governance.md` owns the remaining cross-cutting CSS rules.
+Component behavior, ARIA, keyboard, tone, and token contracts are enforced by source, behavioral tests, focused `scripts/check-*.mjs` commands, review, and rendered-surface verification. `docs/frontend-css-governance.md` owns the remaining cross-cutting CSS rules.
 
 Selected primitives and features have stories (`stories/`) and unit tests (`src/__tests__/`); coverage is partial, not exhaustive. Build/test entry points are the npm scripts in the root `package.json` (see the top-level `README.md`).

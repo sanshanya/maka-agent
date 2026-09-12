@@ -1,3 +1,22 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
 # Desktop smoke runbook
 
 Use the narrowest deterministic check that covers the change, then add live-window evidence or a Storybook story when the risk requires it. Scenario inventories and check identifiers live in the scripts and fixtures, not in this document.
@@ -7,7 +26,8 @@ Use the narrowest deterministic check that covers the change, then add live-wind
 Run the desktop test suite for main-process, IPC, fixture, or contract changes:
 
 ```bash
-npm --workspace @maka/desktop test
+npm run build:test
+npm --workspace @maka/desktop run test:dist
 ```
 
 For a journey across renderer and main, extend the existing Playwright E2E suite and run:
@@ -46,7 +66,7 @@ npm --workspace @maka/desktop run smoke:programmatic-window
 
 ## Storybook baseline and visual contracts
 
-The product's visual baseline is Storybook, not a screenshot harness. Page-level stories (e.g. `apps/desktop/stories/settings/settings-pages.stories.tsx`) render each surface with mocked IPC via `withScopedMakaBridge`; add a story variant for any state the page does not already cover. Style and layout invariants are locked by computed-style or text contract tests (pattern: `apps/desktop/e2e/settings.spec.ts`), not by fixed screenshots. Run Storybook with:
+Storybook is the production-backed design catalog, not a screenshot or desktop E2E harness. Page-level stories (e.g. `apps/desktop/stories/settings/settings-pages.stories.tsx`) render each surface with mocked IPC via `withScopedMakaBridge`; add a story variant for any state the page does not already cover. CI only builds the catalog and mounts every story once without running `play`. Style, layout and interaction invariants belong in focused component contracts or the real Electron E2E harness. Run Storybook with:
 
 ```bash
 npm --workspace @maka/desktop run storybook

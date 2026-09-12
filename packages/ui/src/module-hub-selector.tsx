@@ -1,8 +1,27 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import type { ReactNode } from 'react';
 import { Tab, TabList } from '@astryxdesign/core';
 import type { AutomationModule, ExtensionModule } from './nav-selection.js';
 import { useUiLocale } from './locale-context.js';
-import { Blocks, CalendarCheck, Plug, Sun } from './icons.js';
+import { ICON_SIZE, Blocks, CalendarCheck, Plug, Sun } from './icons.js';
 import { getSharedUiCopy } from './shared-ui-copy.js';
 
 export type ModuleHubHeader = {
@@ -49,8 +68,8 @@ export function ModuleHubSelector(props: ModuleHubSelectorProps) {
   const copy = getSharedUiCopy(useUiLocale()).moduleHubs;
   if (props.hub === 'extensions') {
     const options = [
-      ['skills', copy.extensions.skills, <Blocks key="skills" size={16} aria-hidden="true" />],
-      ['mcp', copy.extensions.mcp, <Plug key="mcp" size={16} aria-hidden="true" />],
+      ['skills', copy.extensions.skills, <Blocks key="skills" size={ICON_SIZE.chrome} aria-hidden="true" />],
+      ['mcp', copy.extensions.mcp, <Plug key="mcp" size={ICON_SIZE.chrome} aria-hidden="true" />],
     ] as const;
     const selectedLabel = options.find(([value]) => value === props.value)?.[1] ?? copy.extensions.skills;
     return (
@@ -64,10 +83,10 @@ export function ModuleHubSelector(props: ModuleHubSelectorProps) {
   }
 
   const options = [
-    ['plan-reminders', copy.automations.planReminders, <CalendarCheck key="plan-reminders" size={16} aria-hidden="true" />],
-    ['daily-review', copy.automations.dailyReview, <Sun key="daily-review" size={16} aria-hidden="true" />],
+    ['scheduled-tasks', copy.automations.scheduledTasks, <CalendarCheck key="scheduled-tasks" size={ICON_SIZE.chrome} aria-hidden="true" />],
+    ['daily-review', copy.automations.dailyReview, <Sun key="daily-review" size={ICON_SIZE.chrome} aria-hidden="true" />],
   ] as const;
-  const selectedLabel = options.find(([value]) => value === props.value)?.[1] ?? copy.automations.planReminders;
+  const selectedLabel = options.find(([value]) => value === props.value)?.[1] ?? copy.automations.scheduledTasks;
   return (
     <Selector
       value={props.value}

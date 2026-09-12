@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 // packages/runtime/src/builtin-tools.ts
 // Baseline tool set. ToolRuntime settlement decorates each tool with durable
 // execution facts, while the active session ExecutionBoundary constrains local
@@ -17,25 +36,25 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute } from 'node:path';
-import {
-  compilePermissionProfile,
-  parseAttachmentResourceRef,
-  type SandboxBoundaryExpansion,
-  type StorageRef,
-  type PermissionProfile,
-  type ToolResultContent,
-} from '@maka/core';
+import { compilePermissionProfile } from '@maka/core/permission-profile-compiler';
+import { parseAttachmentResourceRef } from '@maka/core/attachments';
+import { type SandboxBoundaryExpansion } from '@maka/core/sandbox-boundary';
+import { isStorageRef, type StorageRef, type ToolResultContent } from '@maka/core/events';
+import { type PermissionProfile } from '@maka/core/permission-profile';
 import { bashToolResultToModelOutput } from './bash-model-output.js';
 import { fileWriteToolResultToModelOutput } from './file-tool-model-output.js';
+import { openAiApplyPatchInputSchema } from './openai-apply-patch.js';
+import { parseCodexV4aPatch } from './codex-v4a-patch.js';
+import { executeApplyPatchOperations } from './apply-patch-batch.js';
 import {
   buildManagedBashTool,
   buildStopBackgroundTaskTool,
   buildWriteStdinTool,
   shapeTerminalResult,
-  withShellGuidance,
+  withTurnShellGuidance,
 } from './shell-tools.js';
 import type { ShellRunLauncher } from './shell-tools.js';
-import { defaultShellPlan, type ShellPlan } from './shell-detect.js';
+import { defaultShellPlan, throwIfShellSetupFailed, type TurnShellPlan } from './shell-detect.js';
 import type {
   BackgroundTaskStopper,
   PtyControlWriter,
@@ -66,8 +85,13 @@ import type { ChildFdInput } from './child-fd-input.js';
 import { normalizeSandboxBoundaryPath } from './sandbox-boundary-path.js';
 import type { FilesystemWorkerClient } from './filesystem-worker/client.js';
 import {
+  BASH_REQUIRED_BOUNDARY_DESCRIPTION,
+  bashBoundaryIntentSchema,
   preflightDeclaredSandboxBoundary,
+  preprocessBashBoundaryDeclaration,
+  refineBashBoundaryDeclaration,
   sandboxBoundaryExpansionSchema,
+  selectedBashBoundaryExpansion,
 } from './sandbox-boundary-declaration.js';
 
 // Generous wall-clock cap for the ripgrep-backed Grep tool. A search should be
@@ -146,23 +170,27 @@ export interface BuildBuiltinToolsOptions {
   backgroundTasks?: BackgroundTaskStopper;
   ptyControls?: PtyControlWriter;
   executor?: WorkspaceExecutor;
-  /** Shell that runs Bash commands. Defaults to the process-wide detected shell. */
-  shell?: ShellPlan;
+  /**
+   * Turn-scoped shell resolution that runs Bash commands. Defaults to the
+   * process-wide detected shell. A broken saved preference rides along as
+   * `setupError` and fails closed at the Bash boundary.
+   */
+  shell?: TurnShellPlan;
+  /** Host-only environment overlay for a pre-bound Plugin Shell invocation. */
+  shellEnvironment?: Readonly<Record<string, string>>;
   permissionProfile?: PermissionProfile;
   sandboxManager?: SandboxManager;
   /** Sandboxed worker used for all local filesystem tools. */
   filesystemWorker?: Pick<FilesystemWorkerClient, 'execute'>;
-  /** Host-surface gate for Edit. Defaults to enabled. */
-  includeEdit?: boolean;
   /** Test/embedding override. Production callers use the current process platform. */
   sandboxPlatform?: SandboxPlatform;
   snapshotImage?: (input: {
     sessionId: string;
-    turnId: string;
-    name: string;
+    ownerId: string;
     bytes: Uint8Array;
     mimeType: string;
-  }) => Promise<Extract<StorageRef, { kind: 'session_file' }>>;
+  }) => Promise<Extract<StorageRef, { kind: 'session_context' }>>;
+  releaseImageSnapshot?: (input: { sessionId: string; refId: string }) => Promise<void>;
 }
 
 export function buildBuiltinTools(options: BuildBuiltinToolsOptions = {}): MakaTool[] {
@@ -205,21 +233,27 @@ export function buildBuiltinTools(options: BuildBuiltinToolsOptions = {}): MakaT
       ref: refField,
     })
     .strict();
-  // Some providers serialize unused optional fields as empty strings, so a
-  // model may send `ref: ""` on an ordinary file read. A blank ref means "no
-  // ref provided": drop the key before the strict union judges it, keeping the
-  // canonical input a pure file-or-ref union — `{path, ref: ""}` reads the
-  // file, while a lone `{ref: ""}` fails validation (no readable target).
-  const dropEmptyRef = (value: unknown): unknown => {
-    if (typeof value !== 'object' || value === null || !('ref' in value)) return value;
-    const ref = (value as { ref?: unknown }).ref;
+  // Some providers serialize every optional field with a default. Normalize
+  // only empty fields that cannot carry intent, then let the strict union keep
+  // rejecting genuinely ambiguous file-and-resource requests.
+  const normalizeProviderReadInput = (value: unknown): unknown => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return value;
+    const input = value as Record<string, unknown>;
+    const ref = input.ref;
+    const path = input.path;
+    if (typeof ref === 'string' && ref.trim() !== '') {
+      if (typeof path !== 'string' || path.trim() !== '') return value;
+      return Object.fromEntries(
+        Object.entries(input).filter(
+          ([key]) => key !== 'path' && key !== 'offset' && key !== 'limit',
+        ),
+      );
+    }
     if (typeof ref !== 'string' || ref.trim() !== '') return value;
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).filter(([key]) => key !== 'ref'),
-    );
+    return Object.fromEntries(Object.entries(input).filter(([key]) => key !== 'ref'));
   };
   const strictReadParameters = z.preprocess(
-    dropEmptyRef,
+    normalizeProviderReadInput,
     z
       .union([fileReadParameters, runtimeResourceReadParameters])
       .describe('Read a file with path, or a whole runtime resource with ref; provide exactly one'),
@@ -258,7 +292,7 @@ export function buildBuiltinTools(options: BuildBuiltinToolsOptions = {}): MakaT
         },
       })
     : fileReadParameters;
-  const shell = options.shell ?? defaultShellPlan();
+  const shell = options.shell ?? { plan: defaultShellPlan() };
   const sandboxPlatform = options.sandboxPlatform ?? process.platform;
   const bashTools = options.shellRuns
     ? [
@@ -267,8 +301,8 @@ export function buildBuiltinTools(options: BuildBuiltinToolsOptions = {}): MakaT
           shell,
           ...(options.sandboxManager
             ? {
-                transformCommand: ({ command, pty, requiredBoundary, ctx }) =>
-                  sandboxCommand(
+                transformCommand: ({ command, pty, requiredBoundary, ctx }) => {
+                  const transformed = sandboxCommand(
                     options.sandboxManager!,
                     options.permissionProfile,
                     sandboxPlatform,
@@ -277,9 +311,26 @@ export function buildBuiltinTools(options: BuildBuiltinToolsOptions = {}): MakaT
                     ctx,
                     requiredBoundary,
                     'background_command',
-                  ),
+                  );
+                  if (!options.shellEnvironment) return transformed;
+                  return {
+                    ...(transformed ?? { cwd: ctx.cwd }),
+                    env: {
+                      ...process.env,
+                      ...transformed?.env,
+                      ...options.shellEnvironment,
+                    },
+                  };
+                },
               }
-            : {}),
+            : options.shellEnvironment
+              ? {
+                  transformCommand: ({ ctx }) => ({
+                    cwd: ctx.cwd,
+                    env: { ...process.env, ...options.shellEnvironment },
+                  }),
+                }
+              : {}),
         }),
       ]
     : [
@@ -293,6 +344,28 @@ export function buildBuiltinTools(options: BuildBuiltinToolsOptions = {}): MakaT
     ...(options.backgroundTasks ? [buildStopBackgroundTaskTool(options.backgroundTasks)] : []),
     ...(options.ptyControls ? [buildWriteStdinTool(options.ptyControls)] : []),
   ];
+  const applyPatchTool = {
+    name: 'apply_patch',
+    activityKind: 'edit',
+    categoryHint: 'file_write',
+    description: 'Apply one or more file changes using the selected provider patch protocol.',
+    parameters: openAiApplyPatchInputSchema,
+    providerTool: { kind: 'openai-apply-patch' },
+    executionFacts,
+    impl: async (input, ctx) => {
+      if (typeof input !== 'string') {
+        return await filesystem.applyPatch({ operation: input.operation, ...filesystemCall(ctx) });
+      }
+      const operations = parseCodexV4aPatch(input);
+      return await executeApplyPatchOperations(
+        operations,
+        async (operation) => {
+          await filesystem.applyPatch({ operation, ...filesystemCall(ctx) });
+        },
+        ctx.abortSignal,
+      );
+    },
+  } satisfies MakaTool;
   const tools: MakaTool[] = [
     ...bashTools,
     ...backgroundTools,
@@ -302,6 +375,35 @@ export function buildBuiltinTools(options: BuildBuiltinToolsOptions = {}): MakaT
       description: readDescription,
       parameters: readParameters,
       executionFacts,
+      ...(options.releaseImageSnapshot
+        ? {
+            compensateDurableOutcomeCommitFailure: async (input: {
+              readonly result: unknown;
+              readonly sessionId: string;
+            }) => {
+              const result = input.result;
+              if (
+                !result ||
+                typeof result !== 'object' ||
+                (result as { kind?: unknown }).kind !== 'image'
+              ) {
+                return;
+              }
+              const ref = (result as { ref?: unknown }).ref;
+              if (
+                !isStorageRef(ref) ||
+                ref.kind !== 'session_context' ||
+                ref.sessionId !== input.sessionId
+              ) {
+                return;
+              }
+              await options.releaseImageSnapshot!({
+                sessionId: ref.sessionId,
+                refId: ref.refId,
+              });
+            },
+          }
+        : {}),
       impl: async (input, ctx) => {
         const { cwd, sessionId, abortSignal } = ctx;
         if ('ref' in input) {
@@ -344,10 +446,12 @@ export function buildBuiltinTools(options: BuildBuiltinToolsOptions = {}): MakaT
         if (result.kind === 'read_image') {
           if (!options.snapshotImage)
             throw new Error('Read image snapshots are not available in this toolset.');
+          if (!ctx.operationId) {
+            throw new Error('Read image snapshots require a durable tool operation identity.');
+          }
           const ref = await options.snapshotImage({
             sessionId,
-            turnId: ctx.turnId,
-            name: basename(path),
+            ownerId: ctx.operationId,
             bytes: result.bytes,
             mimeType: result.mimeType,
           });
@@ -362,6 +466,7 @@ export function buildBuiltinTools(options: BuildBuiltinToolsOptions = {}): MakaT
         return { content: result.content };
       },
     },
+    ...(executor.applyPatch ? [applyPatchTool] : []),
     {
       name: 'Write',
       activityKind: 'edit',
@@ -543,7 +648,7 @@ export function buildBuiltinTools(options: BuildBuiltinToolsOptions = {}): MakaT
       },
     },
   ];
-  return tools.filter((tool) => options.includeEdit !== false || tool.name !== 'Edit');
+  return tools;
 }
 
 /** The per-call context every file tool hands to the filesystem authority. */
@@ -566,31 +671,35 @@ interface ExecutorBashSandboxOptions {
 
 function buildExecutorBashTool(
   executor: WorkspaceExecutor,
-  shell: ShellPlan,
+  shell: TurnShellPlan,
   sandboxOptions: ExecutorBashSandboxOptions,
 ): MakaTool {
   return {
     name: 'Bash',
     activityKind: 'command',
     description:
-      withShellGuidance('Run a shell command in the session cwd.', shell) +
+      withTurnShellGuidance('Run a shell command in the session cwd.', shell) +
       ' Enforced by the current session sandbox boundary.',
-    parameters: z
-      .object({
-        command: z.string().describe('The shell command to execute'),
-        timeout_ms: z.number().int().positive().max(600_000).optional(),
-        required_boundary: sandboxBoundaryExpansionSchema
-          .optional()
-          .describe(
-            'Declare the exact filesystem or network sandbox authority this command requires. Do not infer it from command text.',
-          ),
-      })
-      .strict(),
+    parameters: preprocessBashBoundaryDeclaration(
+      z
+        .object({
+          command: z.string().describe('The shell command to execute'),
+          timeout_ms: z.number().int().positive().max(600_000).optional(),
+          boundary_intent: bashBoundaryIntentSchema,
+          required_boundary: sandboxBoundaryExpansionSchema
+            .optional()
+            .describe(BASH_REQUIRED_BOUNDARY_DESCRIPTION),
+        })
+        .strict()
+        .superRefine(refineBashBoundaryDeclaration),
+    ),
     toModelOutput: ({ output }) => bashToolResultToModelOutput(output),
     executionFacts: executor.facts,
-    impl: async ({ command, timeout_ms, required_boundary }, ctx) => {
+    impl: async (input, ctx) => {
+      const { command, timeout_ms } = input;
+      throwIfShellSetupFailed(shell);
       const normalizedRequiredBoundary = await preflightDeclaredSandboxBoundary(
-        required_boundary,
+        selectedBashBoundaryExpansion(input),
         ctx,
       );
       const { cwd, abortSignal, emitOutput } = ctx;
@@ -632,7 +741,7 @@ function buildExecutorBashTool(
           timeoutMs: timeout,
           ...(abortSignal ? { abortSignal } : {}),
           emitOutput,
-          shell,
+          shell: shell.plan,
         });
         const executionResult = {
           ...result,
@@ -702,7 +811,20 @@ function sandboxCommand(
     }
     return undefined;
   }
-  if (!manager.canEnforce({ profile: effective.profile, platform })) {
+  // The Windows broker sandboxes the purpose-built filesystem worker (an
+  // AppContainer-compatible executable), but it cannot launch an arbitrary
+  // shell: cmd.exe/pwsh fail DLL initialization (STATUS_DLL_INIT_FAILED,
+  // 0xC0000142) inside a capability-less AppContainer, and the POSIX `/bin/sh`
+  // this path emits is not a launchable Windows executable at all. Bash command
+  // sandboxing is therefore unavailable on win32 in this milestone. Route it
+  // through the shared "command sandbox unavailable" contract rather than
+  // handing the broker an unlaunchable manifest: fail closed when the profile
+  // requires a sandbox, otherwise return undefined so the caller runs the
+  // command through the detected Windows shell (unsandboxed), exactly as an
+  // explicit bypass boundary already does.
+  const commandSandboxUnavailable =
+    platform === 'win32' || !manager.canEnforce({ profile: effective.profile, platform });
+  if (commandSandboxUnavailable) {
     if (profileRequiresSandbox(effective.profile)) {
       const selection = manager.selectInitial({
         profile: effective.profile,
@@ -758,7 +880,7 @@ function sandboxCommand(
         pathContext: {
           workspaceRoots: effective.workspaceRoots,
           tmpdir: tmpdir(),
-          slashTmp: '/tmp',
+          ...(platform === 'win32' ? {} : { slashTmp: '/tmp' }),
           ...(platform === 'darwin'
             ? {
                 executableRoots: macosRuntimeExecutableRoots(process.execPath),

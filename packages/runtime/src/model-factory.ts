@@ -1,6 +1,29 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { createAnthropic } from '@ai-sdk/anthropic';
+// Load-bearing until the public Anthropic API exposes model thinking mode:
+// replace this capability lookup when upgrading if the exported internal path disappears.
+import { getModelCapabilities as getAnthropicModelCapabilities } from '@ai-sdk/anthropic/internal';
 import { createCohere } from '@ai-sdk/cohere';
 import { createGoogle } from '@ai-sdk/google';
+import { createOpenResponses } from '@ai-sdk/open-responses';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createOpenAICompatible, type MetadataExtractor } from '@ai-sdk/openai-compatible';
 import {
@@ -12,11 +35,13 @@ import {
   type SharedV4ProviderOptions,
 } from '@ai-sdk/provider';
 import { type RuntimeExecutionConnection } from '@maka/core/llm-connections';
-import type { ProviderRuntimeAdapter } from '@maka/core/llm-connections';
+import { lookupModelMetadata } from '@maka/core/model-metadata';
 import type { ThinkingLevel } from '@maka/core/model-thinking';
 import {
+  resolveThinkingLevel,
+  supportsRelayFastServiceTier,
   thinkingOptionsForModel,
-  thinkingVariantsForModel,
+  thinkingVariantsForConnection,
   type ThinkingOptions,
 } from '@maka/core/model-thinking';
 import {
@@ -24,17 +49,23 @@ import {
   createOpenAiChatReasoningTransportState,
   type OpenAiChatReasoningTransportState,
 } from './openai-chat-reasoning-transport.js';
-import { createOpenAiResponsesPlaintextReasoningTransport } from './openai-responses-plaintext-reasoning-transport.js';
 import type { OpenAiResponsesTransportState } from './openai-responses-websocket.js';
-import { anthropicV1BaseUrl, googleV1BetaBaseUrl } from './provider-urls.js';
+import { openResponsesUrl } from './provider-urls.js';
+import { createOpenResponsesCompatibilityFinalizer } from './open-responses-compatibility.js';
 import { resolveModelRuntime, type ResolvedModelRuntime } from './model-runtime.js';
-import { claudeSubscriptionHeaders, openAiCodexHeaders } from './subscription-auth.js';
+import { runtimeProviderName, type RuntimeProviderAdapter } from './provider-runtime-policy.js';
+import { openAiCodexHeaders } from './subscription-auth.js';
+import { createRequestCustomizationFetch } from './request-customization-fetch.js';
+import { createStreamUsageFallbackFetch } from './stream-usage-fallback-fetch.js';
+import { withOpenCodeSessionHeader } from './opencode-session-header.js';
 
 export interface ModelFactoryInput {
   connection: RuntimeExecutionConnection;
   apiKey: string;
   modelId: string;
+  sessionId?: string;
   fetch?: typeof globalThis.fetch;
+  requestHeaders?: Readonly<Record<string, string>>;
   resolvedRuntime?: ResolvedModelRuntime;
   openAiChatReasoningTransportState?: OpenAiChatReasoningTransportState;
   openAiResponsesTransportState?: OpenAiResponsesTransportState;
@@ -46,70 +77,59 @@ export function getAIModel(input: ModelFactoryInput): LanguageModelV4 {
     connection,
     apiKey,
     modelId,
+    sessionId,
     fetch,
+    requestHeaders,
     resolvedRuntime,
     openAiChatReasoningTransportState,
     openAiResponsesTransportState,
   } = input;
   const runtime = resolvedRuntime ?? resolveModelRuntime(connection, modelId);
   const { adapter, baseUrl: baseURL, wire, reasoningReplay } = runtime;
-
-  if (adapter.kind === 'google' && adapter.normalizeBaseUrl === false) {
-    return createGoogle({ apiKey, baseURL, fetch }).chat(modelId);
-  }
+  const effectiveRequestHeaders = withOpenCodeSessionHeader(
+    connection.providerType,
+    sessionId,
+    requestHeaders,
+  );
+  const hasRequestCustomization =
+    Object.keys(effectiveRequestHeaders ?? {}).length > 0 ||
+    Object.keys(connection.requestBodyOverlay ?? {}).length > 0;
+  const baseFetch = fetch ?? globalThis.fetch;
+  const requestCustomization = {
+    headers: effectiveRequestHeaders,
+    bodyOverlay: connection.requestBodyOverlay,
+  } as const;
+  const requestFetch = createRequestCustomizationFetch(baseFetch, requestCustomization);
 
   switch (adapter.kind) {
     case 'anthropic':
       return createAnthropic({
         ...(adapter.auth === 'bearer' ? { authToken: apiKey } : { apiKey }),
-        baseURL: adapter.normalizeBaseUrl ? anthropicV1BaseUrl(baseURL) : baseURL,
-        fetch,
-        headers: { 'anthropic-beta': ANTHROPIC_BETA },
-      }).chat(modelId);
-
-    case 'claude-subscription':
-      return createAnthropic({
-        authToken: apiKey,
-        baseURL: anthropicV1BaseUrl(baseURL),
-        fetch,
-        headers: claudeSubscriptionHeaders(),
+        baseURL,
+        fetch: requestFetch,
+        headers:
+          adapter.includeBetaHeaders === false ? undefined : { 'anthropic-beta': ANTHROPIC_BETA },
       }).chat(modelId);
 
     case 'openai-codex':
       return createOpenAI({
         apiKey,
         baseURL,
-        fetch: openAiResponsesTransportState?.wrapFetch(fetch ?? globalThis.fetch) ?? fetch,
+        fetch:
+          !hasRequestCustomization && openAiResponsesTransportState
+            ? openAiResponsesTransportState.wrapFetch(requestFetch)
+            : requestFetch,
         headers: openAiCodexHeaders(apiKey),
       }).responses(modelId);
-
-    case 'github-copilot': {
-      if (wire === 'openai-responses') {
-        return createOpenAI({ apiKey, baseURL, fetch }).responses(modelId);
-      }
-      if (wire === 'anthropic-messages') {
-        return createAnthropic({
-          authToken: apiKey,
-          baseURL: anthropicV1BaseUrl(baseURL),
-          fetch,
-        }).chat(modelId);
-      }
-      return createOpenAICompatible({
-        name: 'github-copilot',
-        apiKey,
-        baseURL,
-        fetch,
-      }).chatModel(modelId);
-    }
-
-    case 'unavailable':
-      throw new Error(`${connection.providerType} is experimental and not wired yet`);
 
     case 'openai': {
       const openai = createOpenAI({
         apiKey,
         baseURL,
-        fetch: openAiResponsesTransportState?.wrapFetch(fetch ?? globalThis.fetch) ?? fetch,
+        fetch:
+          !hasRequestCustomization && openAiResponsesTransportState
+            ? openAiResponsesTransportState.wrapFetch(requestFetch)
+            : requestFetch,
       });
       return wire === 'openai-responses' ? openai.responses(modelId) : openai.chat(modelId);
     }
@@ -117,12 +137,12 @@ export function getAIModel(input: ModelFactoryInput): LanguageModelV4 {
     case 'google':
       return createGoogle({
         apiKey,
-        baseURL: googleV1BetaBaseUrl(baseURL),
-        fetch,
+        baseURL,
+        fetch: requestFetch,
       }).chat(modelId);
 
     case 'cohere':
-      return createCohere({ apiKey, baseURL, fetch })(modelId);
+      return createCohere({ apiKey, baseURL, fetch: requestFetch })(modelId);
 
     case 'openai-compatible': {
       if (adapter.requireBaseUrl && !baseURL) {
@@ -131,29 +151,40 @@ export function getAIModel(input: ModelFactoryInput): LanguageModelV4 {
         );
       }
       if (wire === 'openai-responses') {
-        // Measured against the live API rather than inferred from the wire:
-        // DeepSeek streams reasoning as `response.reasoning_text.delta`, which
-        // the SDK never reads, so its reasoning parts arrive empty. Keep this
-        // to the provider we have evidence for — a Responses wire says nothing
-        // about which reasoning shape a provider speaks, and the others
-        // reaching here have not been measured.
-        const speaksPlaintextReasoning = connection.providerType === 'deepseek';
+        if (reasoningReplay.contract.adapter === 'open-responses') {
+          const finalizeBody = createOpenResponsesCompatibilityFinalizer(
+            reasoningReplay.contract.compatibility,
+          );
+          // Request customization is applied first; provider compatibility is
+          // the final authority before network dispatch, so an overlay cannot
+          // re-enable storage or violate the provider's tool-choice contract.
+          const responsesFetch = finalizeBody
+            ? createRequestCustomizationFetch(baseFetch, {
+                ...requestCustomization,
+                finalizeBody,
+              })
+            : requestFetch;
+          return createOpenResponses({
+            name: runtimeProviderName(adapter, connection),
+            apiKey,
+            url: openResponsesUrl(baseURL),
+            fetch: responsesFetch,
+          })(modelId);
+        }
         return createOpenAI({
           apiKey,
           baseURL,
-          fetch: speaksPlaintextReasoning
-            ? createOpenAiResponsesPlaintextReasoningTransport(fetch ?? globalThis.fetch)
-            : fetch,
+          fetch: requestFetch,
         }).responses(modelId);
       }
       if (reasoningReplay.kind !== 'openai-chat-plaintext') {
         throw new Error('OpenAI-compatible Chat wire requires plaintext reasoning replay');
       }
       const reasoningTransport = createOpenAiChatReasoningTransport(
-        fetch ?? globalThis.fetch,
+        requestFetch,
         openAiChatReasoningTransportState ??
           createOpenAiChatReasoningTransportState(reasoningReplay.requestField),
-        connection.providerType === 'kimi-coding-plan',
+        adapter.normalizeUsage,
       );
       const transformRequestBody = adapter.replayAssistantReasoningDetails
         ? composeRequestTransforms(
@@ -162,11 +193,17 @@ export function getAIModel(input: ModelFactoryInput): LanguageModelV4 {
           )
         : reasoningTransport.transformRequestBody;
       const model = createOpenAICompatible({
-        name: openAiCompatibleProviderOptionsName(adapter, connection),
+        name: runtimeProviderName(adapter, connection),
         apiKey,
         baseURL,
-        includeUsage: adapter.includeUsage,
-        fetch: reasoningTransport.fetch,
+        // Ask every Chat Completions server for stream usage unless the
+        // registry opts a provider out. Usage is the only signal the runtime's
+        // context handling reads (#4559): without `stream_options.include_usage`
+        // an OpenAI-compatible relay or a local Ollama returns none, and the
+        // proactive compaction baseline, the eviction check, and the usage
+        // indicator all go dark for exactly the connections that need them.
+        includeUsage: adapter.includeUsage ?? true,
+        fetch: createStreamUsageFallbackFetch(reasoningTransport.fetch, baseURL),
         transformRequestBody,
         ...(adapter.replayAssistantReasoningDetails
           ? { metadataExtractor: reasoningDetailsMetadataExtractor() }
@@ -331,14 +368,104 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function modelFamilyId(modelId: string): string {
+  return modelId.includes('/') ? modelId.slice(modelId.lastIndexOf('/') + 1) : modelId;
+}
+
+function claudeFamilyId(modelId: string): string {
+  return modelFamilyId(modelId).replace(
+    /^(claude-(?:haiku|opus|sonnet)-\d+)\.(\d+)(?=$|-)/,
+    '$1-$2',
+  );
+}
+
+function defaultOpenAiReasoningEffort(modelId: string): ThinkingLevel | undefined {
+  const familyModelId = modelFamilyId(modelId);
+  return thinkingOptionsForModel('openai', familyModelId)?.efforts?.includes('medium')
+    ? 'medium'
+    : undefined;
+}
+
+function openAiResponsesSummary(modelId: string, reasoningEffort: string | undefined) {
+  return reasoningEffort !== 'none' && defaultOpenAiReasoningEffort(modelId) !== undefined
+    ? { reasoningSummary: 'auto' as const }
+    : {};
+}
+
+function visibleClaudeThinking(
+  providerType: RuntimeExecutionConnection['providerType'],
+  modelId: string,
+  thinkingOptions: ThinkingOptions | undefined,
+  effort: string | undefined,
+) {
+  const mode = claudeThinkingMode(providerType, modelId, thinkingOptions);
+  if (!mode) return undefined;
+
+  const thinking =
+    mode === 'adaptive'
+      ? { type: 'adaptive' as const, display: 'summarized' as const }
+      : { type: 'enabled' as const, budgetTokens: 1_024 };
+  return {
+    thinking,
+    ...(effort ? { effort } : {}),
+  };
+}
+
+function claudeThinkingMode(
+  providerType: RuntimeExecutionConnection['providerType'],
+  modelId: string,
+  thinkingOptions: ThinkingOptions | undefined,
+): 'adaptive' | 'legacy' | undefined {
+  const familyModelId = claudeFamilyId(modelId);
+  if (!familyModelId.startsWith('claude-')) return undefined;
+
+  const providerMetadata = lookupModelMetadata(providerType, modelId);
+  const anthropicMetadata = lookupModelMetadata('anthropic', familyModelId);
+  const isKnownBareLegacyClaude4 = /^claude-(?:opus|sonnet)-4$/.test(familyModelId);
+  const effectiveOptions =
+    thinkingOptions ??
+    providerMetadata.thinkingOptions ??
+    anthropicMetadata.thinkingOptions ??
+    thinkingOptionsForModel('anthropic', familyModelId);
+  const supportsThinking =
+    effectiveOptions?.toggle === true ||
+    (effectiveOptions?.efforts?.length ?? 0) > 0 ||
+    providerMetadata.capabilities?.reasoning === true ||
+    anthropicMetadata.capabilities?.reasoning === true ||
+    isKnownBareLegacyClaude4;
+  if (!supportsThinking) return undefined;
+
+  // The SDK's capability table only recognizes dated Claude 4 aliases. The
+  // active bare aliases are the same legacy budget-thinking families.
+  if (isKnownBareLegacyClaude4) return 'legacy';
+
+  return getAnthropicModelCapabilities(familyModelId).supportsAdaptiveThinking
+    ? 'adaptive'
+    : 'legacy';
+}
+
 export function buildProviderOptions(
   connection: RuntimeExecutionConnection,
   modelId: string,
   thinkingLevel?: ThinkingLevel,
+  runtime = resolveModelRuntime(connection, modelId),
+): SharedV4ProviderOptions {
+  return withParallelToolCallOptions(
+    connection,
+    modelId,
+    buildThinkingProviderOptions(connection, modelId, thinkingLevel, runtime),
+    runtime,
+  );
+}
+
+function buildThinkingProviderOptions(
+  connection: RuntimeExecutionConnection,
+  modelId: string,
+  thinkingLevel?: ThinkingLevel,
+  runtime = resolveModelRuntime(connection, modelId),
 ): SharedV4ProviderOptions {
   const thinkingOptions = thinkingOptionsForModel(connection.providerType, modelId);
-  const variants = thinkingVariantsForModel(connection.providerType, modelId);
-  const level = thinkingLevel && variants.includes(thinkingLevel) ? thinkingLevel : undefined;
+  const level = resolveThinkingLevel(connection, modelId, thinkingLevel);
   switch (connection.providerType) {
     case 'kimi-coding-plan': {
       // Kimi's coding route has no off wire. Check the raw argument, not the
@@ -350,7 +477,7 @@ export function buildProviderOptions(
       // sweep keeps that tripwire armed.
       if (thinkingLevel === 'off') return {};
       const effort = level ?? 'max';
-      if (connection.models?.find((model) => model.id === modelId)?.apiProtocol === 'openai-chat') {
+      if (runtime.wire === 'openai-chat') {
         // The kimiCodingPlan provider-options namespace is the
         // openai-compatible adapter name; ai-sdk resolves its camelCase
         // alias to the kimi-coding-plan schema key (reasoning_effort).
@@ -387,11 +514,17 @@ export function buildProviderOptions(
     // provider's native effort values pass through unchanged.
     case 'anthropic':
     case 'MiniMax':
-    case 'MiniMax-cn':
-    case 'claude-subscription': {
+    case 'MiniMax-cn': {
       let reasoning = {};
+      const summarizedThinking =
+        connection.providerType === 'anthropic' &&
+        (thinkingLevel === undefined || level !== undefined)
+          ? visibleClaudeThinking(connection.providerType, modelId, thinkingOptions, level)
+          : undefined;
       if (level === 'off' && thinkingOptions?.offBehavior === 'anthropic-thinking-disabled') {
         reasoning = { thinking: { type: 'disabled' as const } };
+      } else if (summarizedThinking) {
+        reasoning = summarizedThinking;
       } else if (level && level !== 'off') {
         reasoning = { effort: level };
       }
@@ -404,21 +537,36 @@ export function buildProviderOptions(
         },
       };
     }
-    case 'openai-codex':
+    case 'openai-codex': {
+      const reasoningEffort =
+        level === 'off'
+          ? 'none'
+          : (level ??
+            (thinkingLevel === undefined ? defaultOpenAiReasoningEffort(modelId) : undefined));
       return {
         openai: {
           store: false,
           textVerbosity: 'medium',
-          ...(level ? { reasoningEffort: level === 'off' ? 'none' : level } : {}),
+          ...openAiResponsesSummary(modelId, reasoningEffort),
+          ...(reasoningEffort ? { reasoningEffort } : {}),
         },
       };
-    case 'openai':
+    }
+    case 'openai': {
+      const usesResponses = runtime.wire === 'openai-responses';
+      const reasoningEffort =
+        level === 'off'
+          ? 'none'
+          : (level ??
+            (thinkingLevel === undefined ? defaultOpenAiReasoningEffort(modelId) : undefined));
       return {
         openai: {
           store: false,
-          ...(level ? { reasoningEffort: level === 'off' ? 'none' : level } : {}),
+          ...(usesResponses ? openAiResponsesSummary(modelId, reasoningEffort) : {}),
+          ...(reasoningEffort ? { reasoningEffort } : {}),
         },
       };
+    }
     case 'volcengine-agent-plan':
       return {
         openai: {
@@ -428,9 +576,7 @@ export function buildProviderOptions(
       };
     case 'xai':
     case 'xai-oauth':
-      // Only grok-4.5 needs the Responses reasoning extras; every other xAI
-      // model serves the plain OpenAI-compatible chat wire handled below.
-      if (modelId === 'grok-4.5') {
+      if (runtime.wire === 'openai-responses') {
         return {
           openai: {
             store: false,
@@ -441,10 +587,10 @@ export function buildProviderOptions(
           },
         };
       }
-      return buildFamilyWire(connection, modelId, level, thinkingOptions);
+      return buildFamilyWire(connection, modelId, level, thinkingOptions, thinkingLevel, runtime);
     case 'volcengine-ark':
       return {
-        [connection.providerType]: {
+        [toCamelCase(connection.providerType)]: {
           thinking: { type: level === 'off' ? 'disabled' : 'enabled' },
           ...(level && level !== 'off' ? { reasoningEffort: level } : {}),
         },
@@ -471,7 +617,7 @@ export function buildProviderOptions(
     case 'cloudflare-workers-ai':
       return level
         ? {
-            [connection.providerType]:
+            [toCamelCase(connection.providerType)]:
               level === 'off'
                 ? thinkingOptions?.offBehavior === 'cloudflare-chat-template-thinking-false'
                   ? { chat_template_kwargs: { thinking: false } }
@@ -486,8 +632,46 @@ export function buildProviderOptions(
     // above (level is defined only when metadata declares it) is what makes
     // this safe to generalize: undeclared models never reach the wire.
     default:
-      return buildFamilyWire(connection, modelId, level, thinkingOptions);
+      return buildFamilyWire(connection, modelId, level, thinkingOptions, thinkingLevel, runtime);
   }
+}
+
+function withParallelToolCallOptions(
+  connection: RuntimeExecutionConnection,
+  modelId: string,
+  options: SharedV4ProviderOptions,
+  runtime: ResolvedModelRuntime,
+): SharedV4ProviderOptions {
+  if (runtime.parallelToolCalls === undefined) return options;
+
+  let providerKey: string;
+  let optionKey: 'parallelToolCalls' | 'parallel_tool_calls';
+  if (runtime.adapter.kind === 'openai' || runtime.adapter.kind === 'openai-codex') {
+    providerKey = 'openai';
+    optionKey = 'parallelToolCalls';
+  } else if (runtime.adapter.kind === 'openai-compatible') {
+    if (runtime.wire === 'openai-responses') {
+      if (runtime.reasoningReplay.contract.adapter !== 'openai') {
+        return options;
+      }
+      providerKey = 'openai';
+      optionKey = 'parallelToolCalls';
+    } else {
+      providerKey = openAiCompatibleProviderOptionsKey(runtime.adapter, connection);
+      optionKey = 'parallel_tool_calls';
+    }
+  } else {
+    return options;
+  }
+
+  const current = options[providerKey];
+  return {
+    ...options,
+    [providerKey]: {
+      ...(isRecord(current) ? current : {}),
+      [optionKey]: runtime.parallelToolCalls,
+    },
+  };
 }
 
 function buildFamilyWire(
@@ -495,51 +679,89 @@ function buildFamilyWire(
   modelId: string,
   level: ThinkingLevel | undefined,
   thinkingOptions: ThinkingOptions | undefined,
+  requestedLevel: ThinkingLevel | undefined,
+  runtime: ResolvedModelRuntime,
 ): SharedV4ProviderOptions {
-  const { adapter, wire } = resolveModelRuntime(connection, modelId);
-  const reasoningEffort = level ? (level === 'off' ? 'none' : level) : undefined;
-  // Whatever the adapter kind, a Responses wire is dialled through the native
-  // OpenAI provider (`getAIModel`), so `openai` is the only provider-options
-  // namespace the SDK will read: an openai-compatible provider's own namespace
-  // is silently dropped there — including the effort, so a model asking for
-  // `max` sent no reasoning parameter at all.
-  //
-  // `store: false` is not a storage preference, it is the switch that makes the
-  // SDK ask for `include: ['reasoning.encrypted_content']` and, on the request
-  // side, drop any reasoning item that came back without one. Both halves are
-  // what we want here: a provider that speaks the encrypted-content contract
-  // gets a replayable chain, and one that does not stops shipping empty husks
-  // it could never replay. Which of the two a given provider is remains its own
-  // business, and this says nothing about how it carries reasoning otherwise —
-  // DeepSeek returns plaintext in `content[].reasoning_text` and consumes it in
-  // the same shape, a dialect the SDK neither reads nor writes. Bridging that
-  // is a transport's job, not this function's. Either way `store` is a property
-  // of the wire rather than of a thinking choice, so it holds whether or not a
-  // level was picked.
-  //
-  // The include is gated on the SDK also believing this is a reasoning model,
-  // and it decides that by parsing the model id for an OpenAI naming scheme —
-  // `deepseek-v4-flash` and `grok-4.5` fail that test however they are served.
-  // Our own declared thinking variants are the authority on that question, so
-  // say so with `forceReasoning` rather than letting a name decide.
+  const { adapter, wire, reasoningReplay } = runtime;
+  const explicitReasoningEffort = level ? (level === 'off' ? 'none' : level) : undefined;
+  const serviceTier =
+    wire === 'openai-responses' &&
+    reasoningReplay.kind === 'responses' &&
+    reasoningReplay.contract.adapter === 'openai' &&
+    supportsRelayFastServiceTier(connection.providerType, modelId)
+      ? connection.relayModelProfiles?.[modelId]?.serviceTier
+      : undefined;
+  // Provider selection and reasoning continuation are independent. The OpenAI
+  // provider reads its provider-options namespace; the Open Responses provider
+  // consumes a provider-native reasoningEffort through the same namespace,
+  // keyed by the provider name getAIModel passes to createOpenResponses.
   if (wire === 'openai-responses') {
-    const reasons = thinkingVariantsForModel(connection.providerType, modelId).length > 0;
+    // Connection-aware: a relay model's declared variants count too.
+    const reasons = thinkingVariantsForConnection(connection, modelId).length > 0;
+    if (reasoningReplay.contract.adapter === 'open-responses') {
+      // @ai-sdk/open-responses@2.0.34 passes a provider-native reasoningEffort
+      // through verbatim, ahead of the cross-provider top-level `reasoning`
+      // enum that cannot express DeepSeek's `max` (whose documented mapping
+      // sends `xhigh` to high, not max). The SDK resolves providerOptions
+      // under the raw provider `name` — no camelCase alias, unlike
+      // openai-compatible — so key by the same name getAIModel passes.
+      return explicitReasoningEffort || serviceTier
+        ? {
+            [runtimeProviderName(adapter, connection)]: {
+              ...(explicitReasoningEffort ? { reasoningEffort: explicitReasoningEffort } : {}),
+              ...(serviceTier ? { serviceTier } : {}),
+            },
+          }
+        : {};
+    }
+    const reasoningEffort =
+      explicitReasoningEffort ??
+      (requestedLevel === undefined ? defaultOpenAiReasoningEffort(modelId) : undefined);
     return {
       openai: {
         store: false,
-        ...(reasons ? { forceReasoning: true } : {}),
+        ...(reasons || reasoningReplay.contract.reasoningReplay === 'encrypted-content'
+          ? { forceReasoning: true }
+          : {}),
+        ...openAiResponsesSummary(modelId, reasoningEffort),
         ...(reasoningEffort ? { reasoningEffort } : {}),
+        ...(serviceTier ? { serviceTier } : {}),
       },
     };
   }
-  if (!reasoningEffort) return {};
+  if (wire === 'anthropic-messages' && (requestedLevel === undefined || level !== undefined)) {
+    const reasoning = visibleClaudeThinking(
+      connection.providerType,
+      modelId,
+      thinkingOptions,
+      explicitReasoningEffort,
+    );
+    if (reasoning) return { anthropic: reasoning };
+  }
+  if (wire === 'openai-chat' && adapter.kind === 'openai-compatible') {
+    const reasoningEffort =
+      explicitReasoningEffort ??
+      (requestedLevel === undefined ? defaultOpenAiReasoningEffort(modelId) : undefined);
+    if (reasoningEffort) {
+      return {
+        [openAiCompatibleProviderOptionsKey(adapter, connection)]: { reasoningEffort },
+      };
+    }
+  }
+  if (!explicitReasoningEffort && !serviceTier) return {};
   switch (adapter.kind) {
     case 'openai-compatible':
       return {
-        [openAiCompatibleProviderOptionsName(adapter, connection)]: { reasoningEffort },
+        [openAiCompatibleProviderOptionsKey(adapter, connection)]: {
+          ...(explicitReasoningEffort ? { reasoningEffort: explicitReasoningEffort } : {}),
+        },
       };
     case 'openai':
-      return { openai: { reasoningEffort } };
+      return {
+        openai: {
+          ...(explicitReasoningEffort ? { reasoningEffort: explicitReasoningEffort } : {}),
+        },
+      };
     case 'anthropic':
       // Anthropic-protocol models declare no `none` effort, so an off
       // choice only exists where an explicit case wires it.
@@ -555,30 +777,33 @@ function buildFamilyWire(
             ? { thinking: { type: 'disabled' as const } }
             : {},
       };
-    case 'github-copilot': {
-      // Copilot routes per account-declared model protocol (mirrors the
-      // getAIModel case), defaulting to its OpenAI-compatible chat wire. Its
-      // Responses protocol is answered by the wire branch above.
-      const copilotProtocol = connection.models?.find((model) => model.id === modelId)?.apiProtocol;
-      if (copilotProtocol === 'anthropic-messages') {
-        return level !== 'off' ? { anthropic: { effort: level } } : {};
-      }
-      return { 'github-copilot': { reasoningEffort } };
-    }
     default:
       return {};
   }
 }
 
+// Mirrors @ai-sdk/openai-compatible's own toCamelCase derivation, so the
+// key we emit always matches the alias the SDK resolves.
+function toCamelCase(name: string): string {
+  return name.replace(/[_-]([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+}
+
 /**
- * providerOptions namespace matches the `name` passed to `createOpenAICompatible`
- * in `getAIModel`; both derive it from this one rule so the two can never drift.
+ * The providerOptions key for an openai-compatible model: the camelCase
+ * alias of the identity passed to `createOpenAICompatible`. The SDK
+ * resolves both spellings — known options and passthrough fields alike —
+ * but flags dashed keys as deprecated (a `type: 'deprecated'` warning on
+ * every doGenerate result), so the camelCase alias is the canonical key.
+ *
+ * The same alias also selects the SDK's *response* metadata namespace:
+ * once options are keyed `zaiCodingPlan`, provider metadata comes back as
+ * `providerMetadata.zaiCodingPlan`, not `providerMetadata['zai-coding-plan']`.
+ * A metadata reader keyed by the raw `connection.providerType` would
+ * silently read nothing for dashed providers.
  */
-function openAiCompatibleProviderOptionsName(
-  adapter: ProviderRuntimeAdapter,
+function openAiCompatibleProviderOptionsKey(
+  adapter: RuntimeProviderAdapter,
   connection: RuntimeExecutionConnection,
 ): string {
-  return adapter.kind === 'openai-compatible' && adapter.name === 'connection'
-    ? connection.slug
-    : connection.providerType;
+  return toCamelCase(runtimeProviderName(adapter, connection));
 }

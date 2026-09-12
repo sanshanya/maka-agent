@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /* WeChat QR login dialog content. */
 
 .settingsWechatQrCaption {
@@ -14,18 +33,23 @@
   text-align: center;
   /* Deep-review fix: the retired `.settingsWechatQrState` pane carried a
      180px floor; without one the dialog collapses in the generating/expired/
-     error states and snaps taller when the QR (224px frame) arrives. */
-  min-height: 224px;
+     error states and snaps taller when the QR frame arrives — the floor
+     tracks the frame token so the two cannot drift. */
+  min-height: var(--qr-frame-size);
 }
 
 .settingsWechatQrFrame {
-  width: 224px;
-  height: 224px;
+  /* Shared with the bot onboarding QR frame (settings/bot.css): both read
+     --qr-frame-size so the paired dialogs present one QR spec. */
+  width: var(--qr-frame-size);
+  height: var(--qr-frame-size);
   display: grid;
   place-items: center;
   border: var(--border-width-hairline) solid color-mix(in srgb, var(--brand-wechat) 20%, var(--border));
   border-radius: var(--radius-surface);
-  background: white;
+  /* Paper, not a ladder tier: a QR code has to stay dark-on-light to be
+     scannable at all. See --surface-paper in maka-tokens.css. */
+  background: var(--surface-paper);
   padding: var(--space-3);
 }
 

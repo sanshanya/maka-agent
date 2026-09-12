@@ -1,10 +1,33 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import {
   BUILTIN_TOOL_CATEGORY,
   type PermissionMode,
   type PolicyDecision,
   type ToolCategory,
 } from '@maka/core/permission';
-import { SUBAGENT_PROFILES, type SubagentPreset, type SubagentProfile } from '@maka/core';
+import {
+  SUBAGENT_PROFILES,
+  type SubagentPreset,
+  type SubagentProfile,
+} from '@maka/core/subagent-settings';
 import type { MakaTool } from './tool-runtime.js';
 
 export const LOCAL_READ_AGENT_ID = 'local-read';
@@ -31,6 +54,11 @@ export type AgentWriteBackMode =
   | 'decision'
   | 'artifact'
   | 'patch';
+export type AgentToolGroup = 'file_edit';
+
+const AGENT_TOOL_GROUP_ALTERNATIVES = {
+  file_edit: [['Write', 'Edit'], ['apply_patch']],
+} as const satisfies Record<AgentToolGroup, readonly (readonly string[])[]>;
 
 export interface AgentProfileContract {
   capability: AgentCapability;
@@ -65,10 +93,14 @@ export interface AgentDefinition {
   contract: AgentProfileContract;
   permissionMode: PermissionMode;
   tools: readonly string[];
+  toolGroups?: readonly AgentToolGroup[];
   systemPrompt: string;
 }
 
-export type AgentRuntimeDefinition = Pick<AgentDefinition, 'id' | 'permissionMode' | 'tools'>;
+export type AgentRuntimeDefinition = Pick<
+  AgentDefinition,
+  'id' | 'permissionMode' | 'tools' | 'toolGroups'
+>;
 
 export interface AgentDefinitionListItem {
   id: string;
@@ -85,7 +117,12 @@ export type SubagentPresetAvailability =
   | { status: 'available' }
   | {
       status: 'unavailable';
-      reason: 'disabled' | 'missing_connection' | 'connection_disabled' | 'model_disabled';
+      reason:
+        | 'disabled'
+        | 'missing_connection'
+        | 'provider_retired'
+        | 'connection_disabled'
+        | 'model_disabled';
     };
 
 export interface SubagentPresetListItem extends SubagentPreset {
@@ -135,7 +172,7 @@ export const WEB_RESEARCH_AGENT_DEFINITION: AgentDefinition = {
     defaultWriteBack: AGENT_WRITE_BACK_SUMMARY,
     supportedWriteBack: [AGENT_WRITE_BACK_SUMMARY],
   },
-  permissionMode: 'execute',
+  permissionMode: 'ask',
   tools: ['WebSearch'],
   systemPrompt: [
     'You are a foreground web-research child agent.',
@@ -147,7 +184,7 @@ export const WEB_RESEARCH_AGENT_DEFINITION: AgentDefinition = {
 };
 
 export const IMPLEMENTATION_AGENT_DEFINITION: AgentDefinition = {
-  definitionVersion: 1,
+  definitionVersion: 3,
   id: IMPLEMENTATION_AGENT_ID,
   profile: IMPLEMENTATION_AGENT_PROFILE,
   name: 'Implementation',
@@ -160,8 +197,19 @@ export const IMPLEMENTATION_AGENT_DEFINITION: AgentDefinition = {
     defaultWriteBack: AGENT_WRITE_BACK_PATCH,
     supportedWriteBack: [AGENT_WRITE_BACK_PATCH],
   },
-  permissionMode: 'execute',
-  tools: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash'],
+  permissionMode: 'ask',
+  tools: [
+    'Read',
+    'Glob',
+    'Grep',
+    'Write',
+    'Edit',
+    'apply_patch',
+    'Bash',
+    'WriteStdin',
+    'StopBackgroundTask',
+  ],
+  toolGroups: ['file_edit'],
   systemPrompt: [
     'You are a foreground implementation child agent.',
     'Run only inside a dedicated worktree child executor when the host provides one.',
@@ -281,8 +329,7 @@ export function evaluateAgentDefinitionAvailability(input: {
     };
   }
 
-  const byName = new Map(tools.map((tool) => [tool.name, tool]));
-  const missingTools = definition.tools.filter((name) => !byName.has(name));
+  const { missingTools } = resolveAgentDefinitionToolSet(tools, definition);
   if (missingTools.length > 0) {
     return { status: 'unavailable', reason: 'missing_tools', missingTools };
   }
@@ -294,14 +341,36 @@ export function buildToolsForAgentDefinition(
   tools: readonly MakaTool[],
   definition: AgentRuntimeDefinition = LOCAL_READ_AGENT_DEFINITION,
 ): MakaTool[] {
+  return resolveAgentDefinitionToolSet(tools, definition).tools;
+}
+
+function resolveAgentDefinitionToolSet(
+  tools: readonly MakaTool[],
+  definition: AgentRuntimeDefinition,
+): { tools: MakaTool[]; missingTools: string[] } {
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
-  const out: MakaTool[] = [];
-  for (const name of definition.tools) {
-    const tool = byName.get(name);
-    if (!tool) continue;
-    out.push(tool);
+  const groupedToolNames = new Set<string>(
+    (definition.toolGroups ?? []).flatMap((group) =>
+      AGENT_TOOL_GROUP_ALTERNATIVES[group].flatMap((alternative) => alternative),
+    ),
+  );
+  const missingTools = definition.tools.filter(
+    (name) => !groupedToolNames.has(name) && !byName.has(name),
+  );
+  for (const group of definition.toolGroups ?? []) {
+    const alternatives = AGENT_TOOL_GROUP_ALTERNATIVES[group];
+    if (alternatives.some((alternative) => alternative.every((name) => byName.has(name)))) continue;
+    for (const name of alternatives.flat()) {
+      if (!byName.has(name) && !missingTools.includes(name)) missingTools.push(name);
+    }
   }
-  return out;
+  return {
+    tools: definition.tools.flatMap((name) => {
+      const tool = byName.get(name);
+      return tool ? [tool] : [];
+    }),
+    missingTools,
+  };
 }
 
 export function assertAgentDefinitionRunnable(input: {

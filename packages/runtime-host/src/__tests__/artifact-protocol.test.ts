@@ -1,3 +1,23 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { RuntimeHostProtocolError } from '../protocol/errors.js';
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import type { ArtifactRecord } from '@maka/core/artifacts';
@@ -13,34 +33,15 @@ import {
   decodeClientFrame,
   decodeHostFrame,
   encodeArtifactQueryResult,
-  encodeProtocolFrame,
-  HOST_OPERATION_SPECS,
-  RUNTIME_HOST_MAX_FRAME_BYTES,
-  RuntimeHostProtocolError,
+  encodeProtocolMessage,
+  RUNTIME_HOST_MAX_MESSAGE_BYTES,
 } from '../protocol/index.js';
 import { encodeArtifactProjection } from '../protocol/artifact.js';
 
 const revision = `sha256:${'a'.repeat(64)}` as const;
 
 describe('Artifact protocol', () => {
-  test('registers the closed ready ingest, query, and delete operations', () => {
-    assert.deepEqual(
-      Object.keys(HOST_OPERATION_SPECS).filter((key) => key.startsWith('artifact.')),
-      ['artifact.ingest', 'artifact.query', 'artifact.delete'],
-    );
-    assert.deepEqual(metadata('artifact.ingest'), {
-      mode: 'command',
-      availability: 'ready',
-    });
-    assert.deepEqual(metadata('artifact.query'), {
-      mode: 'query',
-      availability: 'ready',
-    });
-    assert.deepEqual(metadata('artifact.delete'), {
-      mode: 'command',
-      availability: 'ready',
-    });
-
+  test('accepts closed Artifact operations and rejects open shapes', () => {
     for (const input of [
       { kind: 'list_start', sessionId: 'session-1' },
       { kind: 'list_continue', sessionId: 'session-1', revision, cursor: '128' },
@@ -53,6 +54,11 @@ describe('Artifact protocol', () => {
     }
     assert.doesNotThrow(() =>
       request('artifact.delete', { sessionId: 'session-1', artifactId: 'artifact-1' }),
+    );
+    assert.doesNotThrow(() => response('artifact.delete', { kind: 'deleted' }));
+    assert.throws(
+      () => response('artifact.delete', { kind: 'deleted', artifact: validArtifact() }),
+      isInvalidFrame,
     );
 
     for (const input of [
@@ -70,7 +76,7 @@ describe('Artifact protocol', () => {
     );
   });
 
-  test('bounds sequential Artifact read chunks below the frame limit', () => {
+  test('bounds sequential Artifact read chunks below the message limit', () => {
     const bytes = Buffer.alloc(ARTIFACT_READ_CHUNK_MAX_BYTES, 9);
     assert.doesNotThrow(() =>
       response('artifact.query', {
@@ -111,7 +117,7 @@ describe('Artifact protocol', () => {
     );
   });
 
-  test('bounds chunked attachment publication below the frame limit', () => {
+  test('bounds chunked attachment publication below the message limit', () => {
     const bytes = Buffer.alloc(ARTIFACT_INGEST_CHUNK_MAX_BYTES, 7);
     const digest = `sha256:${'a'.repeat(64)}`;
     assert.doesNotThrow(() =>
@@ -173,7 +179,7 @@ describe('Artifact protocol', () => {
         uploadId: 'upload-1',
       }),
     );
-    const frame = encodeProtocolFrame({
+    const frame = encodeProtocolMessage({
       requestId: 'artifact-ingest-chunk',
       operation: 'artifact.ingest',
       input: {
@@ -184,7 +190,7 @@ describe('Artifact protocol', () => {
         chunkBase64: bytes.toString('base64'),
       },
     });
-    assert.ok(frame.byteLength <= RUNTIME_HOST_MAX_FRAME_BYTES);
+    assert.ok(frame.byteLength <= RUNTIME_HOST_MAX_MESSAGE_BYTES);
 
     for (const chunkBase64 of [
       Buffer.alloc(ARTIFACT_INGEST_CHUNK_MAX_BYTES + 1).toString('base64'),
@@ -242,19 +248,15 @@ describe('Artifact protocol', () => {
   test('keeps operation failures closed and typed', () => {
     assert.doesNotThrow(() => failure('artifact.delete', 'not_found', 'Artifact was not found'));
     assert.doesNotThrow(() =>
-      failure(
-        'artifact.delete',
-        'operation_conflict',
-        'Protected runtime evidence cannot be deleted through Runtime Host',
-      ),
-    );
-    assert.doesNotThrow(() =>
       failure('artifact.query', 'persistence_failed', 'Artifact projection is unavailable'),
     );
     assert.doesNotThrow(() => failure('artifact.query', 'not_found', 'Session was not found'));
     assert.throws(
       () => failure('artifact.query', 'operation_conflict', 'Protected runtime evidence'),
       isInvalidFrame,
+    );
+    assert.doesNotThrow(() =>
+      failure('artifact.delete', 'operation_conflict', 'Protected runtime evidence'),
     );
     assert.throws(() => failure('artifact.delete', 'outcome_unknown', 'Unknown'), isInvalidFrame);
   });
@@ -372,12 +374,12 @@ describe('Artifact protocol', () => {
       Buffer.byteLength(JSON.stringify(maximumBinary), 'utf8') <= ARTIFACT_RESULT_MAX_BYTES,
     );
     assert.ok(
-      encodeProtocolFrame({
+      encodeProtocolMessage({
         requestId: 'artifact-binary',
         operation: 'artifact.query',
         ok: true,
         result: maximumBinary,
-      }).byteLength <= RUNTIME_HOST_MAX_FRAME_BYTES,
+      }).byteLength <= RUNTIME_HOST_MAX_MESSAGE_BYTES,
     );
   });
 
@@ -412,15 +414,9 @@ function validArtifact() {
     kind: 'file' as const,
     sizeBytes: 4,
     mimeType: 'text/plain',
-    source: 'fixture' as const,
+    source: 'tool_result' as const,
     summary: 'bounded',
-    status: 'live' as const,
   };
-}
-
-function metadata(key: 'artifact.ingest' | 'artifact.query' | 'artifact.delete') {
-  const { mode, availability } = HOST_OPERATION_SPECS[key];
-  return { mode, availability };
 }
 
 function request(
@@ -430,7 +426,10 @@ function request(
   decodeClientFrame({ requestId: 'request', operation, input });
 }
 
-function response(operation: 'artifact.ingest' | 'artifact.query', result: unknown): void {
+function response(
+  operation: 'artifact.ingest' | 'artifact.query' | 'artifact.delete',
+  result: unknown,
+): void {
   decodeHostFrame({ requestId: 'response', operation, ok: true, result });
 }
 

@@ -1,78 +1,50 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import type { SessionEvent } from '@maka/core';
-import { SessionActivityRegistry, type GoalTurnOutcome } from '@maka/runtime';
+import type { SessionEvent } from '@maka/core/events';
+import { SessionActivityRegistry } from '@maka/runtime/goal-turn-lifecycle';
 import { runMakaPiTuiTurn } from '../pi-tui-turn.js';
 
 describe('Maka Pi TUI turn', () => {
-  test('prepares, projects, and settles an external turn after releasing activity', async () => {
+  test('drains an attached turn under one Session activity lease', async () => {
     const activities = new SessionActivityRegistry();
     const sequence: string[] = [];
-    const settled: GoalTurnOutcome[] = [];
 
     const outcome = await runMakaPiTuiTurn({
-      driver: {
-        async preparePrompt(prompt, options) {
-          sequence.push('prepare');
-          assert.equal(prompt, 'visible prompt');
-          assert.deepEqual(options, {
-            modelText: 'expanded prompt',
-            turnOrchestration: { mode: 'swarm', source: 'slash_command' },
-          });
-          return preparedTurn([
-            event({
-              type: 'text_delta',
-              messageId: 'message-1',
-              text: 'working',
-            }),
-            event({ type: 'complete', stopReason: 'end_turn' }),
-          ]);
-        },
-      },
-      lifecycle: {
-        activities,
-        beginObservedTurn: (sessionId, turnId) => {
-          sequence.push('register');
-          assert.equal(sessionId, 'session-1');
-          assert.equal(turnId, 'turn-1');
-          assert.ok(activities.whenIdle(sessionId));
-          return {
-            kind: 'registered',
-            settle: (settledOutcome) => {
-              assert.equal(activities.whenIdle(sessionId), undefined);
-              sequence.push('settle');
-              settled.push(settledOutcome);
-              return Promise.resolve();
-            },
-          };
-        },
-      },
+      turnActivity: { activities },
       request: {
-        kind: 'external',
-        prompt: 'visible prompt',
-        sendText: 'expanded prompt',
-        sessionId: null,
-        turnOrchestration: { mode: 'swarm', source: 'slash_command' },
+        turn: preparedTurn([
+          event({ type: 'text_delta', messageId: 'message-1', text: 'working' }),
+          event({ type: 'complete', stopReason: 'end_turn' }),
+        ]),
       },
       shouldAbort: () => false,
-      onStart: () => {
-        sequence.push('start');
-      },
+      onStart: () => sequence.push('start'),
       onEvent: (sessionEvent) => {
         sequence.push(`event:${sessionEvent.type}`);
       },
     });
 
     assert.deepEqual(outcome, { kind: 'completed', turnId: 'turn-1' });
-    assert.deepEqual(settled, [outcome]);
-    assert.deepEqual(sequence, [
-      'start',
-      'prepare',
-      'register',
-      'event:text_delta',
-      'event:complete',
-      'settle',
-    ]);
+    assert.deepEqual(sequence, ['start', 'event:text_delta', 'event:complete']);
     assert.equal(activities.whenIdle('session-1'), undefined);
   });
 
@@ -81,19 +53,8 @@ describe('Maka Pi TUI turn', () => {
     const failures: string[] = [];
 
     const outcome = await runMakaPiTuiTurn({
-      driver: {
-        async preparePrompt() {
-          return preparedTurn([]);
-        },
-      },
-      lifecycle: {
-        activities,
-        beginObservedTurn: () => ({
-          kind: 'registered',
-          settle: async () => {},
-        }),
-      },
-      request: { kind: 'external', prompt: 'hello', sessionId: null },
+      turnActivity: { activities },
+      request: { turn: preparedTurn([]) },
       shouldAbort: () => false,
       onFailure: (error) => {
         failures.push(errorMessage(error));
@@ -109,41 +70,35 @@ describe('Maka Pi TUI turn', () => {
     assert.equal(activities.whenIdle('session-1'), undefined);
   });
 
-  test('releases existing-session activity when preparation fails', async () => {
+  test('releases the Session activity when the attached stream fails', async () => {
     const activities = new SessionActivityRegistry();
     const failures: string[] = [];
-    let registrations = 0;
 
     const outcome = await runMakaPiTuiTurn({
-      driver: {
-        async preparePrompt() {
-          assert.ok(activities.whenIdle('session-1'));
-          throw new Error('prepare failed');
+      turnActivity: { activities },
+      request: {
+        turn: {
+          sessionId: 'session-1',
+          turnId: 'turn-1',
+          events: failingEvents('stream failed'),
         },
       },
-      lifecycle: {
-        activities,
-        beginObservedTurn: () => {
-          registrations++;
-          return {
-            kind: 'registered',
-            settle: async () => {},
-          };
-        },
-      },
-      request: { kind: 'external', prompt: 'hello', sessionId: 'session-1' },
       shouldAbort: () => false,
       onFailure: (error) => {
         failures.push(errorMessage(error));
       },
     });
 
-    assert.deepEqual(outcome, { kind: 'errored', reason: 'prepare failed' });
-    assert.deepEqual(failures, ['prepare failed']);
-    assert.equal(registrations, 0);
+    assert.deepEqual(outcome, { kind: 'errored', turnId: 'turn-1', reason: 'stream failed' });
+    assert.deepEqual(failures, ['stream failed']);
     assert.equal(activities.whenIdle('session-1'), undefined);
   });
 });
+
+async function* failingEvents(reason: string): AsyncIterable<SessionEvent> {
+  await Promise.resolve();
+  throw new Error(reason);
+}
 
 function preparedTurn(events: readonly SessionEvent[]) {
   return {

@@ -1,5 +1,36 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { z } from 'zod';
-import { isActiveShellRunStatus } from '@maka/core';
+import { jsonSchema, zodSchema } from 'ai';
+import {
+  encodedTerminalInputActionsByteLength,
+  normalizeTerminalInputActionDefaults,
+  parseTerminalInputAction,
+  TERMINAL_INPUT_MODIFIERS,
+  TERMINAL_INPUT_NAMED_KEYS,
+  TERMINAL_MOUSE_BUTTONS,
+  TERMINAL_MOUSE_EVENTS,
+  TERMINAL_MOUSE_SCROLL_DIRECTIONS,
+  type TerminalInputAction,
+} from '@maka/core/terminal-input';
+import { isActiveShellRunStatus } from '@maka/core/shell-run';
 import { redactSecrets } from '@maka/core/redaction';
 import type { ToolResultContent } from '@maka/core/events';
 import type { ToolExecutionFacts } from '@maka/core/permission';
@@ -8,7 +39,14 @@ import type { MakaTool, MakaToolContext } from './tool-runtime.js';
 import type { SandboxType } from './sandbox/types.js';
 import { isLikelySandboxDenial } from './sandbox/detect.js';
 import { runShellWithBoundedTail, type BoundedShellResult } from './shell-exec.js';
-import { bashToolShellGuidance, defaultShellPlan, type ShellPlan } from './shell-detect.js';
+import {
+  bashToolShellGuidance,
+  bashToolTurnShellGuidance,
+  defaultShellPlan,
+  type ShellPlan,
+  throwIfShellSetupFailed,
+  type TurnShellPlan,
+} from './shell-detect.js';
 import { truncateToolOutput } from './tool-output.js';
 import {
   DEFAULT_BASH_TIMEOUT_MS,
@@ -17,6 +55,7 @@ import {
   MAX_FOREGROUND_BASH_TIMEOUT_MS,
   MAX_SHELL_RUN_RESOURCE_REF_CHARS,
   MAX_SHELL_RUN_TIMEOUT_MS,
+  MAX_WRITE_STDIN_ACTIONS,
   MAX_WRITE_STDIN_INPUT_BYTES,
   MIN_PTY_COLS,
   MIN_PTY_ROWS,
@@ -29,8 +68,13 @@ import {
 import type { ChildFdInput } from './child-fd-input.js';
 import { bashToolResultToModelOutput } from './bash-model-output.js';
 import {
+  BASH_REQUIRED_BOUNDARY_DESCRIPTION,
+  bashBoundaryIntentSchema,
   preflightDeclaredSandboxBoundary,
+  preprocessBashBoundaryDeclaration,
+  refineBashBoundaryDeclaration,
   sandboxBoundaryExpansionSchema,
+  selectedBashBoundaryExpansion,
 } from './sandbox-boundary-declaration.js';
 
 export interface ForegroundBashExecuteInput {
@@ -108,23 +152,25 @@ export function buildForegroundBashTool(options: BuildForegroundBashToolOptions)
 }
 
 export function buildLocalForegroundBashTool(
-  options: { executionFacts?: ToolExecutionFacts; shell?: ShellPlan } = {},
+  options: { executionFacts?: ToolExecutionFacts; shell?: TurnShellPlan } = {},
 ): MakaTool {
-  const shell = options.shell ?? defaultShellPlan();
+  const shell = options.shell ?? { plan: defaultShellPlan() };
   return buildForegroundBashTool({
     description:
-      withShellGuidance('Run a shell command in the session cwd.', shell) +
+      withTurnShellGuidance('Run a shell command in the session cwd.', shell) +
       ' Subject to permission policy.',
     ...(options.executionFacts ? { executionFacts: options.executionFacts } : {}),
     defaultTimeoutMs: () => 120_000,
-    execute: async ({ command, cwd, timeoutMs, ctx }) =>
-      runShellWithBoundedTail(command, {
+    execute: async ({ command, cwd, timeoutMs, ctx }) => {
+      throwIfShellSetupFailed(shell);
+      return runShellWithBoundedTail(command, {
         cwd,
         timeoutMs: timeoutMs ?? 120_000,
         abortSignal: ctx.abortSignal,
         emitOutput: ctx.emitOutput,
-        shell,
-      }),
+        shell: shell.plan,
+      });
+    },
   });
 }
 
@@ -132,15 +178,14 @@ export function buildManagedBashTool(
   shellRuns: ShellRunLauncher,
   options: {
     executionFacts?: ToolExecutionFacts;
-    shell?: ShellPlan;
+    shell?: TurnShellPlan;
     /** Opening sentence of the description, before the shared foreground/background/PTY contract. */
     lead?: string;
     /**
      * Whether this host has a sandbox boundary the model can be asked to declare.
-     * False drops `required_boundary` from the schema entirely rather than
-     * accepting and ignoring it: a parameter no host enforces is pure noise in
-     * the model's tool selection. Headless runs inside an external isolation
-     * boundary with no in-process sandbox manager, so it passes false.
+     * False drops `boundary_intent` and `required_boundary` from the schema
+     * entirely rather than accepting and ignoring them: parameters no host
+     * enforces are pure noise in the model's tool selection.
      */
     declareSandboxBoundary?: boolean;
     /**
@@ -180,7 +225,7 @@ export function buildManagedBashTool(
       | undefined;
   } = {},
 ): MakaTool {
-  const shell = options.shell ?? defaultShellPlan();
+  const shell = options.shell ?? { plan: defaultShellPlan() };
   const declareSandboxBoundary = options.declareSandboxBoundary !== false;
   const managedBashFields = {
     command: z.string().describe('The shell command to execute'),
@@ -218,30 +263,33 @@ export function buildManagedBashTool(
     name: 'Bash',
     activityKind: 'command',
     description:
-      withShellGuidance(options.lead ?? 'Run a shell command in the session cwd.', shell) +
+      withTurnShellGuidance(options.lead ?? 'Run a shell command in the session cwd.', shell) +
       ` Foreground is the default (timeout ${DEFAULT_BASH_TIMEOUT_MS}ms, maximum ${MAX_FOREGROUND_BASH_TIMEOUT_MS}ms).` +
       ` Set run_in_background=true only when the command should continue as a tracked runtime background task; background commands have no default timeout (maximum explicit timeout ${MAX_SHELL_RUN_TIMEOUT_MS}ms).` +
       ' Set pty=true together with run_in_background=true only for terminal semantics or later input; use the returned ref with Read or WriteStdin.' +
       (declareSandboxBoundary ? ' Enforced by the current session sandbox boundary.' : ''),
     parameters: declareSandboxBoundary
-      ? z
-          .object({
-            ...managedBashFields,
-            required_boundary: sandboxBoundaryExpansionSchema
-              .optional()
-              .describe(
-                'Declare the exact filesystem or network sandbox authority this command requires. Do not infer it from command text.',
-              ),
-          })
-          .strict()
-          .superRefine(refineManagedBash)
+      ? preprocessBashBoundaryDeclaration(
+          z
+            .object({
+              ...managedBashFields,
+              boundary_intent: bashBoundaryIntentSchema,
+              required_boundary: sandboxBoundaryExpansionSchema
+                .optional()
+                .describe(BASH_REQUIRED_BOUNDARY_DESCRIPTION),
+            })
+            .strict()
+            .superRefine(refineManagedBash)
+            .superRefine(refineBashBoundaryDeclaration),
+        )
       : z.object(managedBashFields).strict().superRefine(refineManagedBash),
     toModelOutput: ({ output }) => bashToolResultToModelOutput(output),
     ...(options.executionFacts ? { executionFacts: options.executionFacts } : {}),
     impl: async (input, ctx) => {
+      throwIfShellSetupFailed(shell);
       const { command, timeout_ms, run_in_background, pty } = input;
       const normalizedRequiredBoundary = await preflightDeclaredSandboxBoundary(
-        'required_boundary' in input ? input.required_boundary : undefined,
+        selectedBashBoundaryExpansion(input),
         ctx,
       );
       const transformed = options.transformCommand?.({
@@ -267,7 +315,7 @@ export function buildManagedBashTool(
           cwd: transformed?.cwd ?? ctx.cwd,
           command,
           ...(pty !== undefined ? { pty } : {}),
-          ...(transformed?.argv ? { argv: transformed.argv } : { shell }),
+          ...(transformed?.argv ? { argv: transformed.argv } : { shell: shell.plan }),
           ...(transformed?.env ? { env: transformed.env } : {}),
           ...(transformed?.fdInputs ? { fdInputs: transformed.fdInputs } : {}),
           ...(timeoutMs !== undefined ? { timeoutMs } : {}),
@@ -321,12 +369,18 @@ export function withShellGuidance(lead: string, shell: ShellPlan): string {
   return guidance ? `${lead} ${guidance}` : lead;
 }
 
+/** {@link withShellGuidance} for a turn-scoped plan, including the broken-preference outage notice. */
+export function withTurnShellGuidance(lead: string, shell: TurnShellPlan): string {
+  const guidance = bashToolTurnShellGuidance(shell);
+  return guidance ? `${lead} ${guidance}` : lead;
+}
+
 export function buildStopBackgroundTaskTool(backgroundTasks: BackgroundTaskStopper): MakaTool {
   return {
     name: 'StopBackgroundTask',
     activityKind: 'command',
     description:
-      'Stop a background task by runtime ref. Currently supports background shell run refs returned by Bash and shown in the turn tail.',
+      'Stop a background task by runtime ref. Currently supports background shell run refs returned by Bash.',
     parameters: z.object({
       ref: z
         .string()
@@ -338,55 +392,301 @@ export function buildStopBackgroundTaskTool(backgroundTasks: BackgroundTaskStopp
   };
 }
 
-export function buildWriteStdinTool(ptyControls: PtyControlWriter): MakaTool {
-  const parameters = z
+/** A syntactically valid PTY ref used only in the documented WriteStdin examples. */
+export const WRITE_STDIN_EXAMPLE_REF = 'maka://runtime/background-tasks/sr_example';
+
+/**
+ * One minimal legal payload per WriteStdin action type (plus a resize-only
+ * call). Each entry is valid under the loose provider schema AND passes strict
+ * validation after normalization — the WriteStdin contract conformance test
+ * asserts both, so the documented shape can never drift from what the runtime
+ * actually accepts. The `key (chord)` entry shows the ctrl-modified printable
+ * form the description points at.
+ */
+export const WRITE_STDIN_MINIMAL_EXAMPLES: readonly {
+  readonly label: string;
+  readonly payload: Readonly<Record<string, unknown>>;
+}[] = [
+  {
+    label: 'text',
+    payload: { ref: WRITE_STDIN_EXAMPLE_REF, actions: [{ type: 'text', text: 'hello' }] },
+  },
+  {
+    label: 'key (named)',
+    payload: { ref: WRITE_STDIN_EXAMPLE_REF, actions: [{ type: 'key', key: 'enter' }] },
+  },
+  {
+    label: 'key (chord)',
+    payload: {
+      ref: WRITE_STDIN_EXAMPLE_REF,
+      actions: [{ type: 'key', key: 'c', modifiers: ['ctrl'] }],
+    },
+  },
+  {
+    label: 'mouse click',
+    payload: {
+      ref: WRITE_STDIN_EXAMPLE_REF,
+      actions: [{ type: 'mouse', event: 'click', x: 0, y: 0, button: 'left' }],
+    },
+  },
+  {
+    label: 'mouse press',
+    payload: {
+      ref: WRITE_STDIN_EXAMPLE_REF,
+      actions: [{ type: 'mouse', event: 'press', x: 0, y: 0, button: 'left' }],
+    },
+  },
+  {
+    label: 'mouse release',
+    payload: {
+      ref: WRITE_STDIN_EXAMPLE_REF,
+      actions: [{ type: 'mouse', event: 'release', x: 0, y: 0, button: 'left' }],
+    },
+  },
+  {
+    label: 'mouse move',
+    payload: {
+      ref: WRITE_STDIN_EXAMPLE_REF,
+      actions: [{ type: 'mouse', event: 'move', x: 1, y: 1 }],
+    },
+  },
+  {
+    label: 'mouse scroll',
+    payload: {
+      ref: WRITE_STDIN_EXAMPLE_REF,
+      actions: [{ type: 'mouse', event: 'scroll', x: 0, y: 0, direction: 'up' }],
+    },
+  },
+  { label: 'resize only', payload: { ref: WRITE_STDIN_EXAMPLE_REF, size: { cols: 80, rows: 24 } } },
+];
+
+/**
+ * The concrete minimal example embedded in the WriteStdin tool description,
+ * derived from the pinned {@link WRITE_STDIN_MINIMAL_EXAMPLES} `key (named)`
+ * entry so the documented shape can never drift from what conformance tests
+ * exercise. The example ref id is templated to `<id>` for human readers.
+ */
+export const WRITE_STDIN_DESCRIPTION_EXAMPLE_JSON = JSON.stringify(
+  (
+    WRITE_STDIN_MINIMAL_EXAMPLES.find((example) => example.label === 'key (named)') ??
+    WRITE_STDIN_MINIMAL_EXAMPLES[0]
+  ).payload,
+).replace('sr_example', '<id>');
+
+/**
+ * Build the two-layer WriteStdin schema pair as a single unit so the
+ * provider-visible (loose) schema and the strict runtime validator can be
+ * exercised together by conformance tests. The loose provider schema exists so
+ * providers that inject `null`/`0`/`''` placeholders are tolerated; the strict
+ * validator (via {@link normalizeProviderWriteStdinInput}) normalizes those away
+ * and enforces the real contract. {@link WRITE_STDIN_MINIMAL_EXAMPLES} pins a
+ * minimal legal payload per action type that must pass BOTH layers.
+ */
+/** The validated shape the strict WriteStdin schema yields after normalization. */
+export interface WriteStdinInput {
+  ref: string;
+  input?: string;
+  actions?: TerminalInputAction[];
+  size?: { cols: number; rows: number };
+}
+
+export function createWriteStdinSchemas(): {
+  providerParameters: z.ZodTypeAny;
+  strictParameters: z.ZodType<WriteStdinInput, unknown>;
+} {
+  const terminalAction = z.unknown().transform((value, context): TerminalInputAction => {
+    try {
+      return parseTerminalInputAction(value);
+    } catch (error) {
+      context.addIssue({
+        code: 'custom',
+        message: error instanceof Error ? error.message : 'Invalid terminal input action',
+      });
+      return value as TerminalInputAction;
+    }
+  });
+  const strictParameters = z.preprocess(
+    normalizeProviderWriteStdinInput,
+    z
+      .object({
+        ref: z
+          .string()
+          .max(MAX_SHELL_RUN_RESOURCE_REF_CHARS)
+          .refine(isShellRunResourceRef, 'ref must be a canonical PTY Bash runtime ref'),
+        input: z
+          .string()
+          .min(1, 'input must not be empty')
+          .refine(isWellFormedTerminalInput, 'input must be well-formed Unicode')
+          .refine(
+            (value) => Buffer.byteLength(value, 'utf8') <= MAX_WRITE_STDIN_INPUT_BYTES,
+            `input must not exceed ${MAX_WRITE_STDIN_INPUT_BYTES} bytes`,
+          )
+          .optional(),
+        actions: z.array(terminalAction).min(1).max(MAX_WRITE_STDIN_ACTIONS).optional(),
+        size: z
+          .object({
+            cols: z.number().int().min(MIN_PTY_COLS).max(MAX_PTY_COLS),
+            rows: z.number().int().min(MIN_PTY_ROWS).max(MAX_PTY_ROWS),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .refine((value) => value.input === undefined || value.actions === undefined, {
+        message: 'raw input and terminal actions are mutually exclusive',
+      })
+      .refine(
+        (value) =>
+          value.input !== undefined || value.actions !== undefined || value.size !== undefined,
+        {
+          message: 'input, actions, and/or size is required',
+        },
+      )
+      .superRefine((value, context) => {
+        if (!value.actions) return;
+        try {
+          if (encodedTerminalInputActionsByteLength(value.actions) > MAX_WRITE_STDIN_INPUT_BYTES) {
+            context.addIssue({
+              code: 'custom',
+              path: ['actions'],
+              message: `actions must not exceed ${MAX_WRITE_STDIN_INPUT_BYTES} encoded bytes`,
+            });
+          }
+        } catch {
+          // The key action reports its own precise validation issue.
+        }
+      }),
+  );
+  const providerAction = z
+    .object({
+      type: z.enum(['text', 'key', 'mouse']).describe('Action kind'),
+      text: z
+        .string()
+        .describe('Visible text for a text action; omit it for a key action')
+        .optional(),
+      key: z
+        .string()
+        .describe(
+          `Named key (${TERMINAL_INPUT_NAMED_KEYS.join(', ')}) or one printable ASCII character for a key action; omit it for a text action`,
+        )
+        .optional(),
+      event: z
+        .enum(TERMINAL_MOUSE_EVENTS)
+        .describe('Mouse event; omit it for text and key actions')
+        .optional(),
+      x: z
+        .number()
+        .int()
+        .min(0)
+        .describe('Zero-based terminal cell column for a mouse action')
+        .optional(),
+      y: z
+        .number()
+        .int()
+        .min(0)
+        .describe('Zero-based terminal cell row for a mouse action')
+        .optional(),
+      button: z
+        .enum(TERMINAL_MOUSE_BUTTONS)
+        .describe('Mouse button; required for click, press, and release')
+        .optional(),
+      direction: z
+        .enum(TERMINAL_MOUSE_SCROLL_DIRECTIONS)
+        .describe('Scroll direction; required only for scroll')
+        .optional(),
+      modifiers: z
+        .array(z.enum(TERMINAL_INPUT_MODIFIERS))
+        .describe('Optional unique modifiers for a key or mouse action')
+        .optional(),
+    })
+    .strict();
+  const providerParameters = z
     .object({
       ref: z
         .string()
         .max(MAX_SHELL_RUN_RESOURCE_REF_CHARS)
-        .refine(isShellRunResourceRef, 'ref must be a canonical PTY Bash runtime ref')
         .describe('The runtime ref returned by a PTY Bash task'),
-      input: z
-        .string()
-        .refine(
-          (value) => value.length > 0,
-          'input must not be empty; omit it for a resize-only call',
-        )
-        .refine(isWellFormedTerminalInput, 'input must be well-formed Unicode')
-        .refine(
-          (value) => Buffer.byteLength(value, 'utf8') <= MAX_WRITE_STDIN_INPUT_BYTES,
-          `input must not exceed ${MAX_WRITE_STDIN_INPUT_BYTES} UTF-8 bytes`,
+      actions: z
+        .array(providerAction)
+        .max(MAX_WRITE_STDIN_ACTIONS)
+        .describe(
+          'Ordered terminal input actions. Text uses type and text. Key uses type, key, and optional modifiers. Mouse uses type, event, zero-based x/y, event-specific button or direction, and optional modifiers. Omit it for a resize-only call.',
         )
         .optional(),
       size: z
         .object({
-          cols: z.number().int().min(MIN_PTY_COLS).max(MAX_PTY_COLS),
-          rows: z.number().int().min(MIN_PTY_ROWS).max(MAX_PTY_ROWS),
+          cols: z.number().describe('Terminal columns').optional(),
+          rows: z.number().describe('Terminal rows').optional(),
         })
         .strict()
         .optional(),
     })
     .strict()
-    .refine((value) => value.input !== undefined || value.size !== undefined, {
-      message: 'input and/or size is required',
-    });
+    .describe('Send ordered terminal actions and/or resize a background PTY');
+  return { providerParameters, strictParameters };
+}
+
+export function buildWriteStdinTool(ptyControls: PtyControlWriter): MakaTool {
+  const { providerParameters, strictParameters } = createWriteStdinSchemas();
+  const providerSchema = zodSchema(providerParameters);
+  const parameters = jsonSchema(async () => await providerSchema.jsonSchema, {
+    validate: async (value) => {
+      const result = await strictParameters.safeParseAsync(value);
+      return result.success
+        ? { success: true, value: result.data }
+        : { success: false, error: result.error };
+    },
+  });
+  const parseInput = (value: unknown) => strictParameters.parse(value);
   return {
     name: 'WriteStdin',
     activityKind: 'command',
     description:
-      'Send exact characters to a background PTY and/or resize it, then return the terminal state at the next parser cut. ' +
-      'No newline is added: use \\r for Enter and \\u0003 for Ctrl-C. Input is ordinary audited tool-call data, not a secure secret channel. ' +
+      'Send an ordered sequence of text, key, and mouse actions to a background PTY and/or resize it, then return the terminal state at the next parser cut. ' +
+      `Named keys are ${TERMINAL_INPUT_NAMED_KEYS.join(', ')}. Use a printable ASCII key with ctrl or alt for chords such as Ctrl-B; use text for ordinary typing. ` +
+      'Mouse coordinates are zero-based terminal cells and work only while the application has enabled SGR cell mouse reporting. ' +
+      'Actions are written atomically in their listed order. Text is ordinary audited tool-call data, not a secure secret channel. ' +
+      `Minimal example: ${WRITE_STDIN_DESCRIPTION_EXAMPLE_JSON}. ` +
       'The returned output is the terminal state at that cut, not output attributed to this input; use Read on the ref to observe later output.',
     parameters,
-    impl: ({ ref, input, size }, ctx) =>
-      ptyControls.writeStdin({
+    permissionArgs: (input) => parseInput(input),
+    impl: (input, ctx) => {
+      const { ref, input: rawInput, actions, size } = parseInput(input);
+      return ptyControls.writeStdin({
         sessionId: ctx.sessionId,
         ref,
-        ...(input !== undefined ? { input } : {}),
+        ...(rawInput !== undefined ? { input: rawInput } : {}),
+        ...(actions !== undefined ? { actions } : {}),
         ...(size !== undefined ? { size } : {}),
         abortSignal: ctx.abortSignal,
-      }),
+      });
+    },
   };
+}
+
+function normalizeProviderWriteStdinInput(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const normalized = { ...(value as Record<string, unknown>) };
+  if (normalized.actions === null || isEmptyArray(normalized.actions)) {
+    delete normalized.actions;
+  } else if (Array.isArray(normalized.actions)) {
+    normalized.actions = normalized.actions.map(normalizeTerminalInputActionDefaults);
+  }
+  if (normalized.size === null || isEmptyProviderSize(normalized.size)) delete normalized.size;
+  return normalized;
+}
+
+function isEmptyArray(value: unknown): value is [] {
+  return Array.isArray(value) && value.length === 0;
+}
+
+function isEmptyProviderSize(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const entries = Object.entries(value as Record<string, unknown>);
+  return (
+    entries.every(([key]) => key === 'cols' || key === 'rows') &&
+    entries.every(([, field]) => field === undefined || field === null || field === 0)
+  );
 }
 
 export function shapeTerminalResult(input: {

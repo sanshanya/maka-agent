@@ -1,13 +1,34 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { isCollaborationMode, type CollaborationMode } from '@maka/core/collaboration';
 import { isOrchestrationMode, type OrchestrationMode } from '@maka/core/orchestration';
 import { isPermissionMode, type PermissionMode } from '@maka/core/permission';
-import { isSessionStartMode, type SessionStartMode } from '@maka/core/explore-agent';
+import { isSessionStartMode, type SessionStartMode } from '@maka/core/session-start-mode';
 import {
   isSessionBlockedReason,
-  isSessionStatus,
+  isSessionToolProfile,
+  type PersistedBackendKind,
   type SessionBlockedReason,
   type SessionStatus,
   type SessionSubagentProjection,
+  type SessionToolProfile,
 } from '@maka/core/session';
 import { isThinkingLevel, type ThinkingLevel } from '@maka/core/model-thinking';
 import type { ExecutionBoundarySummary } from '@maka/core/sandbox-boundary';
@@ -23,21 +44,30 @@ import {
   requireUtf8String,
 } from './codec.js';
 import { invalidProtocolFrame } from './errors.js';
-import { defineOperation } from './operation-spec.js';
+import { defineHostPathOperation, defineOperation } from './operation-spec.js';
+import { decodeSessionStatus } from './session-status.js';
+import {
+  decodeWorkspaceProjection,
+  decodeWorkspaceTarget,
+  type WorkspaceProjection,
+  type WorkspaceTarget,
+  WORKSPACE_HOST_PATH_MAX_BYTES,
+} from './workspace.js';
 
 export type { SessionSubagentProjection } from '@maka/core/session';
 
 export const SESSION_CATALOG_PAGE_MAX_ITEMS = 32;
 export const SESSION_CATALOG_RESULT_MAX_BYTES = 48 * 1024;
 export const SESSION_CATALOG_CURSOR_MAX_BYTES = 512;
-export const SESSION_CATALOG_CWD_MAX_BYTES = 4 * 1024;
+export const SESSION_CATALOG_CWD_MAX_BYTES = WORKSPACE_HOST_PATH_MAX_BYTES;
 export const SESSION_CATALOG_NAME_MAX_BYTES = 320;
 export const SESSION_CATALOG_LABEL_MAX_ITEMS = 32;
 export const SESSION_CATALOG_LABEL_MAX_BYTES = 128;
 export const SESSION_CATALOG_PREVIEW_MAX_BYTES = 4 * 1024;
 export const SESSION_CATALOG_MODEL_MAX_BYTES = 512;
 export const SESSION_CATALOG_CONNECTION_SLUG_MAX_BYTES = 256;
-export const SESSION_CATALOG_PROJECT_ID_MAX_BYTES = 256;
+export const SESSION_CATALOG_LIVE_RUN_STATE_SCHEMA_VERSION = 1 as const;
+export const SESSION_CATALOG_RUNNING_TURN_MAX_ITEMS = 64;
 
 const QUERY_ERRORS = [
   'host_not_ready',
@@ -60,9 +90,9 @@ const EXECUTION_BOUNDARY_QUERY_ERRORS = [...QUERY_ERRORS, 'not_found'] as const;
 const PROJECTION_REQUIRED_FIELDS = [
   'id',
   'revision',
-  'cwd',
+  'workspace',
   'createdAt',
-  'lastUsedAt',
+  'activityAt',
   'name',
   'isFlagged',
   'isArchived',
@@ -71,6 +101,7 @@ const PROJECTION_REQUIRED_FIELDS = [
   'hasUnread',
   'status',
   'backend',
+  'llmConnectionId',
   'llmConnectionSlug',
   'connectionLocked',
   'model',
@@ -80,7 +111,6 @@ const PROJECTION_REQUIRED_FIELDS = [
 ] as const;
 const PROJECTION_FIELDS = [
   ...PROJECTION_REQUIRED_FIELDS,
-  'projectId',
   'lastMessageAt',
   'lastMessagePreview',
   'blockedReason',
@@ -95,21 +125,15 @@ const PROJECTION_FIELDS = [
   'revisionState',
   'thinkingLevel',
   'lastReadMessageId',
+  'liveRunState',
 ] as const;
 
 export type SessionCatalogRevision = `sha256:${string}`;
 
-export interface SessionCatalogFilter {
-  readonly isArchived?: boolean;
-  readonly isFlagged?: boolean;
-  readonly labelSlug?: string;
-}
-
 export type SessionCatalogQueryInput =
-  | { readonly kind: 'list_start'; readonly filter?: SessionCatalogFilter }
+  | { readonly kind: 'list_start' }
   | {
       readonly kind: 'list_continue';
-      readonly filter?: SessionCatalogFilter;
       readonly revision: SessionCatalogRevision;
       readonly cursor: string;
     }
@@ -119,19 +143,20 @@ export type SessionModelTarget =
   | { readonly kind: 'default' }
   | {
       readonly kind: 'explicit';
+      readonly connectionId: string;
       readonly connectionSlug: string;
       readonly model: string;
     };
 
 export interface SessionCreateInput {
   readonly sessionId: string;
-  readonly cwd: string;
+  readonly workspace: WorkspaceTarget;
   readonly mode?: SessionStartMode;
-  readonly projectId?: string | null;
   readonly name?: string;
   readonly labels?: readonly string[];
   readonly modelTarget: SessionModelTarget;
   readonly thinkingLevel?: ThinkingLevel;
+  readonly toolProfile?: SessionToolProfile;
   readonly permissionMode?: PermissionMode;
   readonly collaborationMode?: CollaborationMode;
   readonly orchestrationMode?: OrchestrationMode;
@@ -141,7 +166,6 @@ export interface SessionMetadataPatch {
   readonly name?: string;
   readonly labels?: readonly string[];
   readonly isFlagged?: boolean;
-  readonly projectId?: string | null;
 }
 
 export interface SessionMetadataUpdateInput {
@@ -150,25 +174,24 @@ export interface SessionMetadataUpdateInput {
   readonly patch: SessionMetadataPatch;
 }
 
-export interface SessionConfiguration {
-  readonly modelTarget: SessionModelTarget;
-  readonly thinkingLevel: ThinkingLevel | null;
-  readonly permissionMode: PermissionMode;
-  readonly collaborationMode: CollaborationMode;
-  readonly orchestrationMode: OrchestrationMode;
+export interface SessionConfigurationPatch {
+  readonly modelTarget?: Extract<SessionModelTarget, { readonly kind: 'explicit' }>;
+  readonly thinkingLevel?: ThinkingLevel | null;
+  readonly permissionMode?: PermissionMode;
+  readonly collaborationMode?: CollaborationMode;
+  readonly orchestrationMode?: OrchestrationMode;
 }
 
 export interface SessionConfigurationUpdateInput {
   readonly sessionId: string;
   readonly expectedRevision: number;
-  readonly configuration: SessionConfiguration;
+  readonly patch: SessionConfigurationPatch;
 }
 
-export interface SessionCwdRelocateInput {
+export interface SessionWorkspaceRelocateInput {
   readonly sessionId: string;
   readonly expectedRevision: number;
-  readonly cwd: string;
-  readonly projectId?: string | null;
+  readonly workspace: WorkspaceTarget;
 }
 
 export interface SessionReadMarkerSetInput {
@@ -180,13 +203,17 @@ export interface SessionExecutionBoundaryQueryInput {
   readonly sessionId: string;
 }
 
+export interface SessionCatalogLiveRunState {
+  readonly schemaVersion: typeof SESSION_CATALOG_LIVE_RUN_STATE_SCHEMA_VERSION;
+  readonly runningTurnIds: readonly string[];
+}
+
 export interface SessionCatalogProjection {
   readonly id: string;
   readonly revision: number;
-  readonly cwd: string;
-  readonly projectId?: string | null;
+  readonly workspace: WorkspaceProjection;
   readonly createdAt: number;
-  readonly lastUsedAt: number;
+  readonly activityAt: number;
   readonly name: string;
   readonly isFlagged: boolean;
   readonly isArchived: boolean;
@@ -197,6 +224,7 @@ export interface SessionCatalogProjection {
   readonly lastMessageAt?: number;
   readonly lastMessagePreview?: string;
   readonly status: SessionStatus;
+  readonly liveRunState?: SessionCatalogLiveRunState;
   readonly blockedReason?: SessionBlockedReason;
   readonly statusUpdatedAt?: number;
   readonly parentSessionId?: string;
@@ -207,7 +235,8 @@ export interface SessionCatalogProjection {
   readonly revisionOfTurnId?: string;
   readonly revisionIndex?: number;
   readonly revisionState?: 'preparing' | 'committed';
-  readonly backend: 'ai-sdk' | 'fake' | 'pi-agent';
+  readonly backend: PersistedBackendKind;
+  readonly llmConnectionId: string | null;
   readonly llmConnectionSlug: string;
   readonly connectionLocked: boolean;
   readonly model: string;
@@ -224,7 +253,28 @@ export interface UnsupportedLegacySessionCatalogRecord {
   readonly reason: 'not_wire_representable';
 }
 
+export interface SharedSessionCatalogProjection {
+  readonly kind: 'shared_session';
+  readonly id: string;
+  readonly revision: number;
+  readonly createdAt: number;
+  readonly activityAt: number;
+  readonly name: string;
+  readonly lastMessageAt?: number;
+  readonly lastMessagePreview?: string;
+  readonly status: SessionStatus;
+  readonly liveRunState?: SessionCatalogLiveRunState;
+  readonly blockedReason?: SessionBlockedReason;
+  readonly statusUpdatedAt?: number;
+}
+
 export type SessionCatalogItem = SessionCatalogProjection | UnsupportedLegacySessionCatalogRecord;
+
+export type SharedSessionCatalogQueryInput = Record<string, never>;
+
+export interface SharedSessionCatalogQueryResult {
+  readonly session: SharedSessionCatalogProjection | null;
+}
 
 export type SessionCatalogQueryResult =
   | {
@@ -252,6 +302,17 @@ export type SessionUpdateResult =
     };
 
 export const SESSION_CATALOG_OPERATION_SPECS = {
+  'session.shared.query': defineOperation<
+    SharedSessionCatalogQueryInput,
+    SharedSessionCatalogQueryResult,
+    (typeof QUERY_ERRORS)[number]
+  >({
+    mode: 'query',
+    availability: 'ready',
+    errors: QUERY_ERRORS,
+    decodeInput: decodeSharedSessionCatalogQueryInput,
+    decodeOutput: decodeSharedSessionCatalogQueryResult,
+  }),
   'session.catalog.query': defineOperation<
     SessionCatalogQueryInput,
     SessionCatalogQueryResult,
@@ -263,18 +324,21 @@ export const SESSION_CATALOG_OPERATION_SPECS = {
     decodeInput: decodeSessionCatalogQueryInput,
     decodeOutput: decodeSessionCatalogQueryResult,
   }),
-  'session.create': defineOperation<
+  'session.create': defineHostPathOperation<
     SessionCreateInput,
     SessionCatalogItem,
     (typeof CREATE_ERRORS)[number]
-  >({
-    mode: 'command',
-    availability: 'ready',
-    errors: CREATE_ERRORS,
-    decodeInput: decodeSessionCreateInput,
-    decodeOutput: decodeSessionCatalogItem,
-    assertOutputForInput: (input, output) => assertSessionIdentity(input.sessionId, output),
-  }),
+  >(
+    {
+      mode: 'command',
+      availability: 'ready',
+      errors: CREATE_ERRORS,
+      decodeInput: decodeSessionCreateInput,
+      decodeOutput: decodeSessionCatalogItem,
+      assertOutputForInput: (input, output) => assertSessionIdentity(input.sessionId, output),
+    },
+    (input) => input.workspace.kind === 'host_path',
+  ),
   'session.metadata.update': defineOperation<
     SessionMetadataUpdateInput,
     SessionUpdateResult,
@@ -299,18 +363,21 @@ export const SESSION_CATALOG_OPERATION_SPECS = {
     decodeOutput: decodeSessionUpdateResult,
     assertOutputForInput: assertUpdateOutputIdentity,
   }),
-  'session.cwd.relocate': defineOperation<
-    SessionCwdRelocateInput,
+  'session.workspace.relocate': defineHostPathOperation<
+    SessionWorkspaceRelocateInput,
     SessionUpdateResult,
     (typeof CONFIGURATION_UPDATE_ERRORS)[number]
-  >({
-    mode: 'command',
-    availability: 'ready',
-    errors: CONFIGURATION_UPDATE_ERRORS,
-    decodeInput: decodeSessionCwdRelocateInput,
-    decodeOutput: decodeSessionUpdateResult,
-    assertOutputForInput: assertUpdateOutputIdentity,
-  }),
+  >(
+    {
+      mode: 'command',
+      availability: 'ready',
+      errors: CONFIGURATION_UPDATE_ERRORS,
+      decodeInput: decodeSessionWorkspaceRelocateInput,
+      decodeOutput: decodeSessionUpdateResult,
+      assertOutputForInput: assertUpdateOutputIdentity,
+    },
+    (input) => input.workspace.kind === 'host_path',
+  ),
   'session.read_marker.set': defineOperation<
     SessionReadMarkerSetInput,
     SessionCatalogItem,
@@ -335,6 +402,49 @@ export const SESSION_CATALOG_OPERATION_SPECS = {
     decodeOutput: decodeExecutionBoundarySummary,
   }),
 } as const;
+
+function decodeSharedSessionCatalogQueryInput(value: unknown): SharedSessionCatalogQueryInput {
+  requireExactRecord(value, 'shared Session catalog query input', []);
+  return {};
+}
+
+function decodeSharedSessionCatalogQueryResult(value: unknown): SharedSessionCatalogQueryResult {
+  const record = requireExactRecord(value, 'shared Session catalog query result', ['session']);
+  const session =
+    record.session === null ? null : decodeSharedSessionCatalogProjection(record.session);
+  requireEncodedByteLimit(
+    session,
+    'shared Session catalog result',
+    SESSION_CATALOG_RESULT_MAX_BYTES,
+  );
+  return { session };
+}
+
+export function decodeSharedSessionCatalogProjection(
+  value: unknown,
+): SharedSessionCatalogProjection {
+  const exact = requireShapedRecord(
+    value,
+    'shared Session catalog projection',
+    ['kind', 'id', 'revision', 'createdAt', 'activityAt', 'name', 'status'],
+    ['lastMessageAt', 'lastMessagePreview', 'liveRunState', 'blockedReason', 'statusUpdatedAt'],
+  );
+  if (exact.kind !== 'shared_session') throw invalidProtocolFrame('Invalid shared Session kind');
+  return {
+    kind: 'shared_session',
+    id: requireEntityId(exact.id, 'Session id'),
+    revision: positiveRevision(exact.revision, 'Session revision'),
+    createdAt: timestamp(exact.createdAt, 'Session createdAt'),
+    activityAt: timestamp(exact.activityAt, 'Session activityAt'),
+    name: sessionName(exact.name),
+    ...optionalTimestamp(exact, 'lastMessageAt'),
+    ...optionalText(exact, 'lastMessagePreview', SESSION_CATALOG_PREVIEW_MAX_BYTES),
+    status: decodeSessionStatus(exact.status),
+    ...optionalLiveRunState(exact),
+    ...optionalBlockedReason(exact),
+    ...optionalTimestamp(exact, 'statusUpdatedAt'),
+  };
+}
 
 export function decodeSessionExecutionBoundaryQueryInput(
   value: unknown,
@@ -373,27 +483,17 @@ export function decodeExecutionBoundarySummary(value: unknown): ExecutionBoundar
 export function decodeSessionCatalogQueryInput(value: unknown): SessionCatalogQueryInput {
   const input = requireRecord(value, 'Session catalog query input');
   if (input.kind === 'list_start') {
-    const exact = requireShapedRecord(
-      input,
-      'Session catalog list start input',
-      ['kind'],
-      ['filter'],
-    );
-    return {
-      kind: 'list_start',
-      ...(Object.hasOwn(exact, 'filter') ? { filter: decodeFilter(exact.filter) } : {}),
-    };
+    requireExactRecord(input, 'Session catalog list start input', ['kind']);
+    return { kind: 'list_start' };
   }
   if (input.kind === 'list_continue') {
-    const exact = requireShapedRecord(
-      input,
-      'Session catalog list continuation input',
-      ['kind', 'revision', 'cursor'],
-      ['filter'],
-    );
+    const exact = requireExactRecord(input, 'Session catalog list continuation input', [
+      'kind',
+      'revision',
+      'cursor',
+    ]);
     return {
       kind: 'list_continue',
-      ...(Object.hasOwn(exact, 'filter') ? { filter: decodeFilter(exact.filter) } : {}),
       revision: catalogRevision(exact.revision),
       cursor: requireUtf8String(
         exact.cursor,
@@ -413,13 +513,13 @@ export function decodeSessionCreateInput(value: unknown): SessionCreateInput {
   const input = requireShapedRecord(
     value,
     'Session create input',
-    ['sessionId', 'cwd', 'modelTarget'],
+    ['sessionId', 'workspace', 'modelTarget'],
     [
       'mode',
-      'projectId',
       'name',
       'labels',
       'thinkingLevel',
+      'toolProfile',
       'permissionMode',
       'collaborationMode',
       'orchestrationMode',
@@ -427,25 +527,16 @@ export function decodeSessionCreateInput(value: unknown): SessionCreateInput {
   );
   return {
     sessionId: requireEntityId(input.sessionId, 'sessionId'),
-    cwd: requireUtf8String(input.cwd, 'Session cwd', SESSION_CATALOG_CWD_MAX_BYTES),
+    workspace: decodeWorkspaceTarget(input.workspace),
     ...(Object.hasOwn(input, 'mode') ? { mode: sessionStartMode(input.mode) } : {}),
-    ...(Object.hasOwn(input, 'projectId')
-      ? {
-          projectId:
-            input.projectId === null
-              ? null
-              : boundedText(
-                  input.projectId,
-                  'Session project id',
-                  SESSION_CATALOG_PROJECT_ID_MAX_BYTES,
-                ),
-        }
-      : {}),
     ...(Object.hasOwn(input, 'name') ? { name: sessionName(input.name) } : {}),
     ...(Object.hasOwn(input, 'labels') ? { labels: labels(input.labels) } : {}),
     modelTarget: modelTarget(input.modelTarget),
     ...(Object.hasOwn(input, 'thinkingLevel')
       ? { thinkingLevel: thinkingLevel(input.thinkingLevel) }
+      : {}),
+    ...(Object.hasOwn(input, 'toolProfile')
+      ? { toolProfile: sessionToolProfile(input.toolProfile) }
       : {}),
     ...(Object.hasOwn(input, 'permissionMode')
       ? { permissionMode: permissionMode(input.permissionMode) }
@@ -457,6 +548,11 @@ export function decodeSessionCreateInput(value: unknown): SessionCreateInput {
       ? { orchestrationMode: orchestrationMode(input.orchestrationMode) }
       : {}),
   };
+}
+
+function sessionToolProfile(value: unknown): SessionToolProfile {
+  if (!isSessionToolProfile(value)) throw invalidProtocolFrame('Invalid Session tool profile');
+  return value;
 }
 
 function sessionStartMode(value: unknown): SessionStartMode {
@@ -474,7 +570,7 @@ export function decodeSessionMetadataUpdateInput(value: unknown): SessionMetadat
     input.patch,
     'Session metadata patch',
     [],
-    ['name', 'labels', 'isFlagged', 'projectId'],
+    ['name', 'labels', 'isFlagged'],
   );
   if (Object.keys(patch).length === 0) {
     throw invalidProtocolFrame('Session metadata patch is empty');
@@ -488,18 +584,6 @@ export function decodeSessionMetadataUpdateInput(value: unknown): SessionMetadat
       ...(Object.hasOwn(patch, 'isFlagged')
         ? { isFlagged: boolean(patch.isFlagged, 'Session flagged state') }
         : {}),
-      ...(Object.hasOwn(patch, 'projectId')
-        ? {
-            projectId:
-              patch.projectId === null
-                ? null
-                : boundedText(
-                    patch.projectId,
-                    'Session project id',
-                    SESSION_CATALOG_PROJECT_ID_MAX_BYTES,
-                  ),
-          }
-        : {}),
     },
   };
 }
@@ -510,52 +594,52 @@ export function decodeSessionConfigurationUpdateInput(
   const input = requireExactRecord(value, 'Session configuration update input', [
     'sessionId',
     'expectedRevision',
-    'configuration',
+    'patch',
   ]);
-  const configuration = requireExactRecord(input.configuration, 'Session configuration', [
-    'modelTarget',
-    'thinkingLevel',
-    'permissionMode',
-    'collaborationMode',
-    'orchestrationMode',
-  ]);
+  const patch = requireShapedRecord(
+    input.patch,
+    'Session configuration patch',
+    [],
+    ['modelTarget', 'thinkingLevel', 'permissionMode', 'collaborationMode', 'orchestrationMode'],
+  );
+  if (Object.keys(patch).length === 0) {
+    throw invalidProtocolFrame('Session configuration patch is empty');
+  }
   return {
     sessionId: requireEntityId(input.sessionId, 'sessionId'),
     expectedRevision: positiveRevision(input.expectedRevision, 'expected Session revision'),
-    configuration: {
-      modelTarget: modelTarget(configuration.modelTarget),
-      thinkingLevel:
-        configuration.thinkingLevel === null ? null : thinkingLevel(configuration.thinkingLevel),
-      permissionMode: permissionMode(configuration.permissionMode),
-      collaborationMode: collaborationMode(configuration.collaborationMode),
-      orchestrationMode: orchestrationMode(configuration.orchestrationMode),
+    patch: {
+      ...(Object.hasOwn(patch, 'modelTarget')
+        ? { modelTarget: explicitModelTarget(patch.modelTarget) }
+        : {}),
+      ...(Object.hasOwn(patch, 'thinkingLevel')
+        ? {
+            thinkingLevel: patch.thinkingLevel === null ? null : thinkingLevel(patch.thinkingLevel),
+          }
+        : {}),
+      ...(Object.hasOwn(patch, 'permissionMode')
+        ? { permissionMode: permissionMode(patch.permissionMode) }
+        : {}),
+      ...(Object.hasOwn(patch, 'collaborationMode')
+        ? { collaborationMode: collaborationMode(patch.collaborationMode) }
+        : {}),
+      ...(Object.hasOwn(patch, 'orchestrationMode')
+        ? { orchestrationMode: orchestrationMode(patch.orchestrationMode) }
+        : {}),
     },
   };
 }
 
-export function decodeSessionCwdRelocateInput(value: unknown): SessionCwdRelocateInput {
-  const input = requireShapedRecord(
-    value,
-    'Session cwd relocate input',
-    ['sessionId', 'expectedRevision', 'cwd'],
-    ['projectId'],
-  );
+export function decodeSessionWorkspaceRelocateInput(value: unknown): SessionWorkspaceRelocateInput {
+  const input = requireExactRecord(value, 'Session workspace relocate input', [
+    'sessionId',
+    'expectedRevision',
+    'workspace',
+  ]);
   return {
     sessionId: requireEntityId(input.sessionId, 'sessionId'),
     expectedRevision: positiveRevision(input.expectedRevision, 'expected Session revision'),
-    cwd: requireUtf8String(input.cwd, 'Session cwd', SESSION_CATALOG_CWD_MAX_BYTES),
-    ...(Object.hasOwn(input, 'projectId')
-      ? {
-          projectId:
-            input.projectId === null
-              ? null
-              : boundedText(
-                  input.projectId,
-                  'Session project id',
-                  SESSION_CATALOG_PROJECT_ID_MAX_BYTES,
-                ),
-        }
-      : {}),
+    workspace: decodeWorkspaceTarget(input.workspace),
   };
 }
 
@@ -651,10 +735,9 @@ export function decodeSessionCatalogProjection(value: unknown): SessionCatalogPr
   const projection: SessionCatalogProjection = {
     id: requireEntityId(record.id, 'Session id'),
     revision: positiveRevision(record.revision, 'Session revision'),
-    cwd: requireUtf8String(record.cwd, 'Session cwd', SESSION_CATALOG_CWD_MAX_BYTES),
-    ...optionalProjectId(record),
+    workspace: decodeWorkspaceProjection(record.workspace),
     createdAt: timestamp(record.createdAt, 'Session createdAt'),
-    lastUsedAt: timestamp(record.lastUsedAt, 'Session lastUsedAt'),
+    activityAt: timestamp(record.activityAt, 'Session activityAt'),
     name: sessionName(record.name),
     isFlagged: boolean(record.isFlagged, 'Session flagged state'),
     isArchived: boolean(record.isArchived, 'Session archived state'),
@@ -664,7 +747,8 @@ export function decodeSessionCatalogProjection(value: unknown): SessionCatalogPr
     ...optionalEntityId(record, 'lastReadMessageId'),
     ...optionalTimestamp(record, 'lastMessageAt'),
     ...optionalText(record, 'lastMessagePreview', SESSION_CATALOG_PREVIEW_MAX_BYTES),
-    status: sessionStatus(record.status),
+    status: decodeSessionStatus(record.status),
+    ...optionalLiveRunState(record),
     ...optionalBlockedReason(record),
     ...optionalTimestamp(record, 'statusUpdatedAt'),
     ...optionalEntityId(record, 'parentSessionId'),
@@ -676,6 +760,10 @@ export function decodeSessionCatalogProjection(value: unknown): SessionCatalogPr
     ...optionalRevisionIndex(record),
     ...optionalRevisionState(record),
     backend: backend(record.backend),
+    llmConnectionId:
+      record.llmConnectionId === null
+        ? null
+        : requireEntityId(record.llmConnectionId, 'Session Connection id'),
     llmConnectionSlug: requireUtf8String(
       record.llmConnectionSlug,
       'Session connection slug',
@@ -718,32 +806,6 @@ export function decodeSessionCatalogItem(value: unknown): SessionCatalogItem {
   };
 }
 
-function decodeFilter(value: unknown): SessionCatalogFilter {
-  const filter = requireShapedRecord(
-    value,
-    'Session catalog filter',
-    [],
-    ['isArchived', 'isFlagged', 'labelSlug'],
-  );
-  return {
-    ...(Object.hasOwn(filter, 'isArchived')
-      ? { isArchived: boolean(filter.isArchived, 'Session archived filter') }
-      : {}),
-    ...(Object.hasOwn(filter, 'isFlagged')
-      ? { isFlagged: boolean(filter.isFlagged, 'Session flagged filter') }
-      : {}),
-    ...(Object.hasOwn(filter, 'labelSlug')
-      ? {
-          labelSlug: boundedText(
-            filter.labelSlug,
-            'Session label filter',
-            SESSION_CATALOG_LABEL_MAX_BYTES,
-          ),
-        }
-      : {}),
-  };
-}
-
 function modelTarget(value: unknown): SessionModelTarget {
   const target = requireRecord(value, 'Session model target');
   if (target.kind === 'default') {
@@ -753,11 +815,13 @@ function modelTarget(value: unknown): SessionModelTarget {
   if (target.kind === 'explicit') {
     const exact = requireExactRecord(target, 'explicit Session model target', [
       'kind',
+      'connectionId',
       'connectionSlug',
       'model',
     ]);
     return {
       kind: 'explicit',
+      connectionId: requireEntityId(exact.connectionId, 'Session Connection id'),
       connectionSlug: requireUtf8String(
         exact.connectionSlug,
         'Session connection slug',
@@ -767,6 +831,16 @@ function modelTarget(value: unknown): SessionModelTarget {
     };
   }
   throw invalidProtocolFrame('Invalid Session model target');
+}
+
+function explicitModelTarget(
+  value: unknown,
+): Extract<SessionModelTarget, { readonly kind: 'explicit' }> {
+  const target = modelTarget(value);
+  if (target.kind !== 'explicit') {
+    throw invalidProtocolFrame('Session configuration model target must be explicit');
+  }
+  return target;
 }
 
 function labels(value: unknown): readonly string[] {
@@ -780,18 +854,6 @@ function labels(value: unknown): readonly string[] {
     throw invalidProtocolFrame('Duplicate Session label');
   }
   return decoded;
-}
-
-function optionalProjectId(
-  record: Record<string, unknown>,
-): Pick<SessionCatalogProjection, 'projectId'> | Record<string, never> {
-  if (!Object.hasOwn(record, 'projectId')) return {};
-  return {
-    projectId:
-      record.projectId === null
-        ? null
-        : boundedText(record.projectId, 'Session project id', SESSION_CATALOG_PROJECT_ID_MAX_BYTES),
-  };
 }
 
 function optionalTimestamp<Field extends 'lastMessageAt' | 'statusUpdatedAt'>(
@@ -849,6 +911,38 @@ function optionalBlockedReason(
   return { blockedReason: record.blockedReason };
 }
 
+function optionalLiveRunState(
+  record: Record<string, unknown>,
+): Pick<SessionCatalogProjection, 'liveRunState'> | Record<string, never> {
+  if (record.liveRunState === undefined) return {};
+  const state = requireExactRecord(record.liveRunState, 'Session catalog live run state', [
+    'schemaVersion',
+    'runningTurnIds',
+  ]);
+  if (state.schemaVersion !== SESSION_CATALOG_LIVE_RUN_STATE_SCHEMA_VERSION) {
+    throw invalidProtocolFrame('Unsupported Session catalog live run state schema version');
+  }
+  if (
+    !Array.isArray(state.runningTurnIds) ||
+    state.runningTurnIds.length > SESSION_CATALOG_RUNNING_TURN_MAX_ITEMS
+  ) {
+    throw invalidProtocolFrame('Invalid Session catalog running turn ids');
+  }
+  const runningTurnIds: string[] = [];
+  for (let index = 0; index < state.runningTurnIds.length; index += 1) {
+    runningTurnIds.push(requireEntityId(state.runningTurnIds[index], 'Session running turn id'));
+  }
+  if (new Set(runningTurnIds).size !== runningTurnIds.length) {
+    throw invalidProtocolFrame('Duplicate Session catalog running turn id');
+  }
+  return {
+    liveRunState: {
+      schemaVersion: SESSION_CATALOG_LIVE_RUN_STATE_SCHEMA_VERSION,
+      runningTurnIds,
+    },
+  };
+}
+
 function optionalSubagent(
   record: Record<string, unknown>,
 ): Pick<SessionCatalogProjection, 'subagent'> | Record<string, never> {
@@ -899,13 +993,11 @@ function optionalThinkingLevel(
   return { thinkingLevel: thinkingLevel(record.thinkingLevel) };
 }
 
-function sessionStatus(value: unknown): SessionStatus {
-  if (!isSessionStatus(value)) throw invalidProtocolFrame('Invalid Session status');
-  return value;
-}
-
+// `'fake'` stays accepted on decode: the projection carries the session
+// header's durable backend, and rows written by builds that shipped
+// FakeBackend still hold it (#3211).
 function backend(value: unknown): SessionCatalogProjection['backend'] {
-  if (value !== 'ai-sdk' && value !== 'fake' && value !== 'pi-agent') {
+  if (value !== 'ai-sdk' && value !== 'fake') {
     throw invalidProtocolFrame('Invalid Session backend');
   }
   return value;
@@ -971,7 +1063,10 @@ function boolean(value: unknown, label: string): boolean {
 }
 
 function assertUpdateOutputIdentity(
-  input: SessionMetadataUpdateInput | SessionConfigurationUpdateInput | SessionCwdRelocateInput,
+  input:
+    | SessionMetadataUpdateInput
+    | SessionConfigurationUpdateInput
+    | SessionWorkspaceRelocateInput,
   output: SessionUpdateResult,
 ): void {
   if (output.kind === 'committed') assertSessionIdentity(input.sessionId, output.session);

@@ -1,75 +1,79 @@
-import type { CreateSessionInput } from '@maka/core';
-import { isProjectPathMismatchError, type ProjectCatalog } from '@maka/storage';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
-export type DesktopCreateSessionInput = Omit<CreateSessionInput, 'cwd'> & {
-  cwd?: string;
-};
+import type { ProjectCatalog } from '@maka/storage/project-catalog';
+import type { WorkspaceTarget } from '@maka/runtime-host/protocol';
 
-export async function resolveDesktopSessionSelection(
-  input: DesktopCreateSessionInput,
-  selection: {
-    current(): Promise<{
-      projectId: string | null | undefined;
-      path: string;
-    }>;
-    select(
-      projectId: unknown,
-    ): Promise<{ project: { id: string } | null; path: string }>;
-  },
-): Promise<CreateSessionInput> {
-  if (input.cwd) return { ...input, cwd: input.cwd };
-
-  if (input.projectId !== undefined) {
-    const selected = await selection.select(input.projectId);
-    return {
-      ...input,
-      cwd: selected.path,
-      projectId: selected.project?.id ?? null,
-    };
-  }
-
-  const selected = await selection.current();
-  return {
-    ...input,
-    cwd: selected.path,
-    projectId: selected.projectId,
-  };
+export interface DesktopSessionWorkspaceInput {
+  readonly cwd?: string;
+  readonly projectId?: string | null;
 }
 
-export async function resolveNewSessionProjectInput(
-  input: CreateSessionInput,
-  catalog: Pick<ProjectCatalog, 'list' | 'register' | 'touch'>,
-): Promise<CreateSessionInput> {
-  if (input.projectId === null) {
-    return input;
-  }
+interface DesktopSessionWorkspaceSelection {
+  current(): Promise<{ projectId: string | null | undefined; path: string }>;
+  select(projectId: unknown): Promise<{ project: { id: string } | null; path: string }>;
+  defaultProjectId?(): Promise<string | undefined>;
+}
 
-  if (input.projectId) {
-    const project = (await catalog.list()).find(
-      (candidate) =>
-        candidate.id === input.projectId || candidate.aliases?.includes(input.projectId!),
-    );
-    if (!project) throw new Error(`Project does not match the selected directory: ${input.projectId}`);
-    if (project.archivedAt !== undefined) throw new Error(`Project is archived: ${input.projectId}`);
-    if (!project.available) throw new Error(`Project is unavailable: ${input.projectId}`);
-    try {
-      const touched = await catalog.touch(project.id, input.cwd);
-      return {
-        ...input,
-        cwd: touched.preferredPath ?? input.cwd,
-        projectId: touched.id,
-      };
-    } catch (error) {
-      if (!isProjectPathMismatchError(error)) throw error;
-      throw new Error(`Project does not match the selected directory: ${input.projectId}`);
+export async function resolveDesktopSessionWorkspace(
+  input: DesktopSessionWorkspaceInput,
+  selection: DesktopSessionWorkspaceSelection,
+  catalog: Pick<ProjectCatalog, 'register'>,
+  options: { readonly allowHostPath?: boolean } = {},
+): Promise<WorkspaceTarget> {
+  if (input.cwd) {
+    if (input.projectId === null) {
+      if (options.allowHostPath === false) throw remoteProjectRequired();
+      return { kind: 'host_path', path: input.cwd };
     }
+    if (typeof input.projectId === 'string') {
+      return { kind: 'project', projectId: input.projectId };
+    }
+    if (options.allowHostPath === false) throw remoteProjectRequired();
+    return { kind: 'project', projectId: (await catalog.register(input.cwd)).id };
   }
 
-  const project = await catalog.register(input.cwd);
-  if (project.archivedAt !== undefined) throw new Error(`Project is archived: ${project.id}`);
-  return {
-    ...input,
-    cwd: project.preferredPath ?? input.cwd,
-    projectId: project.id,
-  };
+  if (input.projectId !== undefined) {
+    if (input.projectId === null) {
+      if (options.allowHostPath === false) throw remoteProjectRequired();
+      return { kind: 'host_path', path: (await selection.current()).path };
+    }
+    // Session creation names a Project; it must not also mutate the Host's
+    // persisted current-Project preference. The Runtime Host validates the
+    // identity at the workspace authority boundary.
+    return { kind: 'project', projectId: input.projectId };
+  }
+
+  const configuredDefault = await selection.defaultProjectId?.();
+  if (configuredDefault !== undefined) {
+    const selected = await selection.select(configuredDefault);
+    if (selected.project) return { kind: 'project', projectId: selected.project.id };
+  }
+
+  const current = await selection.current();
+  if (typeof current.projectId === 'string') {
+    return { kind: 'project', projectId: current.projectId };
+  }
+  if (options.allowHostPath === false) throw remoteProjectRequired();
+  return { kind: 'host_path', path: current.path };
+}
+
+function remoteProjectRequired(): Error {
+  return new Error('Select a project from the remote Runtime Host first');
 }

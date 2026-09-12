@@ -1,27 +1,55 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import type {
   ConnectionCatalogEntry,
   ConnectionModelDiscoveryResult,
   ConnectionTestErrorClass,
   ConnectionTestSummary,
 } from '@maka/core/runtime-policy';
+import { parseRequestHeaders } from '@maka/core/runtime-policy';
+import { PROVIDER_REGISTRY, providerFallbackModelIds } from '@maka/core/llm-connections';
 import {
   createConnectionEffectFetchTransport,
-  isOAuthSubscriptionProvider,
-  runConnectionModelDiscoveryEffect,
-  runConnectionTestEffect,
-  type ConnectionEffectErrorKind,
-  type ConnectionEffectFetchDependency,
   type ConnectionEffectFetchTransport,
   type ConnectionEffectProxySnapshot,
+} from '@maka/runtime/network/scoped-fetch-transport';
+import { createRequestCustomizationFetch } from '@maka/runtime/request-customization-fetch';
+import {
+  isOAuthSubscriptionProvider,
+  parseOAuthSubscriptionTokens,
+} from '@maka/runtime/subscription-credentials';
+import { runConnectionModelDiscoveryEffect } from '@maka/runtime/model-fetcher';
+import { runConnectionTestEffect } from '@maka/runtime/test-connection';
+import {
+  type ConnectionEffectErrorKind,
   type ConnectionModelDiscoveryEffectOutcome,
   type ConnectionTestEffectOutcome,
-} from '@maka/runtime';
+} from '@maka/runtime/connection-effect-outcome';
+import { type ConnectionEffectFetchDependency } from '@maka/runtime/connection-effect-fetch';
 import {
   authenticateRuntimePolicyStoresWriter,
   RuntimePolicyStoreError,
   type BeginConnectionTestResult,
   type BeginModelFetchResult,
   type ConnectionEffectCompletionResult,
+  type ConnectionOnboardingTicket,
   type RuntimePolicyStoresWriter,
 } from '@maka/storage/runtime-policy-stores';
 import type {
@@ -30,6 +58,9 @@ import type {
   ConnectionEffectRejectionReason,
   ConnectionModelFetchInput,
   ConnectionModelFetchResult,
+  ConnectionOnboardingVerifyInput,
+  ConnectionOnboardingSaveInput,
+  ConnectionOnboardingSaveResult,
   ConnectionTestProjection,
   ConnectionTestRunInput,
   ConnectionTestRunResult,
@@ -69,6 +100,8 @@ export interface HostConnectionEffectCoordinatorOptions {
 /** Runs provider I/O outside Storage lanes and conditionally commits canonical results. */
 export class HostConnectionEffectCoordinator {
   readonly handlers: ConnectionEffectOperationHandlerMap = {
+    'connection.onboarding.save': (input) => this.#saveOnboarding(input),
+    'connection.onboarding.verify': (input) => this.#verifyOnboarding(input),
     'connection.models.fetch': (input) => this.#fetchModels(input),
     'connection.test.run': (input) => this.#testConnection(input),
   };
@@ -150,6 +183,168 @@ export class HostConnectionEffectCoordinator {
     });
   }
 
+  #verifyOnboarding(
+    input: ConnectionOnboardingVerifyInput,
+  ): Promise<OperationOutcome<'connection.onboarding.verify'>> {
+    // Existing targets share their connection lane with models.fetch. Create
+    // attempts share a provider lane until Storage assigns and commits the
+    // next authoritative identity.
+    const lane = onboardingLane(input);
+    return this.#admit(lane, 'connection.onboarding.verify', async () => {
+      const prepared = await this.#discoverOnboarding(input);
+      if (prepared.kind === 'empty') return { kind: 'failed', errorClass: 'invalid_response' };
+      return prepared.kind === 'ready' ? { kind: 'verified', models: prepared.models } : prepared;
+    });
+  }
+
+  #saveOnboarding(
+    input: ConnectionOnboardingSaveInput,
+  ): Promise<OperationOutcome<'connection.onboarding.save'>> {
+    const lane = onboardingLane(input);
+    return this.#admit(lane, 'connection.onboarding.save', async () => {
+      const prepared = await this.#discoverOnboarding(input);
+      if (prepared.kind === 'empty') return { kind: 'rejected', reason: 'model_unavailable' };
+      if (prepared.kind !== 'ready') return prepared;
+      const available = new Set(prepared.models.map(({ id }) => id));
+      // An adoption caller has no model inventory before the Host performs this
+      // discovery. Empty therefore means "enable everything this operation
+      // verified"; ordinary onboarding callers may still submit an explicit
+      // non-empty subset.
+      const enabledModelIds =
+        input.enabledModelIds.length > 0
+          ? input.enabledModelIds
+          : prepared.models.map(({ id }) => id);
+      if (enabledModelIds.some((modelId) => !available.has(modelId))) {
+        return { kind: 'rejected', reason: 'model_unavailable' };
+      }
+      return this.#activation.runMutation(async () =>
+        this.#commitOnboarding(enabledModelIds, prepared),
+      );
+    });
+  }
+
+  async #discoverOnboarding(input: ConnectionOnboardingVerifyInput): Promise<OnboardingDiscovery> {
+    // The begin/complete ticket pair binds this discovery to the connection
+    // revision, credential, and proxy it observed: a concurrent policy update
+    // between the remote probe and the commit supersedes the save instead of
+    // pairing the new endpoint with an inventory it never produced. Verify
+    // simply abandons its ticket (they are WeakMap-held one-shots).
+    const begun = await this.#stores.operations.beginConnectionOnboarding({
+      target: input.target,
+      baseUrl: input.baseUrl,
+    });
+    if (begun.kind === 'target_missing') {
+      // Identity supplied by the client names a connection that is gone or
+      // changed provider type: reject instead of deriving a duplicate.
+      return { kind: 'rejected', reason: 'connection_not_found' };
+    }
+    if (begun.kind === 'provider_unsupported') {
+      return { kind: 'rejected', reason: 'provider_unsupported' };
+    }
+    if (begun.kind === 'catalog_full') {
+      return { kind: 'rejected', reason: 'catalog_full' };
+    }
+    if (begun.kind === 'slug_taken') {
+      return { kind: 'rejected', reason: 'slug_taken' };
+    }
+    const providerType = begun.candidate.providerType;
+    const candidate = begun.existingConnection ?? undefined;
+    const supplied = input.apiKey?.trim() ?? '';
+    const persistedSecret = supplied || begun.storedSecret || '';
+    if (
+      (PROVIDER_REGISTRY[providerType].authKind === 'api_key' ||
+        PROVIDER_REGISTRY[providerType].authKind === 'oauth_token') &&
+      persistedSecret.length === 0
+    ) {
+      return { kind: 'rejected', reason: 'credential_not_configured' };
+    }
+    let discoverySecret = persistedSecret;
+    if (isOAuthSubscriptionProvider(providerType) && persistedSecret.length > 0) {
+      const tokens = parseOAuthSubscriptionTokens(persistedSecret);
+      if (!tokens) return { kind: 'failed', errorClass: 'auth' };
+      discoverySecret = tokens.access_token;
+    }
+    // Mirrors the blank-key contract above: a null baseUrl reuses the
+    // existing connection's persisted endpoint or the registry default.
+    // A relay provider with no endpoint from any of those sources cannot
+    // run discovery — reject up front instead of probing an empty URL.
+    const base = candidate
+      ? { ...candidate, ...(begun.baseUrl ? { baseUrl: begun.baseUrl } : {}) }
+      : transientConnection(begun.candidate, begun.baseUrl);
+    if (!base.baseUrl && !PROVIDER_REGISTRY[providerType].baseUrl) {
+      return { kind: 'rejected', reason: 'base_url_not_configured' };
+    }
+    // The ticket's basis certifies this exact proxy, so discovery must use
+    // the pinned value rather than re-resolving it (a flip-and-restore
+    // between the two reads would otherwise slip past the basis check).
+    if (begun.proxyCredentialMissing) return { kind: 'failed', errorClass: 'network' };
+    const transport = this.#createTransport(
+      toRuntimePolicyProxy(begun.networkProxy, begun.proxySecret ?? undefined),
+    );
+    try {
+      // The probe must go out the way the models path sends it (#withTransport):
+      // with the connection's custom request headers and body overlay, both
+      // pinned by the ticket whose basis the commit revalidates.
+      const effect = await this.#runModelDiscovery(base, discoverySecret, {
+        fetch: createRequestCustomizationFetch(transport.fetch, {
+          headers: begun.requestHeadersSecret
+            ? parseRequestHeaders(begun.requestHeadersSecret)
+            : {},
+          bodyOverlay: base.requestBodyOverlay,
+        }),
+      });
+      if (!effect.ok) return { kind: 'failed', errorClass: effect.error.kind };
+      if (effect.models.length === 0) return { kind: 'empty' };
+      return {
+        kind: 'ready',
+        ticket: begun.ticket,
+        suppliedSecret: supplied,
+        models: effect.models,
+      };
+    } finally {
+      await transport.close();
+    }
+  }
+
+  async #commitOnboarding(
+    enabledModelIds: readonly string[],
+    prepared: Extract<OnboardingDiscovery, { readonly kind: 'ready' }>,
+  ): Promise<ConnectionOnboardingSaveResult> {
+    try {
+      const committed = await this.#stores.operations.completeConnectionOnboarding(
+        prepared.ticket,
+        {
+          suppliedSecret: prepared.suppliedSecret || null,
+          enabledModelIds,
+          discovery: {
+            models: prepared.models,
+            source: 'fetched',
+            fetchedAt: this.#now(),
+          },
+        },
+      );
+      if (committed.kind === 'catalog_full') {
+        return { kind: 'rejected', reason: 'catalog_full' };
+      }
+      if (committed.kind === 'target_missing') {
+        return { kind: 'rejected', reason: 'connection_not_found' };
+      }
+      if (committed.kind === 'slug_taken') {
+        return { kind: 'rejected', reason: 'slug_taken' };
+      }
+      if (committed.kind === 'superseded') {
+        return { kind: 'rejected', reason: 'superseded' };
+      }
+      if (committed.changed) this.#onCommittedMutation();
+      return { kind: 'saved', connection: committed.connection };
+    } catch (error) {
+      if (error instanceof RuntimePolicyStoreError && error.code === 'commit_outcome_unknown') {
+        this.#onCommittedMutation();
+      }
+      throw error;
+    }
+  }
+
   #testConnection(input: ConnectionTestRunInput): Promise<OperationOutcome<'connection.test.run'>> {
     return this.#admit(input.connectionId, 'connection.test.run', async () => {
       const prepared = await this.#stores.operations.beginConnectionTest(
@@ -187,7 +382,13 @@ export class HostConnectionEffectCoordinator {
     });
   }
 
-  #admit<K extends 'connection.models.fetch' | 'connection.test.run'>(
+  #admit<
+    K extends
+      | 'connection.models.fetch'
+      | 'connection.test.run'
+      | 'connection.onboarding.verify'
+      | 'connection.onboarding.save',
+  >(
     connectionId: string,
     operation: K,
     run: () => Promise<Extract<OperationOutcome<K>, { ok: true }>['result']>,
@@ -221,7 +422,16 @@ export class HostConnectionEffectCoordinator {
     const secret = await this.#connectionSecret(prepared, proxy);
     const transport = this.#createTransport(proxy);
     try {
-      return await run(transport.fetch, secret);
+      const requestHeaders = prepared.secretMaterial.requestHeaders
+        ? parseRequestHeaders(prepared.secretMaterial.requestHeaders.secret)
+        : {};
+      return await run(
+        createRequestCustomizationFetch(transport.fetch, {
+          headers: requestHeaders,
+          bodyOverlay: prepared.connection.requestBodyOverlay,
+        }),
+        secret,
+      );
     } finally {
       await transport.close();
     }
@@ -239,6 +449,7 @@ export class HostConnectionEffectCoordinator {
     if (!isOAuthSubscriptionProvider(prepared.connection.providerType)) return material.secret;
     const binding = this.#oauthCredentials.bind({
       providerType: prepared.connection.providerType,
+      connectionId: prepared.connection.connectionId,
       connectionSlug: prepared.connection.slug,
       material,
       createRefreshTransport: () => this.#createTransport(proxy),
@@ -280,6 +491,26 @@ export class HostConnectionEffectCoordinator {
 
 type BeginModelFetchReady = Extract<BeginModelFetchResult, { readonly kind: 'ready' }>;
 type BeginConnectionTestReady = Extract<BeginConnectionTestResult, { readonly kind: 'ready' }>;
+
+type OnboardingDiscovery =
+  | { readonly kind: 'empty' }
+  | {
+      readonly kind: 'ready';
+      readonly ticket: ConnectionOnboardingTicket;
+      readonly suppliedSecret: string;
+      readonly models: ConnectionModelDiscoveryResult['models'];
+    }
+  | {
+      readonly kind: 'rejected';
+      readonly reason:
+        | 'provider_unsupported'
+        | 'connection_not_found'
+        | 'credential_not_configured'
+        | 'base_url_not_configured'
+        | 'slug_taken'
+        | 'catalog_full';
+    }
+  | { readonly kind: 'failed'; readonly errorClass: ConnectionEffectFailureClass };
 
 function preparationResult(
   prepared: Exclude<BeginModelFetchResult, { readonly kind: 'ready' }>,
@@ -352,9 +583,13 @@ function committedConnectionBasis(
   return { connectionId, revision: connection.revision };
 }
 
-function storeFailure<K extends 'connection.models.fetch' | 'connection.test.run'>(
-  error: unknown,
-): OperationOutcome<K> {
+function storeFailure<
+  K extends
+    | 'connection.models.fetch'
+    | 'connection.test.run'
+    | 'connection.onboarding.verify'
+    | 'connection.onboarding.save',
+>(error: unknown): OperationOutcome<K> {
   if (!(error instanceof RuntimePolicyStoreError)) throw error;
   switch (error.code) {
     case 'commit_outcome_unknown':
@@ -367,15 +602,50 @@ function storeFailure<K extends 'connection.models.fetch' | 'connection.test.run
       return operationFailure('persistence_failed', 'Connection effect persistence failed');
     case 'invalid_policy_input':
     case 'invalid_connection_input':
+    case 'revision_conflict':
       return operationFailure('invalid_request', 'Connection effect request is invalid');
     case 'invalid_credential_input':
       throw new Error('Connection effect admitted an invalid credential operation');
   }
 }
 
-function operationFailure<K extends 'connection.models.fetch' | 'connection.test.run'>(
+function operationFailure<
+  K extends
+    | 'connection.models.fetch'
+    | 'connection.test.run'
+    | 'connection.onboarding.verify'
+    | 'connection.onboarding.save',
+>(
   code: 'commit_outcome_unknown' | 'persistence_failed' | 'invalid_request',
   message: string,
 ): OperationOutcome<K> {
   return { ok: false, error: { code, message } } as OperationOutcome<K>;
+}
+
+function transientConnection(
+  identity: Pick<ConnectionCatalogEntry, 'connectionId' | 'slug' | 'providerType'>,
+  baseUrl: string | null = null,
+): ConnectionCatalogEntry {
+  const { providerType } = identity;
+  const definition = PROVIDER_REGISTRY[providerType];
+  const models = providerFallbackModelIds(definition).map((id) => ({ id }));
+  return {
+    connectionId: identity.connectionId,
+    revision: 0,
+    slug: identity.slug,
+    name: definition.label,
+    providerType,
+    ...((baseUrl ?? definition.baseUrl) ? { baseUrl: baseUrl ?? definition.baseUrl } : {}),
+    enabled: true,
+    enabledModelIds: models.map(({ id }) => id),
+    models,
+    modelSource: 'fallback',
+    modelsFetchedAt: 0,
+  };
+}
+
+function onboardingLane(input: ConnectionOnboardingVerifyInput): string {
+  return input.target.kind === 'existing'
+    ? input.target.connectionId
+    : `onboarding:create:${input.target.providerType}`;
 }

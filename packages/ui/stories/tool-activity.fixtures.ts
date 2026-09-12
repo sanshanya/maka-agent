@@ -1,4 +1,23 @@
-import type { ToolResultContent } from '@maka/core';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import type { ToolResultContent } from '@maka/core/events';
 import type { ToolActivityItem, ToolOutputChunk } from '../src/materialize.js';
 
 const NOW = 1_735_689_600_000;
@@ -17,13 +36,13 @@ const terminalResult = {
 const terminalFailureResult = {
   kind: 'terminal',
   cwd: '/Users/yuhan/workspace/oss/maka-agent',
-  cmd: 'npm run -w @maka/headless test',
+  cmd: 'npm run -w @maka/eval test',
   status: 'failed',
   exitCode: 1,
-  output: pipeOutput('running headless tests\n', [
-      'Error: expected verifier to receive task-run.json',
-      'at packages/headless/src/verifier.ts:42:11',
-    ].join('\n')),
+  output: pipeOutput(
+    'running eval tests\n',
+    ['Error: expected earliest valid attempt', 'at packages/eval/src/result.ts:42:11'].join('\n'),
+  ),
 } satisfies ToolResultContent;
 
 function pipeOutput(stdout = '', stderr = '') {
@@ -99,145 +118,6 @@ const webSearchErrorResult = {
   credentialSource: 'saved',
 } satisfies ToolResultContent;
 
-const subagentResult = {
-  kind: 'subagent',
-  agentId: 'agent-review',
-  agentName: 'Review Agent',
-  turnId: 'turn-subagent',
-  runId: 'run-subagent',
-  status: 'completed',
-  permissionMode: 'ask',
-  summary: 'Reviewed the renderer story surface and found the missing ToolActivity state board.',
-  artifactIds: ['artifact-summary'],
-  startedAt: NOW - 18_000,
-  completedAt: NOW,
-  durationMs: 18_000,
-  eventCount: 14,
-} satisfies ToolResultContent;
-
-const subagentWaitingResult = {
-  kind: 'subagent',
-  agentName: 'Explore Helper',
-  turnId: 'turn-subagent-waiting',
-  status: 'waiting_for_user',
-  permissionMode: 'explore',
-  summary: 'Waiting for approval before reading the requested path.',
-  artifactIds: [],
-  startedAt: NOW - 4_000,
-  durationMs: 4_000,
-} satisfies ToolResultContent;
-
-const agentSwarmResult = {
-  kind: 'agent_swarm',
-  status: 'partial',
-  items: [
-    {
-      itemId: 'runtime',
-      index: 0,
-      profile: 'local_read',
-      started: true,
-      agentName: 'Local Read',
-      turnId: 'turn-swarm-runtime',
-      runId: 'run-swarm-runtime',
-      status: 'completed',
-      summary: 'Verified that every child uses the shared spawnChildAgent permit boundary.',
-      artifactIds: ['artifact-runtime-notes'],
-      startedAt: NOW - 21_000,
-      completedAt: NOW - 8_000,
-      durationMs: 13_000,
-    },
-    {
-      itemId: 'presentation',
-      index: 1,
-      profile: 'local_read',
-      started: true,
-      agentName: 'Local Read',
-      turnId: 'turn-swarm-presentation',
-      runId: 'run-swarm-presentation',
-      status: 'completed',
-      summary: 'Mapped the compact ToolResultPreview surface and its bounded output contracts.',
-      artifactIds: [],
-      startedAt: NOW - 21_000,
-      completedAt: NOW - 3_000,
-      durationMs: 18_000,
-    },
-    {
-      itemId: 'telemetry',
-      index: 2,
-      profile: 'local_read',
-      started: true,
-      agentName: 'Local Read',
-      turnId: 'turn-swarm-telemetry',
-      runId: 'run-swarm-telemetry',
-      status: 'failed',
-      summary: 'The first telemetry probe was interrupted before it produced evidence.',
-      artifactIds: [],
-      startedAt: NOW - 21_000,
-      completedAt: NOW,
-      durationMs: 21_000,
-      failureClass: 'ChildFailed',
-    },
-  ],
-  startedAt: NOW - 21_000,
-  completedAt: NOW,
-  durationMs: 21_000,
-} satisfies ToolResultContent;
-
-const exploreAgentResult = {
-  kind: 'explore_agent',
-  ok: false,
-  partial: true,
-  terminalStatus: 'canceled_partial',
-  mode: 'read_only',
-  objective: 'Find every ToolActivity preview state needed for UI polish.',
-  roots: ['packages/ui/src', 'packages/ui/stories'],
-  queries: ['ToolActivity', 'ToolResultContent', 'previewVariants'],
-  ignoredPaths: ['node_modules', 'dist'],
-  stoppingCondition: 'Stopped after the candidate budget was reached.',
-  limitReasons: ['candidate_budget'],
-  filesDiscovered: 42,
-  filesInspected: 12,
-  filesSkipped: 6,
-  sensitiveFilesSkipped: 1,
-  bytesRead: 186_402,
-  startedAt: NOW - 52_000,
-  completedAt: NOW,
-  durationMs: 52_000,
-  progress: [
-    'Scanned packages/ui/src/tool-activity.tsx for ToolResultContent branches.',
-    'Collected representative result shapes from @maka/core events.',
-    'Stopped before reading generated renderer output.',
-  ],
-  recentEvents: [
-    { type: 'started', at: NOW - 52_000, message: 'Started read-only exploration.' },
-    { type: 'scan', at: NOW - 41_000, message: 'Matched ToolActivity preview branches.' },
-    { type: 'checkpoint', at: NOW - 12_000, message: 'Candidate budget reached with partial evidence.' },
-    { type: 'aborted', at: NOW, message: 'Canceled with partial findings preserved.' },
-  ],
-  evidence: [
-    { type: 'match', path: 'packages/ui/src/tool-activity.tsx', line: 370, label: 'ToolResultPreview kind routing', score: 0.95 },
-    { type: 'candidate', path: 'packages/ui/src/materialize.ts', label: 'ToolActivityItem shape', score: 0.87 },
-  ],
-  summary: 'ToolActivity already renders every important preview branch; Storybook needs fixed fixture states.',
-  report: [
-    'The UI surface is ready for a storyboard-only PR.',
-    'No runtime or materialization changes are needed.',
-    'Long output and permission-denied paths should be visible in the state board.',
-  ].join('\n'),
-  candidateFiles: [
-    { path: 'packages/ui/src/tool-activity.tsx', score: 0.98, reasons: ['direct-component', 'preview-routing'] },
-    { path: 'packages/core/src/events.ts', score: 0.91, reasons: ['result-shape'] },
-    { path: 'packages/ui/src/materialize.ts', score: 0.84, reasons: ['item-shape'] },
-  ],
-  matches: [
-    { path: 'packages/ui/src/tool-activity.tsx', line: 395, query: 'terminal', snippet: "if (content.kind === 'terminal')" },
-    { path: 'packages/ui/src/tool-activity.tsx', line: 407, query: 'file_diff', snippet: "if (content.kind === 'file_diff')" },
-  ],
-  notes: ['Read-only mode kept production files untouched.', 'One sensitive path was skipped.'],
-  reason: 'aborted',
-  message: 'Exploration was canceled after collecting enough fixture evidence.',
-} satisfies ToolResultContent;
-
 const liveOutputChunks: ToolOutputChunk[] = [
   { seq: 1, stream: 'stdout', text: 'installing dependencies\n', redacted: false, createdAt: NOW - 7_000 },
   { seq: 2, stream: 'stderr', text: 'warning: optional peer dependency not installed\n', redacted: false, createdAt: NOW - 6_000 },
@@ -251,14 +131,6 @@ function toolItem(item: ToolActivityItem): ToolActivityItem {
 }
 
 export const statusOverviewItems = [
-  toolItem({
-    toolUseId: 'status-pending',
-    toolName: 'read_file',
-    displayName: 'Read file',
-    intent: 'Open the target component before editing.',
-    status: 'pending',
-    args: { path: 'packages/ui/src/tool-activity.tsx' },
-  }),
   toolItem({
     toolUseId: 'status-long-running',
     toolName: 'bash',
@@ -288,18 +160,18 @@ export const statusOverviewItems = [
   toolItem({
     toolUseId: 'status-errored',
     toolName: 'bash',
-    displayName: 'Headless test',
+    displayName: 'Eval test',
     status: 'errored',
-    args: { cmd: 'npm run -w @maka/headless test' },
+    args: { cmd: 'npm run -w @maka/eval test' },
     result: terminalFailureResult,
     durationMs: 2_480,
   }),
   toolItem({
     toolUseId: 'status-interrupted',
-    toolName: 'explore',
-    displayName: 'Explore repository',
+    toolName: 'Grep',
+    displayName: 'Search repository',
     status: 'interrupted',
-    args: { roots: ['packages/ui/src'], query: 'ToolActivity' },
+    args: { pattern: 'ToolActivity', path: 'packages/ui/src' },
     result: { kind: 'text', text: 'The turn was interrupted after partial output was retained.' },
     durationMs: 9_360,
   }),
@@ -491,49 +363,6 @@ export const fileDiffAndWebSearchItems = [
   }),
 ] satisfies ToolActivityItem[];
 
-export const subagentAndExploreItems = [
-  toolItem({
-    toolUseId: 'subagent-completed',
-    toolName: 'spawn_subagent',
-    displayName: 'Subagent review',
-    intent: 'Delegate a bounded review to a foreground subagent.',
-    status: 'completed',
-    args: { agentName: subagentResult.agentName, objective: 'Review ToolActivity states' },
-    result: subagentResult,
-    durationMs: 18_000,
-  }),
-  toolItem({
-    toolUseId: 'subagent-running',
-    toolName: 'spawn_subagent',
-    displayName: 'Subagent',
-    intent: 'Wait for a child agent to report back.',
-    status: 'running',
-    args: { agentName: subagentWaitingResult.agentName, permissionMode: subagentWaitingResult.permissionMode },
-    result: subagentWaitingResult,
-    durationMs: 4_000,
-  }),
-  toolItem({
-    toolUseId: 'agent-swarm-partial',
-    toolName: 'agent_swarm',
-    displayName: 'Agent Swarm',
-    intent: 'Inspect runtime, presentation, and telemetry independently, then synthesize.',
-    status: 'completed',
-    args: { items: 3, max_concurrency: 3 },
-    result: agentSwarmResult,
-    durationMs: 21_000,
-  }),
-  toolItem({
-    toolUseId: 'explore-agent',
-    toolName: 'explore_agent',
-    displayName: 'Read-only explore',
-    intent: 'Summarize partial findings with evidence and continuation copy.',
-    status: 'interrupted',
-    args: { objective: exploreAgentResult.objective, roots: exploreAgentResult.roots },
-    result: exploreAgentResult,
-    durationMs: 52_000,
-  }),
-] satisfies ToolActivityItem[];
-
 export const errorsAndPermissionDeniedItems = [
   toolItem({
     toolUseId: 'terminal-error',
@@ -562,8 +391,6 @@ export const denseMixedResultItems = [
   terminalAndLiveOutputItems[0],
   fileDiffAndWebSearchItems[0],
   fileDiffAndWebSearchItems[1],
-  subagentAndExploreItems[0],
-  subagentAndExploreItems[2],
   fileDiffAndWebSearchItems[2],
   errorsAndPermissionDeniedItems[0],
 ] satisfies ToolActivityItem[];

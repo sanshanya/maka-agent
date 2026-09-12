@@ -1,22 +1,40 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 "use client";
 
 import type React from "react";
 import { cn } from "../utils.js";
 
 /**
- * `Marker` — the per-turn status / lineage / footer chrome (issue #332, PR2).
+ * `Marker` — the per-turn lineage / footer chrome (issue #332, PR2).
  *
- * Retires the bespoke `.maka-turn-summary*`, `.maka-turn-aborted-marker`,
- * `.maka-turn-failed-*`, `.maka-turn-lineage-*`, and `.maka-turn-footer*` shell
+ * Retires the bespoke `.maka-turn-summary*`, `.maka-turn-lineage-*`, and
+ * `.maka-turn-footer*` shell
  * CSS (spread across `maka-tokens.css`, `styles/settings/models.css`, and the
  * re-anchored measure-column block in `styles/tool-output.css`), moving each
  * onto package-owned semantic classes.
  *
  * The measure-column geometry the old `tool-output.css` re-anchor applied to
- * the summary / lineage rows / footer (`max-width:var(--maka-chat-measure)`,
- * `margin-right:auto`) is folded directly into those container variants here,
- * so the layout is location-independent instead of coupled to a
- * `[data-role="assistant"]` descendant selector.
+ * the summary / lineage rows / footer is gone rather than moved: `.maka-turn`
+ * is the column, and every `Marker` renders inside one, so a second cap on the
+ * chrome could only ever be the same edge stated twice.
  *
  * `markerVariants` is exported from THIS module as a local variant recipe
  * so the lineage badge + footer action — which render as `UiButton` and can't
@@ -28,11 +46,7 @@ import { cn } from "../utils.js";
  *
  */
 export type MarkerVariant =
-  | "aborted"
-  | "automation-origin"
-  | "failed-banner"
-  | "failed-icon"
-  | "failed-recovery"
+  | "host-origin"
   | "lineage-row"
   | "lineage-row-reverse"
   | "lineage-badge"
@@ -40,11 +54,7 @@ export type MarkerVariant =
   | "footer-action";
 
 const MARKER_CLASSES: Record<MarkerVariant, string> = {
-  aborted: "maka-turn-aborted-marker",
-  "automation-origin": "maka-turn-automation-origin",
-  "failed-banner": "maka-turn-failed-banner",
-  "failed-icon": "maka-turn-failed-icon",
-  "failed-recovery": "maka-turn-failed-recovery",
+  "host-origin": "maka-turn-host-origin",
   "lineage-row": "maka-turn-lineage-row",
   "lineage-row-reverse": "maka-turn-lineage-row maka-turn-lineage-row-reverse",
   "lineage-badge": "maka-turn-lineage-badge",
@@ -60,9 +70,9 @@ export { markerVariants };
 
 export interface MarkerProps extends React.ComponentPropsWithoutRef<"div"> {
   variant: MarkerVariant;
-  // The summary chips and the failed-banner sub-spans were authored as inline
-  // `<span>`s; the containers/markers as `<div>`s. Keep the original tag so the
-  // semantic-class conversion is structurally identical (zero behavioral change).
+  // The summary chips were authored as inline `<span>`s; the containers /
+  // markers as `<div>`s. Keep the original tag so the semantic-class
+  // conversion is structurally identical (zero behavioral change).
   as?: "div" | "span";
 }
 
@@ -87,55 +97,11 @@ export function Marker({
 }
 
 /**
- * `TextShimmer` — a running "sweep of light" across short label text
- * (streaming UI rework). Used for the turn's processing indicator while a turn
- * is still working.
- *
- * Two overlaid layers on the same grid cell: an opaque `base` (keeps the text
- * readable at all times, and is all a snapshot / reduced-motion user sees) and
- * a `sweep` layer whose animated linear-gradient is clipped to the glyph shape
- * (`background-clip: text` + transparent fill) so a light band travels across
- * the letters. The band motion is the one declaration that can't be a leaf
- * literal — it rides the governed `@keyframes maka-text-shimmer` in
- * maka-tokens.css plus the literal
- * utilities here.
- *
- * `active={false}` (or reduced-motion) renders just the base text — callers
- * pass `active` false for settled/snap states so the sweep never runs in a
- * deterministic capture. Kept INTERNAL (off the package barrel, imported by
- * relative path) — its only consumers live in `@maka/ui`.
- */
-export function TextShimmer({
-  children,
-  active = true,
-  className,
-}: {
-  children: React.ReactNode;
-  active?: boolean;
-  className?: string;
-}): React.ReactElement {
-  if (!active) {
-    return <span className={cn("maka-text-shimmer-static", className)}>{children}</span>;
-  }
-  return (
-    <span data-slot="text-shimmer" className={cn("maka-text-shimmer", className)}>
-      {/* Base: opaque, muted, always readable. */}
-      <span className="maka-text-shimmer-base">{children}</span>
-      {/* Sweep: a clipped light band that travels across the glyphs. */}
-      <span aria-hidden="true" className="maka-text-shimmer-sweep">
-        {children}
-      </span>
-    </span>
-  );
-}
-
-/**
  * Tool-result preview surfaces (issue #332, PR4).
  *
  * Retires the bespoke `OverlayPreview` family shell CSS — the shared
  * height-bounded `.maka-overlay-preview` base + `.maka-overlay-close`, the
  * structured cards (`.maka-tool-diff*`, `.maka-tool-terminal*`,
- * `.maka-explore-agent-*` / `.maka-subagent-preview`,
  * `.maka-web-search-*`), and the separate `.maka-load-tool-*` result card —
  * represented by package-owned semantic classes in `styles.css`.
  *
@@ -146,7 +112,7 @@ export function TextShimmer({
  *      The kind class follows the shared base and may refine it by normal CSS
  *      source order.
  *   2. Leaf rules authored as descendant selectors on bare tags (e.g.
- *      `.maka-explore-agent-section li`, `.maka-web-search-preview > header strong`)
+ *      `.maka-web-search-preview > header strong`)
  *      remain descendants of the stable semantic container class.
  *
  * Unlike the other tables, `previewVariants` IS exported on the `@maka/ui` barrel
@@ -212,39 +178,6 @@ const PREVIEW_PART_CLASSES = {
       "terminal-copy":
         "maka-tool-terminal-copy",
 
-      // ── explore agent / subagent (shared shell) ───────────────────────────
-      // `.maka-explore-agent-preview, .maka-subagent-preview` (+ the fault
-      // border, keyed on explore's `[data-ok=false]` or subagent's failed /
-      // cancelled `[data-status]`).
-      agent:
-        "maka-agent-preview",
-      // `.maka-explore-agent-head` (+ its `strong` title and `small` caption,
-      // the latter shared with the nested summary-line small).
-      "agent-head":
-        "maka-agent-preview-head",
-      // `.maka-explore-agent-summary-line` (+ its `small` ellipsis, layered over
-      // the head's caption styling above).
-      "agent-summary-line":
-        "maka-agent-preview-summary-line",
-      // `.maka-explore-agent-actions`
-      "agent-actions": "maka-agent-preview-actions",
-      // `.maka-explore-agent-message`
-      "agent-message":
-        "maka-agent-preview-message",
-      // `.maka-explore-agent-meta` (+ its `div` cells, `dt` labels, `dd` values).
-      "agent-meta":
-        "maka-agent-preview-meta",
-      // `.maka-explore-agent-section` (+ its direct `> strong`, list `ul`/`li`
-      // rows, leading `li` reset, `code` / `small` / `p` / `span` leaves).
-      "agent-section":
-        "maka-agent-preview-section",
-      // `.maka-explore-agent-section-head` (+ its `> strong`).
-      "agent-section-head":
-        "maka-agent-preview-section-head",
-      // `.maka-explore-agent-copy` (UiButton) + the copied / shared copy-state tints.
-      "agent-copy":
-        "maka-agent-preview-copy",
-
       // ── web search ────────────────────────────────────────────────────────
       // `.maka-web-search-preview` (+ its bare `> header` / list leaves; the
       // container inherits the overlay base's mono font, never resetting it).
@@ -268,10 +201,6 @@ const PREVIEW_PART_CLASSES = {
       "load-tool-title": "maka-load-tool-title",
       // `.maka-load-tool-count`
       "load-tool-count": "maka-load-tool-count",
-      // `.maka-load-tool-tools`
-      "load-tool-tools": "maka-load-tool-tools",
-      // `.maka-load-tool-footer`
-      "load-tool-footer": "maka-load-tool-footer",
 } as const;
 
 type PreviewPart = keyof typeof PREVIEW_PART_CLASSES;

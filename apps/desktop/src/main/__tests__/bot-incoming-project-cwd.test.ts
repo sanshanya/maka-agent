@@ -1,12 +1,30 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
-import type { BotIncomingMessage, BotRegistry, SessionManager } from '@maka/runtime';
+import type { BotIncomingMessage, BotRegistry } from '@maka/runtime/bots';
 import { createBotIncomingMainService } from '../bot-incoming-main.js';
-import { createEmbeddedBotSessionAdapter } from '../embedded-bot-session-adapter.js';
 
 describe('bot incoming new-session cwd', () => {
   it('leaves the cwd to the shared desktop session resolver', async () => {
-    let capturedCwd: unknown = undefined;
+    let createInput: unknown;
     const service = createBotIncomingMainService({
       botRegistry: {
         async sendMessage() {},
@@ -17,27 +35,18 @@ describe('bot incoming new-session cwd', () => {
           return true;
         },
       } as unknown as BotRegistry,
-      sessions: createEmbeddedBotSessionAdapter({
-        runtime: {} as SessionManager,
-        // createSession captures the cwd it was given, then throws to
-        // short-circuit before the streaming / typing path runs.
+      sessions: {
         async createSession(input) {
-          capturedCwd = input.cwd;
+          createInput = input;
           throw new Error('__short_circuit_after_create__');
         },
-        getDefaultConnectionSlug: async () => 'slug',
-        getReadyConnection: async () => ({ connection: { slug: 'slug' }, model: 'm' }),
-        readSessionHeader: async () => ({
-          permissionMode: 'ask',
-          isArchived: false,
-          status: 'active',
-        }),
-        ensureSessionCanSend: async () => {},
-        emitSessionsChanged() {},
-        async runAgentTurn() {
-          throw new Error('runAgentTurn must not be reached');
+        async prepareSession() {
+          throw new Error('prepareSession must not be reached');
         },
-      }),
+        async runTurn() {
+          throw new Error('runTurn must not be reached');
+        },
+      },
     });
 
     await service.handleBotIncomingMessage({
@@ -51,6 +60,9 @@ describe('bot incoming new-session cwd', () => {
       receivedAt: Date.now(),
     } as unknown as BotIncomingMessage);
 
-    assert.equal(capturedCwd, undefined);
+    assert.deepEqual(createInput, {
+      name: 'Telegram 任务',
+      labels: ['bot', 'telegram'],
+    });
   });
 });

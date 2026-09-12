@@ -1,47 +1,52 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import {
-  resolveExistingStorageRoot,
-  tryAcquireInteractiveRootOwner,
-} from '@maka/storage/root-authority';
-import type { RuntimeHostCandidateOptions } from './candidate.js';
-import type { VerifiedGitRuntimeInput } from '@maka/storage/managed-workspace-owner';
-import { resolveBundledGitRuntime } from './bundled-git-runtime.js';
-import { createExecutionRuntimeHostComposition } from './execution-composition.js';
-import { RuntimeHostKernel } from './host-kernel.js';
+  startInteractiveRuntimeHostCandidate,
+  type InteractiveRuntimeHostCandidateDependencies,
+  type InteractiveRuntimeHostCandidateOptions,
+  type InteractiveRuntimeHostCandidateResult,
+} from './candidate.js';
+import {
+  createExecutionRuntimeHostCompositionSource,
+  type ExecutionRuntimeHostCompositionDependencies,
+} from './execution-composition-factory.js';
 
-export type ExecutionRuntimeHostCandidateResult =
-  | { kind: 'loser' }
-  | { kind: 'winner'; host: RuntimeHostKernel };
+export type ExecutionRuntimeHostCandidateResult = InteractiveRuntimeHostCandidateResult;
 
-export interface ExecutionRuntimeHostCandidateOptions extends RuntimeHostCandidateOptions {
-  readonly managedWorkspaceGitRuntime?: VerifiedGitRuntimeInput;
-  /** Packaged resource root containing bundled-git.json and the Git toolchain. */
-  readonly bundledGitResourcesRoot?: string;
-}
+export type ExecutionRuntimeHostCandidateOptions = InteractiveRuntimeHostCandidateOptions;
+
+export interface ExecutionRuntimeHostCandidateDependencies
+  extends ExecutionRuntimeHostCompositionDependencies,
+    InteractiveRuntimeHostCandidateDependencies {}
 
 export async function startExecutionRuntimeHostCandidate(
   options: ExecutionRuntimeHostCandidateOptions,
+  dependencies: ExecutionRuntimeHostCandidateDependencies = {},
 ): Promise<ExecutionRuntimeHostCandidateResult> {
-  if (options.managedWorkspaceGitRuntime && options.bundledGitResourcesRoot) {
-    throw new Error('Managed workspace Git runtime must have exactly one authority');
-  }
-  const managedWorkspaceGitRuntime = options.bundledGitResourcesRoot
-    ? await resolveBundledGitRuntime({ resourcesRoot: options.bundledGitResourcesRoot })
-    : options.managedWorkspaceGitRuntime;
-  const capability = await resolveExistingStorageRoot({
-    path: options.rootPath,
-    kind: 'interactive',
-    expectedRootId: options.expectedRootId,
-  });
-  const owner = await tryAcquireInteractiveRootOwner(capability);
-  if (!owner) return { kind: 'loser' };
-  const host = await RuntimeHostKernel.start({
-    owner,
-    idleGraceMs: options.idleGraceMs,
-    handshakeTimeoutMs: options.handshakeTimeoutMs,
-    compositionFactory: (context) =>
-      createExecutionRuntimeHostComposition(context, {
-        ...(managedWorkspaceGitRuntime ? { managedWorkspaceGitRuntime } : {}),
-      }),
-  });
-  return { kind: 'winner', host };
+  return startInteractiveRuntimeHostCandidate(
+    options,
+    (managedConfig) =>
+      createExecutionRuntimeHostCompositionSource(
+        managedConfig ? { projectDirectoryRoots: managedConfig.projectDirectoryRoots } : {},
+        dependencies,
+      ),
+    dependencies,
+  );
 }

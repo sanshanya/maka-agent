@@ -1,14 +1,31 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { defineInteractiveRuntimeHostComposition } from '../server/host-composition.js';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import {
-  LOAD_TOOLS_NAME,
-  type MakaTool,
-  mcpProxyToolName,
-  ToolAvailabilityRuntime,
-} from '@maka/runtime';
+import { TOOL_SEARCH_NAME, ToolAvailabilityRuntime } from '@maka/runtime/tool-availability';
+import { type MakaTool } from '@maka/runtime/tool-runtime';
+import { mcpProxyToolName } from '@maka/runtime/mcp-tools';
 import { resolveStorageRoot, tryAcquireInteractiveRootOwner } from '@maka/storage/root-authority';
 import {
   connectRuntimeHost,
@@ -27,8 +44,9 @@ import {
   type DomainOperationHandlerMap,
 } from '../server/operation-dispatcher.js';
 import { RuntimePolicyActivationGate } from '../server/runtime-policy-activation-gate.js';
+import { clientCapabilityCoordinatorTestAdmission } from './fixtures/client-capability.js';
 
-test('unknown Client Capability loads, invokes, chunks, and disconnects over real UDS', async () => {
+test('unknown Client Capability loads, invokes, and rebinds after UDS reconnect', async () => {
   const base = await mkdtemp(join(tmpdir(), 'maka-client-capability-'));
   const root = join(base, 'root');
   let host: RuntimeHostKernel | undefined;
@@ -44,8 +62,9 @@ test('unknown Client Capability loads, invokes, chunks, and disconnects over rea
     host = await RuntimeHostKernel.start({
       owner,
       idleGraceMs: 60_000,
-      compositionFactory: async () => {
+      composition: defineInteractiveRuntimeHostComposition(async () => {
         coordinator = new HostClientCapabilityCoordinator({
+          ...clientCapabilityCoordinatorTestAdmission(),
           activation: new RuntimePolicyActivationGate(),
           onModelToolsChanged: () => undefined,
         });
@@ -62,12 +81,12 @@ test('unknown Client Capability loads, invokes, chunks, and disconnects over rea
           recover: async () => undefined,
           close: async () => coordinator?.close(),
         };
-      },
+      }),
     });
 
     const connected = await connectRuntimeHost({
       rootPath: root,
-      surface: 'desktop',
+      clientInstanceId: 'desktop-installation-a',
       protocol: {
         min: RUNTIME_HOST_PROTOCOL_VERSION,
         max: RUNTIME_HOST_PROTOCOL_VERSION,
@@ -90,6 +109,7 @@ test('unknown Client Capability loads, invokes, chunks, and disconnects over rea
             offerId: 'bypassed',
             version: '0',
             affinity: 'call',
+            hostPathAccess: 'cwd',
             label: 'Bypassed',
             tools: [
               {
@@ -113,8 +133,9 @@ test('unknown Client Capability loads, invokes, chunks, and disconnects over rea
           offerId: 'fixture_unknown',
           version: '0',
           affinity: 'session',
+          hostPathAccess: 'cwd',
           label: 'Unknown fixture',
-          description: 'A capability the Host source does not enumerate.',
+          description: 'Schedule a calendar meeting through the fixture provider.',
           tools: [
             {
               serverId: 'fixture_unknown',
@@ -143,7 +164,7 @@ test('unknown Client Capability loads, invokes, chunks, and disconnects over rea
         if (frame.toolName === 'reject_unknown') {
           throw new Error('Provider rejected before acceptance');
         }
-        await accept();
+        await accept({ kind: 'none' });
         return {
           content: [
             {
@@ -184,30 +205,33 @@ test('unknown Client Capability loads, invokes, chunks, and disconnects over rea
       abortSignal: new AbortController().signal,
       emitOutput: () => undefined,
     };
+    const activeTools = new Map<string, string>();
     const availability = new ToolAvailabilityRuntime(
       snapshot.tools,
-      { economy: true, groups: snapshot.groups },
+      { groups: snapshot.groups },
       invalidTool(),
-    ).prepare([]);
-    assert.deepEqual(availability.activeTools, [LOAD_TOOLS_NAME]);
-    const loadTools = availability.providerTools.find(
-      (candidate) => candidate.name === LOAD_TOOLS_NAME,
+    ).prepare(activeTools);
+    assert.deepEqual(availability.activeTools, [TOOL_SEARCH_NAME]);
+    const toolSearch = availability.providerTools.find(
+      (candidate) => candidate.name === TOOL_SEARCH_NAME,
     );
-    assert.ok(loadTools);
-    const loaded = await loadTools.impl({ group: group.id }, toolContext);
+    assert.ok(toolSearch);
+    const searched = await toolSearch.impl(
+      { query: 'schedule calendar meeting', limit: 20 },
+      toolContext,
+    );
     const capabilityToolNames = [tool.name, rejectedTool.name].sort((left, right) =>
       left.localeCompare(right),
     );
-    assert.deepEqual(loaded, { loaded: capabilityToolNames });
     assert.deepEqual(
-      availability.projectActiveTools?.({
-        completedSteps: [
-          {
-            toolCalls: [{ toolName: LOAD_TOOLS_NAME, input: { group: group.id } }],
-          },
-        ],
-      }).activeTools,
-      [LOAD_TOOLS_NAME, ...capabilityToolNames],
+      [...(searched as { activated: string[] }).activated].sort((left, right) =>
+        left.localeCompare(right),
+      ),
+      capabilityToolNames,
+    );
+    assert.deepEqual(
+      availability.projectActiveTools?.().activeTools,
+      [TOOL_SEARCH_NAME, ...capabilityToolNames].sort((left, right) => left.localeCompare(right)),
     );
 
     const result = await tool.impl({ prefix: 'from-uds' }, toolContext);
@@ -230,6 +254,39 @@ test('unknown Client Capability loads, invokes, chunks, and disconnects over rea
       (error: unknown) =>
         error instanceof ClientCapabilityInvocationError && error.code === 'capability_lost',
     );
+
+    const reconnected = await connectRuntimeHost({
+      rootPath: root,
+      clientInstanceId: 'desktop-installation-a',
+      protocol: {
+        min: RUNTIME_HOST_PROTOCOL_VERSION,
+        max: RUNTIME_HOST_PROTOCOL_VERSION,
+      },
+    });
+    assert.equal(reconnected.kind, 'connected');
+    if (reconnected.kind !== 'connected') return;
+    client = reconnected.connection;
+    await client.replaceClientCapabilities({
+      offers: provider.offers,
+      call: async (frame, { accept }) => {
+        await accept({ kind: 'none' });
+        return {
+          content: [{ type: 'text', text: `reconnected:${String(frame.arguments.prefix)}` }],
+        };
+      },
+    });
+    assert.deepEqual(await coordinator.bindSession('session-uds', client.connectionId), {
+      ok: true,
+    });
+    snapshot.release();
+    snapshot = coordinator.snapshotForSession('session-uds');
+    const reconnectedTool = snapshot?.tools.find(
+      (candidate) => candidate.name === mcpProxyToolName('fixture_unknown', 'make_unknown_payload'),
+    );
+    assert.ok(reconnectedTool);
+    assert.deepEqual(await reconnectedTool.impl({ prefix: 'from-uds' }, toolContext), {
+      content: [{ type: 'text', text: 'reconnected:from-uds' }],
+    });
   } finally {
     snapshot?.release();
     await client?.close().catch(() => undefined);

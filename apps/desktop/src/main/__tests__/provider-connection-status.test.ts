@@ -1,59 +1,89 @@
-import { strict as assert } from 'node:assert';
-import { describe, it } from 'node:test';
-import type { LlmConnection } from '@maka/core';
-import { connectionChipStatus } from '../../renderer/settings/provider-connection-status.js';
-import { connectionLastTestMessageDisplay } from '../../renderer/settings/provider-panel-shared.js';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
-function conn(input: Partial<LlmConnection> = {}): LlmConnection {
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import type { LlmConnection } from '@maka/core/llm-connections';
+import { connectionChipStatus } from '../../renderer/settings/provider-connection-status.js';
+
+function connection(overrides: Partial<LlmConnection> = {}): LlmConnection {
   return {
-    slug: 'c1',
-    name: '连接 1',
-    providerType: 'anthropic',
-    defaultModel: 'claude-sonnet-4-5-20250929',
+    slug: 'openai-live',
+    name: 'OpenAI Live',
+    providerType: 'openai',
+    defaultModel: 'gpt-4.1',
     enabled: true,
-    createdAt: 0,
-    updatedAt: 0,
-    ...input,
+    models: [{ id: 'gpt-4.1' }],
+    modelSource: 'fetched',
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
   };
 }
 
-describe('connectionChipStatus', () => {
-  it('maps lifecycle states without stale readiness signals', () => {
-    const cases: Array<
-      [Partial<LlmConnection>, ReturnType<typeof connectionChipStatus>]
-    > = [
-      [
-        { enabled: false, lastTestStatus: 'needs_reauth' },
-        { label: '需要重新登录', tone: 'info' },
-      ],
-      [
-        { enabled: true, lastTestStatus: 'needs_reauth' },
-        { label: '需要重新登录', tone: 'info' },
-      ],
-      [
-        { enabled: false, lastTestStatus: 'error' },
-        { label: '暂不可用 · 上次连接失败', tone: 'destructive' },
-      ],
-      [{ enabled: false, lastTestStatus: undefined }, { label: '暂不可用', tone: 'neutral' }],
-      [{ enabled: false, lastTestStatus: 'verified' }, { label: '暂不可用', tone: 'neutral' }],
-      [{ enabled: true, lastTestStatus: 'verified' }, null],
-      [
-        { enabled: true, lastTestStatus: 'error' },
-        { label: '上次连接失败', tone: 'destructive' },
-      ],
-      [{ enabled: true, lastTestStatus: undefined }, null],
-    ];
-    for (const [input, expected] of cases) {
-      assert.deepEqual(connectionChipStatus(conn(input)), expected);
-    }
+const retired = connection({
+  slug: 'claude-subscription',
+  name: 'Claude Subscription',
+  providerType: 'claude-subscription',
+  defaultModel: 'claude-opus-5',
+  models: [{ id: 'claude-opus-5' }],
+});
+
+test('a retired connection reads as broken rather than repairable', () => {
+  // Nothing else in the list marks this row, so without a status the only
+  // signal that it has to go is on the detail page the user has no reason to
+  // open.
+  assert.deepEqual(connectionChipStatus(retired, 'zh-CN'), {
+    label: '已停用 · 请删除',
+    tone: 'error',
+  });
+  assert.deepEqual(connectionChipStatus(retired, 'en'), {
+    label: 'Retired · delete it',
+    tone: 'error',
   });
 });
 
-describe('connectionLastTestMessageDisplay', () => {
-  it('localizes legacy status text without exposing unknown raw provider messages', () => {
-    assert.equal(connectionLastTestMessageDisplay('Authentication failed'), '鉴权失败');
-    assert.equal(connectionLastTestMessageDisplay('GitHub Copilot 登录已导入。'), 'GitHub Copilot 登录已导入。');
-    assert.equal(connectionLastTestMessageDisplay('upstream detail that should not reach settings'), '连接测试状态暂时无法显示，请重新测试。');
-    assert.equal(connectionLastTestMessageDisplay(undefined), undefined);
+test('retirement outranks every repairable state', () => {
+  // Each of these would otherwise render a "sign in again" or "it failed, try
+  // again" status, and for a retired provider both point at nothing.
+  for (const overrides of [
+    { lastTestStatus: 'needs_reauth' as const },
+    { lastTestStatus: 'error' as const },
+    { lastTestStatus: 'verified' as const },
+    { enabled: false },
+  ]) {
+    assert.deepEqual(
+      connectionChipStatus({ ...retired, ...overrides }, 'zh-CN'),
+      { label: '已停用 · 请删除', tone: 'error' },
+      `retirement must win over ${JSON.stringify(overrides)}`,
+    );
+  }
+});
+
+test('a live connection keeps its existing statuses', () => {
+  assert.equal(connectionChipStatus(connection({ lastTestStatus: 'verified' }), 'zh-CN'), null);
+  assert.deepEqual(connectionChipStatus(connection({ lastTestStatus: 'needs_reauth' }), 'zh-CN'), {
+    label: '需要重新登录',
+    tone: 'attention',
+  });
+  assert.deepEqual(connectionChipStatus(connection({ enabled: false }), 'zh-CN'), {
+    label: '暂不可用',
+    tone: 'neutral',
   });
 });

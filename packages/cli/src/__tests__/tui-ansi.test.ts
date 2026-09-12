@@ -1,66 +1,70 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
-import { afterEach, describe, test } from 'node:test';
-import {
-  ansi,
-  disc,
-  stripAnsi,
-  _setColorLevelForTesting,
-  _detectColorLevelForTesting as detect,
-} from '../tui-ansi.js';
+import { describe, test } from 'node:test';
+import { detectColorLevelFromEnv } from '../tui-ansi.js';
 
-// Reset to truecolor (the development default) after each test so a test that
-// changes the level never leaks into the next one.
-afterEach(() => _setColorLevelForTesting(3));
+/** Node's answer on a Windows 10+ console: truecolor, whatever TERM says. */
+const WINDOWS_CONSOLE_DEPTH = 24;
+/** Node's answer for a 256-color xterm. */
+const XTERM_256_DEPTH = 8;
+/** Node's answer when it finds no evidence of color support. */
+const NO_COLOR_DEPTH = 1;
 
-describe('tui-ansi semantic slots (#1053)', () => {
-  test('renders a single ● glyph regardless of tone', () => {
-    _setColorLevelForTesting(3);
-    for (const tone of ['ok', 'muted', 'accent', 'danger'] as const) {
-      assert.equal(stripAnsi(disc(tone)), '●', `tone ${tone} should yield one ●`);
-    }
+describe('detectColorLevelFromEnv', () => {
+  test('uses the terminal capability when TERM is unset — native Windows shells', () => {
+    // PowerShell and cmd.exe set no TERM at all. Reading that as "colorless"
+    // turns the whole TUI monochrome on a console that supports truecolor.
+    assert.equal(detectColorLevelFromEnv({}, WINDOWS_CONSOLE_DEPTH), 3);
   });
-});
 
-describe('color capability fallback (#1064)', () => {
-  test('adapts semantic and basic styles to each terminal color level', () => {
-    const cases = [
-      [3, '\x1b[38;2;87;163;239mx\x1b[39m', '\x1b[38;2;128;132;140mx\x1b[39m', '\x1b[1mx\x1b[22m'],
-      [2, '\x1b[38;5;75mx\x1b[39m', '\x1b[38;5;102mx\x1b[39m', '\x1b[1mx\x1b[22m'],
-      [1, '\x1b[37mx\x1b[39m', '\x1b[90mx\x1b[39m', '\x1b[1mx\x1b[22m'],
-      [0, 'x', 'x', 'x'],
-    ] as const;
-
-    for (const [level, accent, muted, bold] of cases) {
-      _setColorLevelForTesting(level);
-      assert.equal(ansi.accent('x'), accent, `accent level ${level}`);
-      assert.equal(ansi.muted('x'), muted, `muted level ${level}`);
-      assert.equal(ansi.bold('x'), bold, `bold level ${level}`);
-    }
+  test('honours an explicit COLORTERM even when TERM is unset', () => {
+    assert.equal(detectColorLevelFromEnv({ COLORTERM: 'truecolor' }, NO_COLOR_DEPTH), 3);
+    assert.equal(detectColorLevelFromEnv({ COLORTERM: '24bit' }, NO_COLOR_DEPTH), 3);
   });
-});
 
-describe('detectColorLevel env detection (#1064)', () => {
-  test('maps environment capabilities and overrides to color levels', () => {
-    const cases: Array<[Record<string, string>, number]> = [
-      [{ NO_COLOR: '1', TERM: 'xterm-256color', COLORTERM: 'truecolor' }, 0],
-      [{ NO_COLOR: '0', TERM: 'xterm-256color' }, 0],
-      [{ NO_COLOR: '', TERM: 'xterm-256color', COLORTERM: 'truecolor' }, 3],
-      [{}, 0],
-      [{ TERM: '' }, 0],
-      [{ TERM: 'dumb' }, 0],
-      [{ TERM: 'xterm-256color', COLORTERM: 'truecolor' }, 3],
-      [{ TERM: 'xterm', COLORTERM: '24bit' }, 3],
-      [{ TERM: 'xterm-truecolor' }, 3],
-      [{ TERM: 'tmux-24bit' }, 3],
-      [{ TERM: 'xterm-256color' }, 2],
-      [{ TERM: 'screen-256color' }, 2],
-      [{ TERM: 'xterm' }, 1],
-      [{ TERM: 'screen' }, 1],
-      [{ TERM: 'rxvt-unicode' }, 1],
-    ];
+  test('NO_COLOR and TERM=dumb still win over any capability', () => {
+    assert.equal(
+      detectColorLevelFromEnv({ NO_COLOR: '1', TERM: 'xterm-256color' }, WINDOWS_CONSOLE_DEPTH),
+      0,
+    );
+    assert.equal(detectColorLevelFromEnv({ TERM: 'dumb' }, WINDOWS_CONSOLE_DEPTH), 0);
+    // The NO_COLOR spec: an empty value does NOT disable color.
+    assert.equal(
+      detectColorLevelFromEnv({ NO_COLOR: '', TERM: 'xterm-256color' }, XTERM_256_DEPTH),
+      2,
+    );
+  });
 
-    for (const [env, expected] of cases) {
-      assert.equal(detect(env), expected, JSON.stringify(env));
-    }
+  test('maps the reported depth onto the three color levels', () => {
+    assert.equal(detectColorLevelFromEnv({ TERM: 'xterm-256color' }, XTERM_256_DEPTH), 2);
+    assert.equal(detectColorLevelFromEnv({ TERM: 'xterm' }, 4), 1);
+    assert.equal(detectColorLevelFromEnv({ TERM: 'xterm' }, NO_COLOR_DEPTH), 0);
+  });
+
+  test('falls back to the TERM ladder when there is no terminal to ask', () => {
+    // Piped output has no tty.WriteStream, so no depth is available. The
+    // pre-existing env ladder still answers, unchanged.
+    assert.equal(detectColorLevelFromEnv({ TERM: 'xterm-256color' }, undefined), 2);
+    assert.equal(detectColorLevelFromEnv({ TERM: 'xterm' }, undefined), 1);
+    assert.equal(detectColorLevelFromEnv({ TERM: 'xterm-truecolor' }, undefined), 3);
+    assert.equal(detectColorLevelFromEnv({}, undefined), 0);
   });
 });

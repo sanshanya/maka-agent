@@ -1,26 +1,51 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import {
   forwardRef,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type ComponentProps,
   type ClipboardEvent,
   type DragEvent,
   type FormEvent,
   type KeyboardEvent,
   type ReactNode,
 } from 'react';
+import type { LucideIcon } from './icons.js';
 import { useMountedRef } from './use-mounted-ref.js';
 import {
+  ICON_SIZE,
   ArrowUp,
+  CircleGauge,
   FileText,
   ListTodo,
-  Mic,
   Network,
   Pencil,
   Plus,
+  Square,
   Sparkles,
+  Target,
   Upload,
   Workflow,
 } from './icons.js';
@@ -32,9 +57,16 @@ import {
 } from './chat-model-switcher.js';
 import { useUiLocale } from './locale-context.js';
 import { getConversationCopy } from './conversation-copy.js';
-import { type ChatModelChoice, modelChoiceValue } from './chat-model-helpers.js';
-import { appendPromptContextDraft, isReferenceSizedPaste } from './composer-helpers.js';
+import { type ChatModelChoice, exactModelChoiceValue } from './chat-model-helpers.js';
+import {
+  appendPromptContextDraft,
+  deriveComposerModelSwitchAvailability,
+  isReferenceSizedPaste,
+  type ComposerModelSwitchAvailability,
+} from './composer-helpers.js';
 import { stripQuoteHeadingMarkers } from './quote-ref-chip.js';
+import { DirectoryReferenceChip } from './directory-reference-chip.js';
+import { FolderOpen } from './icons.js';
 import { WorkspacePicker, type WorkspacePickerModel } from './workspace-picker.js';
 import { useComposerDraft, type ComposerDraftPersistence } from './use-composer-draft.js';
 import { useComposerHistory } from './use-composer-history.js';
@@ -45,19 +77,31 @@ import {
   fileTransferContainsFiles,
   isChatInputComposing,
   mentionQueryMatches,
+  slashCommandQuery,
   skillMentionQuery,
   type ChatInputActionOwner,
   type ComposerTextPort,
 } from './chat-input-behavior.js';
-import { SKILL_INVOCATION_TOKEN_SOURCE } from '@maka/core';
-import type { AttachmentRef, PermissionMode, ProviderType, QuoteRef, SessionSummary } from '@maka/core';
+import { SKILL_INVOCATION_TOKEN_SOURCE } from '@maka/core/skill-invocation-token';
+import type {
+  AttachmentRef,
+  FollowUpMode,
+  MessageQueueEntryProjection,
+  QuoteRef,
+} from '@maka/core/events';
+import type { PermissionMode } from '@maka/core/permission';
+import type { OrchestrationMode } from '@maka/core/orchestration';
+import type { ProviderType } from '@maka/core/llm-connections';
+import type { SessionSummary } from '@maka/core/session';
 import {
   Button as UiButton,
   ChatComposer as AstryxChatComposer,
   ChatComposerDrawer,
   ChatComposerInput,
   IconButton,
+  Lightbox,
   Token,
+  Tooltip,
   useChatPasteAsToken,
   type ChatComposerInputHandle,
   type ChatComposerToken,
@@ -68,9 +112,15 @@ import {
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
+  DropdownMenuDivider,
   DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
 } from '@astryxdesign/core/DropdownMenu';
+import { useIndicator } from '@astryxdesign/core/Indicator';
 import { PermissionModeSelect } from './permission-mode-menu.js';
+import { AttachmentKindIcon } from './attachment-kinds.js';
+import { formatPreviewSize } from './artifact-preview-registry.js';
 import {
   inlineReferenceFileBasename,
   inlineReferenceToken,
@@ -78,6 +128,7 @@ import {
   workspaceFileReferencePositions,
   type WorkspaceFileReferencePosition,
 } from './inline-reference.js';
+import { ComposerMessageQueue, projectComposerMessageQueue } from './composer-message-queue.js';
 
 /** A Skill as the composer offers it: what the `/` menu lists and what a
  * chosen entry writes into the draft. */
@@ -87,6 +138,18 @@ export interface ComposerSkillOption {
   name: string;
   description?: string;
 }
+
+export interface ComposerSlashCommandOption {
+  id: string;
+  name: string;
+  description?: string;
+  keywords?: readonly string[];
+  Icon?: LucideIcon;
+}
+
+type ComposerSlashSuggestion =
+  | { kind: 'command'; command: ComposerSlashCommandOption; group: string }
+  | { kind: 'skill'; skill: ComposerSkillOption; group: string };
 
 /**
  * The draft text a chosen Skill becomes. This is the product-wide invocation
@@ -120,6 +183,15 @@ function skillTokenValue(id: string): string {
  */
 const COMPOSER_MAX_ROWS = 10;
 
+/** Uppercased extension for the staged-file card's meta line ("EPUB · 621.0 KB").
+ *  Null when the name has no usable extension, so the meta line is size-only. */
+function attachmentExtensionLabel(name: string): string | null {
+  const idx = name.lastIndexOf('.');
+  if (idx <= 0 || idx === name.length - 1) return null;
+  const ext = name.slice(idx + 1);
+  return ext.length > 8 ? null : ext.toUpperCase();
+}
+
 /**
  * PR-UI-15 (@yuejing 2026-05-22): Composer copy is locale-aware.
  *
@@ -139,31 +211,65 @@ export interface ComposerHandle {
   clearDraft(draftKey: string): void;
   /** Write a specific session draft before navigation changes the active key. */
   setDraft(draftKey: string, text: string): void;
+  /** Read a specific draft without changing the active input. */
+  getDraft(draftKey: string): string;
   /** Append to a specific session draft without replacing newer text. */
   appendDraft?(draftKey: string, text: string): void;
   /** Move focus to the input without changing its content. */
   focus(): void;
+  /** Open the active Session's existing account-and-model picker. */
+  openModelPicker(): void;
 }
 
 export interface ComposerSendMetadata {
   workspaceFileReferences?: readonly WorkspaceFileReferencePosition[];
+  followUpMode?: FollowUpMode;
 }
 
-type ComposerImportActionId = 'pick' | 'attach';
+type ComposerImportActionId = 'pick' | 'attach' | 'directory';
+
+export interface ComposerGoalProps {
+  /**
+   * Open the host's Goal dialog. The composer offers the entry and nothing
+   * else: a Goal names a condition and two budgets, which is a form, and the
+   * ＋ menu is a menu. Absent handler, no entry — the same rule the other
+   * ＋ entries follow.
+   */
+  onSetGoal?(): void | Promise<void>;
+  /**
+   * A Goal is already running here. Arming refuses a second one, so the
+   * entry says so up front instead of spending the user's click on an error.
+   */
+  goalActive?: boolean;
+}
 
 export const Composer = forwardRef<
   ComposerHandle,
   {
     disabled?: boolean;
+    placeholder?: string;
+    /**
+     * Prevent submission while leaving the draft and recovery controls usable.
+     * Hosts use this for configuration failures that the model picker can fix.
+     */
+    sendBlocked?: boolean;
     hidden?: boolean;
     /**
      * When true, a turn is in flight — live output OR the pre-first-token wait.
-     * Send becomes Stop. The ＋ menu and permission control stay reachable
-     * (#1444); the model and thinking menus stay mounted but lock with an
-     * explanatory tooltip, so the footer row never reflows mid-turn; import
-     * stays blocked mid-turn.
+     * Send becomes Stop while the draft is empty. The ＋ menu and permission
+     * control stay reachable (#1444); the model and thinking menus stay
+     * mounted but lock with an explanatory tooltip, so the footer row never
+     * reflows mid-turn. Attachment import remains blocked unless the host opts
+     * in via `allowAttachmentImportWhileStreaming`.
      */
     streaming?: boolean;
+    /**
+     * Keep attachment paste, drop, and picker imports available during a
+     * running turn. Only hosts whose running-turn submission carries staged
+     * attachments into a follow-up should opt in; text-only steering hosts
+     * must retain the default gate so text cannot leave its attachment behind.
+     */
+    allowAttachmentImportWhileStreaming?: boolean;
     /**
      * #646: retained for hosts that still track first-token wait vs mid-turn
      * lull. Quiet composer no longer surfaces long status copy from these;
@@ -176,22 +282,61 @@ export const Composer = forwardRef<
     continuing?: boolean;
     /** True while the current streaming session is processing a stop request. */
     stopPending?: boolean;
+    pendingMessages?: readonly import('./chat-view.js').TransientUserMessageProjection[];
+    queuedMessages?: readonly MessageQueueEntryProjection[];
+    queuedMessageRevision?: number;
+    /** Promote a queued follow-up into the active Turn (调整方向). */
+    onPromoteQueuedEntry?(entryId: string): void | Promise<void>;
+    /** Update one queued entry in place without changing its order or placement. */
+    onUpdateQueuedEntry?(
+      entryId: string,
+      expectedQueueRevision: number,
+      text: string,
+    ): void | Promise<void>;
+    /** Remove one queued entry without restoring it. */
+    onDeleteQueuedEntry?(entryId: string): void | Promise<void>;
+    /** Reorder the follow-up queue; entryIds is the full intended order. */
+    onReorderQueuedEntries?(entryIds: readonly string[]): void | Promise<void>;
     /** Runtime-only key used to keep unsent drafts isolated per session. */
     draftKey?: string;
     /** Optional host persistence for reload-safe draft scopes. */
     draftPersistence?: ComposerDraftPersistence;
+    /**
+     * The composer's one submit. Mid-turn the host decides what handing the
+     * draft over means there — steering, a control command — because that is a
+     * reading of the same action, not a second control on this surface.
+     */
     onSend(
       text: string,
       metadata?: ComposerSendMetadata,
     ): boolean | void | Promise<boolean | void>;
     onStop(): void | Promise<void>;
     onPickAttachments?(): void | Promise<void>;
+    onPickDirectory?(): void | Promise<void>;
+    pendingDirectories?: readonly import('@maka/core/events').DirectoryReference[];
+    onRemoveDirectory?(index: number): void;
     onAttachFilePaths?(files: File[]): void | Promise<void>;
-    pendingAttachments?: readonly { displayName: string; kind: AttachmentRef['kind']; mimeType?: string; size: number }[];
+    /** Hosts that can submit context without a text prompt opt in. */
+    allowAttachmentOnlySend?: boolean;
+    pendingAttachments?: readonly {
+      displayName: string;
+      kind: AttachmentRef['kind'];
+      mimeType?: string;
+      size: number;
+      /** Renderer-resolvable image source (object/data URL) for `kind: 'image'`
+       *  previews. When set, the chip is clickable and opens the image in a
+       *  Lightbox; while absent (still loading, or preview failed) the chip is
+       *  inert like any other kind. */
+      previewUrl?: string;
+    }[];
     onRemoveAttachment?(index: number): void;
     /** Quoted excerpts staged for the next send; rendered as removable chips. */
     pendingQuotes?: readonly QuoteRef[];
     onRemoveQuote?(index: number): void;
+    /** Start staged context collapsed on compact secondary composer surfaces. */
+    contextDrawerDefaultCollapsed?: boolean;
+    /** Hide the unavailable dot when an inherited model is intentionally read-only. */
+    showStaticModelUnavailableStatus?: boolean;
     /**
      * Stage a reference-sized paste as a quote chip rather than letting it
      * flood the textarea. Omitted by hosts that don't compose quotes, in which
@@ -200,32 +345,48 @@ export const Composer = forwardRef<
     onPasteAsQuote?(input: { text: string; label?: string }): void;
     modelLabel?: string;
     activeSession?: SessionSummary;
-    activeConnectionLabel?: string;
+    activeModelConnectionId?: string;
+    activeModelConnectionSlug?: string;
     activeModel?: string;
     activeModelLabel?: string;
     activeProviderType?: ProviderType;
     modelChoices?: ChatModelChoice[];
+    /** Maximum input height in the upstream editor's row units. */
+    maxInputRows?: number;
+    /** Whether this Session already has conversation history whose provider prompt cache may be rebuilt by a switch. */
+    modelSwitchHasHistory?: boolean;
+    /** Identity recovery must not present the stale target as a checked, selectable row. */
+    hideUnavailableCurrentModel?: boolean;
     /** Renders the provider brand mark beside each model option;
      *  injected by the desktop app to keep the provider SVG library out of @maka/ui. */
     renderProviderMark?(type: ProviderType): ReactNode;
-    modelChangePending?: boolean;
-    onModelChange?(input: { llmConnectionSlug: string; model: string }): void | Promise<void>;
+    /** Host-projected availability when another recovery surface opens this picker. */
+    modelSwitchAvailability?: ComposerModelSwitchAvailability;
+    onModelChange?(input: {
+      llmConnectionId: string;
+      llmConnectionSlug: string;
+      model: string;
+    }): void | Promise<void>;
     /** Per-model thinking-level variants for the active model; empty/undefined hides the switcher. */
-    activeThinkingLevels?: readonly import('@maka/core').ThinkingLevel[];
-    activeThinkingLevel?: import('@maka/core').ThinkingLevel;
-    onThinkingLevelChange?(level: import('@maka/core').ThinkingLevel | undefined): void | Promise<void>;
-    newChatThinkingLevels?: readonly import('@maka/core').ThinkingLevel[];
-    newChatThinkingLevel?: import('@maka/core').ThinkingLevel;
-    onNewChatThinkingLevelChange?(level: import('@maka/core').ThinkingLevel | undefined): void | Promise<void>;
+    activeThinkingLevels?: readonly import('@maka/core/model-thinking').ThinkingLevel[];
+    activeThinkingLevel?: import('@maka/core/model-thinking').ThinkingLevel;
+    onThinkingLevelChange?(level: import('@maka/core/model-thinking').ThinkingLevel | undefined): void | Promise<void>;
+    newChatThinkingLevels?: readonly import('@maka/core/model-thinking').ThinkingLevel[];
+    newChatThinkingLevel?: import('@maka/core/model-thinking').ThinkingLevel;
+    onNewChatThinkingLevelChange?(level: import('@maka/core/model-thinking').ThinkingLevel | undefined): void | Promise<void>;
     /**
      * Home / empty-state composer only (no active session yet): the model
      * the next new chat will start with, and the picker callback. When set,
      * the otherwise-static model chip becomes a real dropdown so the user can
      * choose the new-chat model inline instead of only via Settings · 模型.
      */
-    newChatModel?: { llmConnectionSlug: string; model: string };
+    newChatModel?: { llmConnectionId: string; llmConnectionSlug: string; model: string };
     newChatProviderType?: ProviderType;
-    onPickNewChatModel?(input: { llmConnectionSlug: string; model: string }): void | Promise<void>;
+    onPickNewChatModel?(input: {
+      llmConnectionId: string;
+      llmConnectionSlug: string;
+      model: string;
+    }): void | Promise<void>;
     /**
      * Empty-state only: no models are configured yet, so the model chip is a
      * non-interactive label. When provided, the chip becomes a button into
@@ -241,6 +402,22 @@ export const Composer = forwardRef<
      * constant footprint (#740).
      */
     noModelConnection?: boolean;
+    /** Optional Host-aware replacement for the generic no-model hint. */
+    noModelHint?: string;
+    /** Read-only usage indicator for the active model's latest request. */
+    contextUsage?: {
+      usageTokens?: number;
+      declaredContextWindow?: number;
+      /**
+       * The window the usage number was metered against, frozen at call time.
+       * When present it outranks the metadata window, so a live reading keeps
+       * its numerator and denominator from the same request.
+       */
+      meteredContextWindow?: number;
+      metadataContextWindow?: number;
+      /** Open the Host-owned trace surface for this readout. */
+      onOpen(): void;
+    };
     /**
      * Optional edit-and-resend banner above the composer. Desktop owns the
      * revision draft; Composer only renders the notice + cancel affordance.
@@ -259,6 +436,8 @@ export const Composer = forwardRef<
      * the moment the first message creates the session.
      */
     workspacePicker?: WorkspacePickerModel;
+    /** Host actions that share the composer's existing footer. */
+    footerAccessory?: ReactNode;
     /**
      * PR-MOVE-PERMISSION-MODE (WAWQAQ 47fe0d0e + a667cf6c): the
      * permission mode picker lives inside the composer left-controls
@@ -269,39 +448,43 @@ export const Composer = forwardRef<
      * option (#1611).
      */
     permissionMode?: PermissionMode;
-    permissionModePending?: boolean;
     permissionModeDisabledReason?: string;
     onPermissionModeChange?(mode: PermissionMode): void | Promise<void>;
     /**
-     * Session collaboration mode switch. Agent mode is the implicit default,
-     * so the composer only exposes whether Plan mode is enabled.
+     * Plan mode — a temporary collaboration excursion, and a toggle because
+     * that is what it is. Agent is the implicit default, so the composer only
+     * carries whether Plan is on. Runtime ends the excursion by itself when a
+     * proposal is approved or abandoned, which is why nothing here treats Plan
+     * as a resting mode the user must leave by hand.
      */
     planModeActive?: boolean;
-    planModePending?: boolean;
     planModeDisabledReason?: string;
     onPlanModeChange?(active: boolean): void | Promise<void>;
-    /** Session orchestration mode switch. Default mode remains the implicit fallback. */
-    swarmModeActive?: boolean;
-    swarmModePending?: boolean;
-    swarmModeDisabledReason?: string;
-    onSwarmModeChange?(active: boolean): void | Promise<void>;
-    graphModeActive?: boolean;
-    graphModePending?: boolean;
-    graphModeDisabledReason?: string;
-    onGraphModeChange?(active: boolean): void | Promise<void>;
-    voiceCaptureState?: 'idle' | 'requesting' | 'recording' | 'processing' | 'native_ready' | 'sending';
-    /** @deprecated Quiet composer drops realtime chrome; retained for host compatibility. */
-    realtimeVoiceState?: 'idle' | 'connecting' | 'connected';
-    voiceProviderLabel?: string;
     /**
-     * When provided (and the host has recognition configured), a single mic
-     * appears left of Send. Omitted by default so unconfigured voice is not a
-     * dead control.
+     * The Session's standing orchestration default. Of the field's three
+     * values only Swarm and Graph name a way to fan a turn out; `default` is
+     * the absence of one, so this is an optional choice between two rather
+     * than a choice among three. The two are exclusive — a run carries one
+     * orchestration — which is why the menu offers them as a radio group with
+     * no selection at rest, not as two switches that would silently turn each
+     * other off.
+     *
+     * Independent of Plan on purpose. The two are different fields with
+     * different lifetimes: Plan gates which tools a turn gets, this names how
+     * a turn fans out by default, and Runtime resolves the overlap by
+     * stripping the subagent and agent-graph tools while planning. So "plan
+     * with Swarm armed for afterwards" is a state the Session can hold, and
+     * neither control writes the other's field.
      */
-    onToggleVoiceCapture?(input?: { dictate?: boolean }): void | Promise<void>;
-    onCancelVoiceCapture?(): void;
-    /** @deprecated Realtime voice is not rendered in the quiet composer. */
-    onToggleRealtimeVoice?(): void | Promise<void>;
+    orchestrationMode?: OrchestrationMode;
+    orchestrationModeDisabledReason?: string;
+    onOrchestrationModeChange?(mode: OrchestrationMode): void | Promise<void>;
+    /**
+     * Why a Goal cannot be set right now — a running Turn, typically. A Goal
+     * takes hold on the Turn after it is armed, so arming during one reads as
+     * having done nothing; the host names the reason and the entry shows it.
+     */
+    goalDisabledReason?: string;
     /**
      * Composer mention popups. Both are optional and the whole feature no-ops
      * when absent (SSR contracts render Composer with minimal props):
@@ -313,8 +496,32 @@ export const Composer = forwardRef<
      *   - `onSearchMentionFiles` powers the `@` popup.
      */
     mentionSkills?: ReadonlyArray<ComposerSkillOption>;
+    /**
+     * The host's SETTLED verdict on whether the catalog has anything to offer,
+     * held steady across refreshes. The host clears `mentionSkills` while
+     * re-fetching it (the `/` popup must stay fail-closed), so the list being
+     * empty cannot tell "refreshing" from "no skills" — and reading the
+     * transient `[]` as the latter disables the ＋ menu's Skills row and grows
+     * it by a description line for the length of the round trip, blinking the
+     * open menu's geometry on every mode or model change. Hosts that never
+     * clear the list mid-flight can omit this; the row then falls back to
+     * `mentionSkills.length === 0`.
+     */
+    mentionSkillsUnavailable?: boolean;
+    /**
+     * True while the host is re-fetching `mentionSkills`. The row's LOOK is
+     * governed by `mentionSkillsUnavailable` and does not move during a
+     * refresh; this flag governs what a click DOES. Mid-refresh the enabled
+     * look is a held presentation of the previous catalog, not a promise the
+     * current one can honor — acting on it would write a stray `/` into the
+     * draft and pop an empty menu — so the row ignores clicks (and stops
+     * closing the menu, so the click can simply be retried) until the catalog
+     * settles.
+     */
+    mentionSkillsLoading?: boolean;
+    slashCommands?: ReadonlyArray<ComposerSlashCommandOption>;
     onSearchMentionFiles?(query: string): Promise<ReadonlyArray<{ relativePath: string }>>;
-  }
+  } & ComposerGoalProps
 >(function Composer(props, ref) {
   const formRef = useRef<HTMLFormElement>(null);
   /** Astryx's imperative handle on the contentEditable input. */
@@ -326,10 +533,21 @@ export const Composer = forwardRef<
   }
   const [dragActive, setDragActive] = useState(false);
   const [sendPending, setSendPending] = useState(false);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const modelSwitchAvailability =
+    props.modelSwitchAvailability ??
+    deriveComposerModelSwitchAvailability({
+      streaming: props.streaming,
+      sessionStatus: props.activeSession?.status,
+    });
+  const modelSwitchAvailabilityRef = useRef(modelSwitchAvailability);
+  modelSwitchAvailabilityRef.current = modelSwitchAvailability;
+  useLayoutEffect(() => setModelPickerOpen(false), [props.activeSession?.id]);
   const [pendingImportAction, setPendingImportAction] = useState<ComposerImportActionId | null>(null);
   const composerMountedRef = useMountedRef();
   const sendPendingRef = useRef(false);
   const compositionActiveRef = useRef(false);
+  const plainTextPasteInputActiveRef = useRef(false);
   const importActionOwnerRef = useRef<ChatInputActionOwner<ComposerImportActionId> | null>(null);
   if (!importActionOwnerRef.current) {
     importActionOwnerRef.current = createChatInputActionOwner((action) => {
@@ -359,6 +577,8 @@ export const Composer = forwardRef<
    * identity so neither hook re-runs an effect when the draft changes.
    */
   const caretToEndRef = useRef(false);
+  /** A caret-to-end owed to an editor that was not focused when it came due. */
+  const caretPendingRef = useRef(false);
   const redrawPendingRef = useRef(false);
   const textPortRef = useRef<ComposerTextPort>(null);
   if (!textPortRef.current) {
@@ -383,10 +603,27 @@ export const Composer = forwardRef<
    * say) then landed the caret at offset 0, so typing prepended to the restored
    * draft. Collapse to the end here when the editor holds no selection of its
    * own, which is what the retired `focusTextInputAtEnd` did unconditionally.
+   *
+   * Only on a focused editor, though. A selection inside a `contenteditable` is
+   * never only a caret: the browser focuses the element to carry it, whatever
+   * held focus before — measured in the shipping runtime, a selection placed
+   * here takes focus from a focused button exactly as it takes it from `body` —
+   * and sequential focus navigation then resumes from the selection rather than
+   * from the top of the document. So a restored draft claimed focus nobody
+   * directed at it: on a cold start, tens of milliseconds in, past the skip link
+   * and with no `focus()` call to explain it; and on a session swap, out from
+   * under the sidebar row the user had just activated. Hold the caret while the
+   * editor is not focused and land it on the editor's next real focus, which is
+   * the first moment the offset is the only thing being decided.
    */
   function caretToContentEnd() {
     const editable = editableNode();
     if (!editable) return;
+    if (document.activeElement !== editable) {
+      caretPendingRef.current = true;
+      return;
+    }
+    caretPendingRef.current = false;
     const selection = document.getSelection();
     const range = document.createRange();
     range.selectNodeContents(editable);
@@ -401,6 +638,30 @@ export const Composer = forwardRef<
     if (!editable || (selection?.anchorNode && editable.contains(selection.anchorNode))) return;
     caretToContentEnd();
   }
+  /**
+   * Settle a held caret when focus reaches the editor for real. On the component
+   * root, like the other native listeners here: `focusin` and `pointerdown`
+   * bubble, and a disabled composer renders no editable to look up at mount.
+   *
+   * A pointer press places the caret itself and is the more specific intent, so
+   * it drops the claim rather than being overruled by it.
+   */
+  useEffect(() => {
+    const root = inputRootRef.current;
+    if (!root) return undefined;
+    const land = () => {
+      if (caretPendingRef.current) caretToContentEnd();
+    };
+    const drop = () => {
+      caretPendingRef.current = false;
+    };
+    root.addEventListener('focusin', land);
+    root.addEventListener('pointerdown', drop);
+    return () => {
+      root.removeEventListener('focusin', land);
+      root.removeEventListener('pointerdown', drop);
+    };
+  }, []);
   /**
    * The ＋ menu's Skills entry opens the same `/` menu the keyboard opens: it
    * types the trigger for the user. There is no second Skill surface to keep in
@@ -532,13 +793,27 @@ export const Composer = forwardRef<
    * The redraw gets the same treatment for the same reason, and can land a
    * render later than the write that owed it: `insertToken` parks the selection
    * after the last chip it wrote, so the caret has to be collected again.
+   *
+   * A held caret is suspended across the redraw rather than left armed. The
+   * redraw drives `insertToken` through the document selection, and its first
+   * range focuses the editor — which would otherwise fire the focus lander onto
+   * the very range the redraw is holding, collapsing it to the end so the chip
+   * landed at the end and its source text stayed in the draft. The redraw ends
+   * by collecting the caret itself, so on success the claim is settled; on a
+   * pass that redrew nothing it is handed back untouched.
    */
   useEffect(() => {
     let restoreCaret = caretToEndRef.current;
     caretToEndRef.current = false;
-    if (redrawPendingRef.current && redrawSkillTokens()) {
-      redrawPendingRef.current = false;
-      restoreCaret = true;
+    if (redrawPendingRef.current) {
+      const heldCaret = caretPendingRef.current;
+      caretPendingRef.current = false;
+      const redrew = redrawSkillTokens();
+      caretPendingRef.current = redrew ? false : heldCaret;
+      if (redrew) {
+        redrawPendingRef.current = false;
+        restoreCaret = true;
+      }
     }
     if (restoreCaret) caretToContentEnd();
   });
@@ -550,6 +825,7 @@ export const Composer = forwardRef<
     saveCurrentDraft,
     clearDraft,
     setDraft,
+    getDraft,
     appendDraft,
     activeDraftKey,
   } = useComposerDraft({
@@ -566,11 +842,6 @@ export const Composer = forwardRef<
   const locale = useUiLocale();
   const copy = getConversationCopy(locale).composer;
   const mentionCopy = getConversationCopy(locale).mentions;
-  const voiceCaptureLabel = props.voiceCaptureState === 'recording'
-    ? copy.voiceStopRecording
-    : props.voiceCaptureState === 'native_ready'
-      ? copy.voiceSend
-      : copy.voiceStart;
 
   useEffect(() => {
     return () => {
@@ -647,14 +918,18 @@ export const Composer = forwardRef<
   // through this ref instead.
   const mentionSourceRef = useRef({
     mentionSkills: props.mentionSkills,
+    slashCommands: props.slashCommands,
     onSearchMentionFiles: props.onSearchMentionFiles,
+    commandsGroup: mentionCopy.commandsGroup,
+    skillsGroup: mentionCopy.skillsGroup,
   });
-  useEffect(() => {
-    mentionSourceRef.current = {
-      mentionSkills: props.mentionSkills,
-      onSearchMentionFiles: props.onSearchMentionFiles,
-    };
-  });
+  mentionSourceRef.current = {
+    mentionSkills: props.mentionSkills,
+    slashCommands: props.slashCommands,
+    onSearchMentionFiles: props.onSearchMentionFiles,
+    commandsGroup: mentionCopy.commandsGroup,
+    skillsGroup: mentionCopy.skillsGroup,
+  };
 
   const searchSourcesRef = useRef<{ files: SearchSource; skills: SearchSource }>(null);
   if (!searchSourcesRef.current) {
@@ -668,21 +943,69 @@ export const Composer = forwardRef<
       );
     };
     const files = createTriggerSearchSource<SearchableItem>(runFileSearch);
-    const listSkills = (rawQuery: string): SearchableItem[] => {
-      const skills = mentionSourceRef.current.mentionSkills ?? [];
+    const listSlashSuggestions = (rawQuery: string): SearchableItem[] => {
+      const source = mentionSourceRef.current;
+      const skills = source.mentionSkills ?? [];
+      const editable = editableNode();
+      const selection = document.getSelection();
+      let textBeforeCaret = textPort.getValue();
+      let textAfterCaret = '';
+      if (
+        editable &&
+        selection?.focusNode &&
+        editable.contains(selection.focusNode)
+      ) {
+        const range = document.createRange();
+        range.selectNodeContents(editable);
+        range.setEnd(selection.focusNode, selection.focusOffset);
+        textBeforeCaret = range.toString();
+        range.selectNodeContents(editable);
+        range.setStart(selection.focusNode, selection.focusOffset);
+        textAfterCaret = range.toString();
+      }
+      const commandQuery = slashCommandQuery(textBeforeCaret, textAfterCaret, rawQuery);
       const query = skillMentionQuery(rawQuery);
-      return skills
+      const commandItems = commandQuery === null
+        ? []
+        : (source.slashCommands ?? [])
+            .filter((command) =>
+              mentionQueryMatches(
+                commandQuery,
+                `${command.id} ${command.name} ${command.description ?? ''} ${(command.keywords ?? []).join(' ')}`,
+              ),
+            )
+            .map((command) => ({
+              id: `command:${command.id}`,
+              label: command.name,
+              auxiliaryData: {
+                kind: 'command',
+                command,
+                group: source.commandsGroup,
+              } satisfies ComposerSlashSuggestion,
+            }));
+      const skillItems = skills
         .filter((skill) =>
           mentionQueryMatches(query, `${skill.id} ${skill.name} ${skill.description ?? ''}`),
         )
-        .slice(0, 50)
-        .map((skill) => ({ id: skill.id, label: skill.name, auxiliaryData: skill }));
+        .map((skill) => ({
+          id: `skill:${skill.id}`,
+          label: skill.name,
+          auxiliaryData: {
+            kind: 'skill',
+            skill,
+            group: source.skillsGroup,
+          } satisfies ComposerSlashSuggestion,
+        }));
+      return [...commandItems, ...skillItems].slice(0, 50);
     };
     // `bootstrap` is required by SearchSource but never called by
     // `useTriggerMenu`; the menu opens straight into `search`.
     searchSourcesRef.current = {
       files,
-      skills: { bootstrap: () => listSkills(''), search: listSkills },
+      skills: {
+        bootstrap: () => listSlashSuggestions(''),
+        search: listSlashSuggestions,
+      },
     };
   }
 
@@ -700,7 +1023,7 @@ export const Composer = forwardRef<
         loadingText: mentionCopy.loading,
         renderItem: (item) => (
           <>
-            <FileText size={14} aria-hidden="true" className="maka-composer-mention-icon" />
+            <FileText size={ICON_SIZE.control} aria-hidden="true" className="maka-composer-mention-icon" />
             <span className="maka-composer-mention-text">
               <span className="maka-composer-mention-name">{inlineReferenceFileBasename(item.id)}</span>
               <span className="maka-composer-mention-secondary">{item.id}</span>
@@ -722,17 +1045,26 @@ export const Composer = forwardRef<
           inlineReferenceToken(workspaceFileInlineReference(item.id)),
       });
     }
-    if (props.mentionSkills !== undefined) {
+    if (
+      props.mentionSkills !== undefined ||
+      (props.slashCommands?.length ?? 0) > 0
+    ) {
       list.push({
         character: '/',
         searchSource: sources.skills,
-        menuLabel: mentionCopy.skillsAriaLabel,
-        emptySearchResultsText: mentionCopy.noSkills,
+        menuLabel:
+          (props.slashCommands?.length ?? 0) > 0
+            ? mentionCopy.commandsAndSkillsAriaLabel
+            : mentionCopy.skillsAriaLabel,
+        emptySearchResultsText:
+          (props.slashCommands?.length ?? 0) > 0
+            ? mentionCopy.noCommandsOrSkills
+            : mentionCopy.noSkills,
         loadingText: mentionCopy.loading,
         // Name over description, and no id: the second line is one line wide,
         // and the id spent a dozen characters of it on a string nobody types
         // here — the menu is how you avoid typing it. It stays searchable
-        // (`listSkills` matches against it) and it is still what the chip
+        // (the slash source matches against it) and it is still what the chip
         // serializes to; it just no longer crowds out the sentence that tells
         // two Skills apart.
         //
@@ -741,10 +1073,35 @@ export const Composer = forwardRef<
         // and none carries one on hover. A `/` menu is driven with ↑↓, so a
         // hover-only description would be invisible to the way it is used.
         renderItem: (item) => {
-          const skill = item.auxiliaryData as ComposerSkillOption;
+          const suggestion = item.auxiliaryData as ComposerSlashSuggestion;
+          if (suggestion.kind === 'command') {
+            const { command } = suggestion;
+            const Icon = command.Icon;
+            return (
+              <>
+                {Icon ? (
+                  <Icon
+                    size={ICON_SIZE.control}
+                    aria-hidden="true"
+                    className="maka-composer-mention-icon"
+                  />
+                ) : null}
+                <span className="maka-composer-mention-text">
+                  <span className="maka-composer-mention-name">
+                    {command.name}
+                    <span className="maka-composer-command-token">/{command.id}</span>
+                  </span>
+                  <span className="maka-composer-mention-secondary">
+                    {command.description}
+                  </span>
+                </span>
+              </>
+            );
+          }
+          const { skill } = suggestion;
           return (
             <>
-              <Sparkles size={14} aria-hidden="true" className="maka-composer-mention-icon" />
+              <Sparkles size={ICON_SIZE.control} aria-hidden="true" className="maka-composer-mention-icon" />
               <span className="maka-composer-mention-text">
                 <span className="maka-composer-mention-name">{skill.name}</span>
                 <span className="maka-composer-mention-secondary">{skill.description}</span>
@@ -767,18 +1124,28 @@ export const Composer = forwardRef<
         //
         // No colour: Maka blue is the single product accent, and a staged
         // Skill is identified by its sparkle and its label.
-        onSelect: (item): ChatComposerToken =>
-          inlineReferenceToken({
+        onSelect: (item): string | ChatComposerToken => {
+          const suggestion = item.auxiliaryData as ComposerSlashSuggestion;
+          if (suggestion.kind === 'command') {
+            return `/${suggestion.command.id} `;
+          }
+          return inlineReferenceToken({
             kind: 'skill',
-            value: skillTokenValue(item.id),
-            label: (item.auxiliaryData as ComposerSkillOption).name,
-          }),
+            value: skillTokenValue(suggestion.skill.id),
+            label: suggestion.skill.name,
+          });
+        },
       });
     }
     return list;
     // The sources live in a ref, so only the localized copy, provider presence,
     // and the Skill projection identity (see the refresh effect below) matter.
-  }, [locale, Boolean(props.onSearchMentionFiles), props.mentionSkills]);
+  }, [
+    locale,
+    Boolean(props.onSearchMentionFiles),
+    props.mentionSkills,
+    props.slashCommands,
+  ]);
 
   /**
    * A visible `/` menu must never keep offering a Skill the host has since
@@ -791,7 +1158,7 @@ export const Composer = forwardRef<
     const editable = editableNode();
     if (editable?.getAttribute('aria-expanded') !== 'true') return;
     editable.dispatchEvent(new Event('input', { bubbles: true }));
-  }, [props.mentionSkills]);
+  }, [locale, props.mentionSkills, props.slashCommands]);
 
   /**
    * An open menu must follow the caret, not just the text. `useTriggerMenu`
@@ -874,6 +1241,9 @@ export const Composer = forwardRef<
         focusInput();
         textPort.setValue(nextText);
       },
+      getDraft(draftKey: string) {
+        return getDraft(draftKey);
+      },
       appendDraft(draftKey: string, nextText: string) {
         const next = appendDraft(draftKey, nextText);
         if (activeDraftKey() !== draftKey) return;
@@ -884,17 +1254,26 @@ export const Composer = forwardRef<
       focus() {
         focusInput();
       },
+      openModelPicker() {
+        if (!modelSwitchAvailabilityRef.current.available) return;
+        setModelPickerOpen(true);
+      },
     }),
     [],
   );
 
-  async function sendCurrent() {
-    if (props.disabled || sendPendingRef.current || importActionOwnerRef.current?.pending) return;
+  async function sendCurrent(followUpMode?: FollowUpMode) {
+    if (
+      props.disabled
+      || props.sendBlocked
+      || sendPendingRef.current
+      || importActionOwnerRef.current?.pending
+    ) return;
     // There is one authoritative draft: staged Skills and files serialize into
     // `text`. The optional metadata below is a send-time rendering snapshot of
     // file chips that still exist in the editor, not a second draft state.
     const text = composerWireText(textPort.getValue());
-    if (!text) return;
+    if (!text && !(props.allowAttachmentOnlySend && props.pendingAttachments?.length)) return;
     const editable = editableNode();
     const workspaceFileReferences = editable ? workspaceFileReferencePositions(editable) : [];
     const submittedDraftKey = activeDraftKey();
@@ -902,10 +1281,11 @@ export const Composer = forwardRef<
     setSendPending(true);
     let sent: boolean | void;
     try {
-      sent = await props.onSend(
-        text,
-        workspaceFileReferences.length > 0 ? { workspaceFileReferences } : undefined,
-      );
+      const metadata: ComposerSendMetadata = {
+        ...(workspaceFileReferences.length > 0 ? { workspaceFileReferences } : {}),
+        ...(followUpMode ? { followUpMode } : {}),
+      };
+      sent = await props.onSend(text, Object.keys(metadata).length > 0 ? metadata : undefined);
     } finally {
       sendPendingRef.current = false;
       if (composerMountedRef.current) setSendPending(false);
@@ -915,21 +1295,38 @@ export const Composer = forwardRef<
     // Save to both local ref and global persistence so the history
     // survives page reloads and is shared across all input surfaces.
     rememberSentEntry(text);
-    clearDraft(submittedDraftKey);
     // The owner may have changed while onSend awaited (new-session creation,
     // revision branch, or user navigation). Never erase a foreign draft.
-    if (activeDraftKey() !== submittedDraftKey) return;
+    if (activeDraftKey() !== submittedDraftKey) {
+      clearDraft(submittedDraftKey);
+      return;
+    }
+    // The user can begin the next message while the send IPC is still
+    // resolving. Clear only the exact draft that was submitted; a newer value
+    // belongs to the next send and must survive this older completion.
+    if (composerWireText(textPort.getValue()) !== text) {
+      saveCurrentDraft(textPort.getValue());
+      return;
+    }
+    clearDraft(submittedDraftKey);
     textPort.setValue('');
     saveCurrentDraft('');
   }
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    // Mid-turn the host queues the draft as a follow-up by default; only
+    // Shift+Enter (see onInputKeyDown) steers it into the active Turn.
     void sendCurrent();
   }
 
+  const attachmentImportBlocked = Boolean(
+    props.disabled
+      || (props.streaming && !props.allowAttachmentImportWhileStreaming),
+  );
+
   async function runImportAction(actionId: ComposerImportActionId, action: (() => void | Promise<void>) | undefined) {
-    if (!action || props.disabled || props.streaming) return;
+    if (!action || attachmentImportBlocked) return;
     await importActionOwnerRef.current?.run(actionId, async () => {
       await action();
     });
@@ -957,15 +1354,6 @@ export const Composer = forwardRef<
       );
       return;
     }
-    if (
-      event.key === 'Escape' &&
-      props.voiceCaptureState &&
-      props.voiceCaptureState !== 'idle'
-    ) {
-      event.preventDefault();
-      props.onCancelVoiceCapture?.();
-      return;
-    }
     // Esc while a drag-active highlight is showing should clear it
     // immediately. The existing useEffect listens for blur/dragend/drop
     // but not keydown, so a user who hits Esc to cancel a stuck drag
@@ -991,18 +1379,15 @@ export const Composer = forwardRef<
       if (handleArrowKey(event)) return;
     }
     if (event.key !== 'Enter') return;
-    // Shift+Enter / Alt+Enter insert a line break instead of sending. We have
-    // to insert it ourselves rather than fall through: ChatComposerInput's own
-    // Enter branch only exempts Shift, so a bare `return` here would hand it
-    // Alt+Enter as a submit — and that path clears the editor even when it
-    // sends nothing, silently dropping the draft.
-    if (event.shiftKey || event.altKey) {
+    // Alt+Enter always inserts a line break. During a running turn, Shift+Enter
+    // steers this one draft into the active Turn; plain Enter queues it.
+    if (event.altKey || (event.shiftKey && !props.streaming)) {
       event.preventDefault();
       document.execCommand('insertLineBreak');
       return;
     }
     event.preventDefault();
-    void sendCurrent();
+    void sendCurrent(props.streaming && event.shiftKey ? 'steer' : undefined);
   }
 
   function onInputChange(next: string) {
@@ -1012,7 +1397,11 @@ export const Composer = forwardRef<
   }
 
   function canAcceptDroppedFiles(): boolean {
-    return Boolean(props.onAttachFilePaths && !props.disabled && !props.streaming && !importActionOwnerRef.current?.pending);
+    return Boolean(
+      props.onAttachFilePaths
+        && !attachmentImportBlocked
+        && !importActionOwnerRef.current?.pending,
+    );
   }
 
   function hasDraggedFiles(event: DragEvent<HTMLFormElement>): boolean {
@@ -1069,24 +1458,32 @@ export const Composer = forwardRef<
   const noModelConnection = props.noModelConnection === true;
   const sendDisabled =
     props.disabled ||
+    props.sendBlocked ||
     sendPending ||
     importActionBusy ||
-    !text.trim() ||
+    (!text.trim() && !(props.allowAttachmentOnlySend && props.pendingAttachments?.length)) ||
     noModelConnection;
   // The disabled Send is explanatory only in the no-model dead-end; other
   // disabled reasons (empty draft, in-flight import) keep the neutral label.
   const sendTitle = noModelConnection && !props.disabled ? copy.noModelSendTitle : copy.sendLabel;
+  // One slot, one button, two states — Astryx's send/stop toggle. Mid-turn an
+  // empty draft has nothing to submit, so the slot is Stop; the moment there is
+  // a draft, handing it over is the only meaningful action there and the button
+  // returns to Send (the host queues it as a follow-up). Stop is not lost in
+  // that window: Esc interrupts from the input, which is where the hands already
+  // are.
+  const stopShown = props.streaming === true && (!text.trim() || props.sendBlocked === true);
+  // A Host receipt is not model consumption. Keep steering above the composer
+  // until the host surface retires its transient on steering_message.
+  const queuedMessages = projectComposerMessageQueue(props.queuedMessages ?? [], props.pendingMessages ?? []);
+  const queueCount = queuedMessages.length;
   const modelChipLabel = props.modelLabel?.trim() || copy.selectModel;
   // Mid-turn the model and thinking menus stay mounted but locked, each
   // carrying the reason in its own words (model vs thinking level) — the
   // lock is one state with two wordings, not two locks.
-  const switchLock = props.streaming
-    ? 'streaming'
-    : props.activeSession?.status === 'running'
-      ? 'running'
-      : props.activeSession?.status === 'waiting_for_user'
-        ? 'permission'
-        : undefined;
+  const switchLock = modelSwitchAvailability.available
+    ? undefined
+    : modelSwitchAvailability.reason;
   const modelSwitcherDisabledReason =
     switchLock === 'streaming' ? copy.switchDisabledStreaming
     : switchLock === 'running' ? copy.switchDisabledRunning
@@ -1108,115 +1505,190 @@ export const Composer = forwardRef<
    * Skill is a chip in the draft itself, visible where it will be sent from.
    */
   const drawerTokenCount =
-    (props.pendingQuotes?.length ?? 0) + (props.pendingAttachments?.length ?? 0);
+    (props.pendingQuotes?.length ?? 0) +
+    (props.pendingAttachments?.length ?? 0) +
+    (props.pendingDirectories?.length ?? 0);
+  /** The last staged image opened from a chip (Lightbox media shape). Kept
+   *  mounted after close — see the Lightbox render — so only the open flag
+   *  drives visibility. */
+  const [attachmentLightbox, setAttachmentLightbox] = useState<{
+    src: string;
+    alt: string;
+    caption: string;
+  } | null>(null);
+  const [attachmentLightboxOpen, setAttachmentLightboxOpen] = useState(false);
+  useEffect(() => {
+    if (attachmentLightboxOpen || !attachmentLightbox) return;
+    // Unmount one commit AFTER the closed render, never in it: child effects
+    // run first, so Astryx has already executed dialog.close() — the native
+    // hand-back of focus to the chip button — by the time this fires. The
+    // deferred unmount also keeps the DOM to a single .astryx-lightbox for
+    // the chat transcript's own lightbox.
+    setAttachmentLightbox(null);
+  }, [attachmentLightboxOpen, attachmentLightbox]);
   /**
-   * The session modes that are currently on, in the order the ＋ menu lists
-   * them. The menu stays the switch — it turns each mode on *and* off; these
-   * marks are the resting state readout, plus one nearby way out. They sit at
-   * the tail of the footer's left controls, after the model and thinking
-   * pickers, so switching a mode never shifts those two.
+   * The orchestration modes the ＋ menu offers — the field's two real values.
+   *
+   * `default` is not among them and has no row: it is not a third thing to
+   * pick, it is what the Session is when neither of these is chosen. The group
+   * carries that as no selection, which is a state Astryx's radio group takes
+   * (`value: string | undefined`) and screen readers announce as a set with
+   * nothing checked.
+   */
+  const orchestrationOptions: ReadonlyArray<{
+    id: Exclude<OrchestrationMode, 'default'>;
+    icon: ReactNode;
+    label: string;
+    onTitle: string;
+  }> = [
+    {
+      id: 'swarm',
+      icon: <Network size={ICON_SIZE.control} aria-hidden="true" />,
+      label: copy.swarmModeLabel,
+      onTitle: copy.swarmModeOnTitle,
+    },
+    {
+      id: 'graph',
+      icon: <Workflow size={ICON_SIZE.control} aria-hidden="true" />,
+      label: copy.graphModeLabel,
+      onTitle: copy.graphModeOnTitle,
+    },
+  ];
+  /** A host that passes no handler cannot be in a mode this control can leave. */
+  const planModeActive = props.onPlanModeChange !== undefined && props.planModeActive === true;
+  // Deliberately NOT disabled while the host commits a toggle. The host
+  // already drops re-entrant toggles itself, so a disable during its short
+  // IPC round trip carries no protection — it only dims the row (and the
+  // footer mark) to half opacity and back on every click, a visible blink
+  // in the very menu the user is looking at.
+  const planModeDisabled =
+    props.disabled === true
+    || Boolean(props.planModeDisabledReason);
+  const orchestrationMode: OrchestrationMode =
+    props.onOrchestrationModeChange ? props.orchestrationMode ?? 'default' : 'default';
+  const orchestrationModeDisabled =
+    props.disabled === true
+    || Boolean(props.orchestrationModeDisabledReason);
+  /**
+   * The marks at the tail of the footer's left controls are the resting
+   * readout for whatever is on, plus one nearby way out each; the menu stays
+   * the switch. They sit after the model and thinking pickers, so a mode
+   * turning on or off never shifts those two.
+   *
+   * There can be two of them — Plan and an orchestration default are separate
+   * Session state, and a Session holding both should say so rather than have
+   * one of them hidden behind the other.
    *
    * Which mode a mark is comes from its icon, never from a hue. Maka blue is
    * the single product accent (DESIGN.md), so a per-mode colour would be a
    * second and third accent carrying no semantic — and a coloured pill per
    * status is on the same file's Don't list.
    */
-  const modes: ReadonlyArray<{
-    id: 'plan' | 'swarm' | 'graph';
-    active: boolean;
+  const activeModeMarks: ReadonlyArray<{
+    id: string;
     icon: ReactNode;
     label: string;
-    onTitle: string;
+    tooltip: string;
     isDisabled: boolean;
-    disabledReason: string | undefined;
     onDeactivate(): void;
   }> = [
-    {
-      id: 'plan',
-      active: props.planModeActive === true && props.onPlanModeChange !== undefined,
-      icon: <ListTodo size={15} aria-hidden="true" />,
-      label: copy.planModeLabel,
-      onTitle: copy.planModeOnTitle,
-      isDisabled:
-        props.disabled === true
-        || props.planModePending === true
-        || Boolean(props.planModeDisabledReason),
-      disabledReason: props.planModeDisabledReason,
-      onDeactivate: () => { void props.onPlanModeChange?.(false); },
-    },
-    {
-      id: 'swarm',
-      active: props.swarmModeActive === true && props.onSwarmModeChange !== undefined,
-      icon: <Network size={15} aria-hidden="true" />,
-      label: copy.swarmModeLabel,
-      onTitle: copy.swarmModeOnTitle,
-      isDisabled:
-        props.disabled === true
-        || props.swarmModePending === true
-        || Boolean(props.swarmModeDisabledReason),
-      disabledReason: props.swarmModeDisabledReason,
-      onDeactivate: () => { void props.onSwarmModeChange?.(false); },
-    },
-    {
-      id: 'graph',
-      active: props.graphModeActive === true && props.onGraphModeChange !== undefined,
-      icon: <Workflow size={15} aria-hidden="true" />,
-      label: copy.graphModeLabel,
-      onTitle: copy.graphModeOnTitle,
-      isDisabled:
-        props.disabled === true
-        || props.graphModePending === true
-        || Boolean(props.graphModeDisabledReason),
-      disabledReason: props.graphModeDisabledReason,
-      onDeactivate: () => { void props.onGraphModeChange?.(false); },
-    },
+    ...(planModeActive
+      ? [{
+        id: 'plan',
+        icon: <ListTodo size={ICON_SIZE.control} aria-hidden="true" />,
+        label: copy.planModeLabel,
+        tooltip: props.planModeDisabledReason ?? copy.planModeOnTitle,
+        isDisabled: planModeDisabled,
+        onDeactivate: () => { void props.onPlanModeChange?.(false); },
+      }]
+      : []),
+    ...orchestrationOptions
+      .filter((option) => option.id === orchestrationMode)
+      .map((option) => ({
+        id: option.id,
+        icon: option.icon,
+        label: option.label,
+        tooltip: props.orchestrationModeDisabledReason ?? option.onTitle,
+        isDisabled: orchestrationModeDisabled,
+        onDeactivate: () => { void props.onOrchestrationModeChange?.('default'); },
+      })),
   ];
-  const activeModes = modes.filter((mode) => mode.active);
-  const showPlusMenu = Boolean(
-    props.onPickAttachments
-    || props.mentionSkills
-    || props.onPlanModeChange
-    || props.onSwarmModeChange
-    || props.onGraphModeChange,
+  /**
+   * The mark Astryx draws for a chosen option — a check when chosen, nothing
+   * when not — which is what its own `Selector` puts on a selected option, and
+   * what a menu of otherwise identical rows needs: no column of empty boxes
+   * ahead of the labels, and the mode icons on the same x as the action rows
+   * above. Both selectable item types draw their own control at the row's
+   * start — a box for Plan, a circle for the orchestration options — so the
+   * mark is passed as `endContent` and a rule scoped to this panel suppresses
+   * them. Read through `useIndicator` rather than an icon, so a theme
+   * replacing the `check` indicator reaches these rows too.
+   *
+   * That rule lives in the host, with the rest of `.maka-composer-*` — this
+   * component ships markup and class names, and every composer rule is the
+   * host's (`apps/desktop/src/renderer/styles/composer.css` today). A second
+   * host has to bring composer styling with it; that is the existing split,
+   * not something this control introduced.
+   *
+   * Upstream ask: let a selectable item choose its indicator, and this pair
+   * of workarounds goes away.
+   */
+  const SelectionMark = useIndicator('check');
+  /**
+   * Whether any action row precedes the mode group. The divider separates two
+   * groups, so with nothing above it there is nothing to separate — a host
+   * that wires only the mode controls would open the menu on a rule.
+   */
+  const hasPlusMenuActions = Boolean(
+    props.onPickAttachments || props.onPickDirectory || props.mentionSkills || props.onSetGoal,
   );
-  const showVoiceCapture = Boolean(props.onToggleVoiceCapture) && !props.streaming;
+  const hasPlusMenuModes = Boolean(props.onPlanModeChange || props.onOrchestrationModeChange);
+  const showPlusMenu = Boolean(hasPlusMenuActions || hasPlusMenuModes);
 
   return (
     <>
-      {/* U3: no-model dead-end guidance. Outside the form so it never grows
-          the composer's constant footprint (#740). */}
       {!props.hidden && noModelConnection && (
         <div className="maka-composer-no-model-hint" role="status">
-          <span>{copy.noModelHint}</span>
+          <span>{props.noModelHint ?? copy.noModelHint}</span>
           {props.onOpenModelSettings && (
-            <button
-              type="button"
+            <UiButton
+              variant="ghost"
+              size="sm"
               className="maka-composer-no-model-hint-action"
+              label={copy.noModelAction}
               onClick={() => props.onOpenModelSettings?.()}
-            >
-              {copy.noModelAction}
-            </button>
+            />
           )}
         </div>
       )}
       {!props.hidden && props.revisionNotice && (
         <div className="maka-composer-revision-notice" role="status" data-revision-notice="true">
-          <Pencil size={13} aria-hidden="true" />
+          <Pencil size={ICON_SIZE.meta} aria-hidden="true" />
           <span className="maka-composer-revision-notice-text">
             {props.revisionNotice.title}
             {props.revisionNotice.detail ? <span className="maka-composer-revision-notice-detail">{props.revisionNotice.detail}</span> : null}
           </span>
-          <button
-            type="button"
+          <UiButton
+            variant="ghost"
+            size="sm"
             className="maka-composer-revision-notice-cancel"
-            disabled={sendPending}
-            aria-busy={sendPending ? 'true' : undefined}
+            label={props.revisionNotice.cancelLabel}
+            isDisabled={sendPending}
             onClick={() => props.revisionNotice?.onCancel()}
-          >
-            {props.revisionNotice.cancelLabel}
-          </button>
+          />
         </div>
       )}
+      {!props.hidden && queueCount > 0 ? (
+          <ComposerMessageQueue
+            queuedMessages={queuedMessages}
+            queueRevision={props.queuedMessageRevision}
+          copy={copy}
+          onPromoteEntry={props.onPromoteQueuedEntry}
+          onUpdateEntry={props.onUpdateQueuedEntry}
+          onDeleteEntry={props.onDeleteQueuedEntry}
+          onReorderEntries={props.onReorderQueuedEntries}
+        />
+      ) : null}
       <form
         ref={formRef}
         className="maka-composer composer"
@@ -1240,8 +1712,54 @@ export const Composer = forwardRef<
           onSubmit={() => {}}
           isDisabled={props.disabled}
           drawer={drawerTokenCount > 0 ? (
-            <ChatComposerDrawer count={drawerTokenCount} label={copy.addContext}>
-              <div className="maka-composer-context-drawer" role="group" aria-label={copy.addContext}>
+            <ChatComposerDrawer
+              className="maka-composer-drawer"
+              count={drawerTokenCount}
+              label={copy.stagedContext}
+              defaultIsCollapsed={props.contextDrawerDefaultCollapsed}
+              // The collapse band's tooltip (composer.css ::after) follows the
+              // pointer instead of sitting at a fixed offset — on a full-width
+              // band a fixed bubble can be half a window away from the cursor.
+              // The custom property feeds the ::after's `left`; clamped so the
+              // bubble never crosses the band's right edge.
+              onPointerMove={(event) => {
+                const toggle = event.currentTarget.querySelector<HTMLElement>(
+                  '[role="button"][aria-controls]',
+                );
+                if (!toggle) return;
+                const band = toggle.getBoundingClientRect();
+                if (event.clientY < band.top || event.clientY > band.bottom) return;
+                // Clamp against the bubble's border-box: computed width is
+                // content-box only, so the paddings must be priced in or the
+                // right edge overshoots by exactly their sum.
+                const bubbleStyle = getComputedStyle(toggle, '::after');
+                const bubbleWidth =
+                  (Number.parseFloat(bubbleStyle.width) || 124) +
+                  (Number.parseFloat(bubbleStyle.paddingLeft) || 0) +
+                  (Number.parseFloat(bubbleStyle.paddingRight) || 0);
+                const x = Math.min(
+                  Math.max(event.clientX - band.left + 14, 8),
+                  Math.max(8, band.width - bubbleWidth - 8),
+                );
+                toggle.style.setProperty('--maka-drawer-tooltip-x', `${x}px`);
+              }}
+              // Without this, keyboard focus after a hover would show the
+              // bubble at the last pointer position instead of the
+              // beside-the-pill fallback.
+              onPointerLeave={(event) => {
+                event.currentTarget
+                  .querySelector<HTMLElement>('[role="button"][aria-controls]')
+                  ?.style.removeProperty('--maka-drawer-tooltip-x');
+              }}
+            >
+              <div className="maka-composer-context-drawer" role="group" aria-label={copy.stagedContext}>
+                {props.pendingDirectories?.map((reference, index) => (
+                  <DirectoryReferenceChip
+                    key={`${reference.hostId}:${reference.path}`}
+                    reference={reference}
+                    onRemove={props.onRemoveDirectory ? () => props.onRemoveDirectory?.(index) : undefined}
+                  />
+                ))}
                 {props.pendingQuotes?.map((quote, index) => (
                   <Token
                     key={`${quote.sourceTurnId ?? 'quote'}-${index}`}
@@ -1250,20 +1768,68 @@ export const Composer = forwardRef<
                     onRemove={props.onRemoveQuote ? () => props.onRemoveQuote?.(index) : undefined}
                   />
                 ))}
-                {props.pendingAttachments?.map((attachment, index) => (
-                  <Token
-                    key={`${attachment.displayName}-${index}`}
-                    size="sm"
-                    label={attachment.displayName}
-                    onRemove={props.onRemoveAttachment ? () => props.onRemoveAttachment?.(index) : undefined}
-                  />
-                ))}
+                {props.pendingAttachments?.map((attachment, index) => {
+                  const onRemove = props.onRemoveAttachment
+                    ? () => props.onRemoveAttachment?.(index)
+                    : undefined;
+                  // Astryx-standard rendering (maintainer decision on #2367's
+                  // follow-up): every attachment is a Token in the same chip
+                  // rhythm as quotes — kind icon + truncated name. The full
+                  // name and «EXT · size» meta live in a hover/focus Tooltip,
+                  // and an image with a decoded preview opens it in a
+                  // Lightbox on click instead of rendering an inline
+                  // thumbnail.
+                  const extension = attachmentExtensionLabel(attachment.displayName);
+                  const sizeLabel = formatPreviewSize(attachment.size, locale);
+                  // One string for both surfaces (chip tooltip + lightbox
+                  // caption), so the wording cannot drift between them.
+                  const detail = `${attachment.displayName} · ${
+                    extension ? `${extension} · ${sizeLabel}` : sizeLabel
+                  }`;
+                  const previewUrl =
+                    attachment.kind === 'image' ? attachment.previewUrl : undefined;
+                  return (
+                    <Tooltip
+                      key={`${attachment.displayName}-${index}`}
+                      content={detail}
+                      // "always", not the default "auto": the tooltip anchors
+                      // Token's non-focusable root span, so auto would never
+                      // attach focus listeners. focusin bubbles from the
+                      // chip's inner buttons, giving keyboard users the same
+                      // metadata hover shows.
+                      focusTrigger="always"
+                    >
+                      <Token
+                        size="sm"
+                        className="maka-composer-attachment-token"
+                        icon={<AttachmentKindIcon kind={attachment.kind} />}
+                        label={attachment.displayName}
+                        onRemove={onRemove}
+                        onClick={
+                          previewUrl
+                            ? () => {
+                                setAttachmentLightbox({
+                                  src: previewUrl,
+                                  alt: attachment.displayName,
+                                  caption: detail,
+                                });
+                                setAttachmentLightboxOpen(true);
+                              }
+                            : undefined
+                        }
+                      />
+                    </Tooltip>
+                  );
+                })}
               </div>
             </ChatComposerDrawer>
           ) : undefined}
           input={(
             <div
               className="maka-composer-input"
+              onInputCapture={(event) => {
+                if (plainTextPasteInputActiveRef.current) event.stopPropagation();
+              }}
               // PR-FE-BUG-HUNT-10: a paste that lands mid-CJK-composition must
               // not be consumed — `ChatComposerInput` always preventDefault()s
               // the paste, which would interrupt the IME mid-character. The
@@ -1285,15 +1851,45 @@ export const Composer = forwardRef<
                 className="maka-composer-editor"
                 value={text}
                 onChange={onInputChange}
-                placeholder={copy.placeholder}
+                placeholder={props.placeholder ?? copy.placeholder}
                 label={copy.textareaAriaLabel}
-                maxRows={COMPOSER_MAX_ROWS}
+                maxRows={props.maxInputRows ?? COMPOSER_MAX_ROWS}
                 // Prompt history stays ours: persisted, shared across input
                 // surfaces, and clearable from Settings · 数据 (see
                 // use-composer-history.ts).
                 hasHistory={false}
                 triggers={triggers}
                 pasteAsToken={pasteAsToken}
+                onPaste={(event, pasted) => {
+                  // Astryx has already offered token-adjacent, file, and
+                  // reference-sized-token pastes before it reaches this seam.
+                  const plainTextContainer = document.createElement('div');
+                  plainTextContainer.textContent = pasted;
+                  const menuWasOpen = event.currentTarget.getAttribute('aria-expanded') === 'true';
+                  plainTextPasteInputActiveRef.current = true;
+                  try {
+                    // Deprecated, but still the composer's only insertion
+                    // primitive that creates a browser undo transaction.
+                    // Migrate when Astryx exposes a transactional plain-text
+                    // insertion authority.
+                    return document.execCommand(
+                      'insertHTML',
+                      false,
+                      plainTextContainer.innerHTML.replace(/\r\n?|\n/g, '<br>'),
+                    );
+                  } finally {
+                    plainTextPasteInputActiveRef.current = false;
+                    if (menuWasOpen) {
+                      event.currentTarget.dispatchEvent(
+                        new KeyboardEvent('keydown', {
+                          key: 'Escape',
+                          bubbles: true,
+                          cancelable: true,
+                        }),
+                      );
+                    }
+                  }
+                }}
                 onFiles={onInputFiles}
                 onKeyDown={onInputKeyDown}
                 onCompositionStart={() => { compositionActiveRef.current = true; }}
@@ -1314,10 +1910,10 @@ export const Composer = forwardRef<
                   <DropdownMenu
                     placement="above"
                     hasChevron={false}
-                    className="maka-composer-quiet-menu"
+                    className="maka-composer-quiet-menu maka-composer-plus-panel"
                     button={{
                       label: copy.addContext,
-                      icon: <Plus size={15} aria-hidden="true" />,
+                      icon: <Plus size={ICON_SIZE.control} aria-hidden="true" />,
                       isIconOnly: true,
                       variant: 'ghost',
                       size: 'sm',
@@ -1328,80 +1924,159 @@ export const Composer = forwardRef<
                     {props.onPickAttachments ? (
                       <DropdownMenuItem
                         label={pendingImportAction === 'pick' ? copy.addingAttachment : copy.addFileOrDirectory}
-                        icon={<Upload size={15} aria-hidden="true" />}
-                        isDisabled={props.disabled || props.streaming === true || importActionBusy}
+                        icon={<Upload size={ICON_SIZE.control} aria-hidden="true" />}
+                        isDisabled={attachmentImportBlocked || importActionBusy}
                         onClick={() => {
                           void runImportAction('pick', props.onPickAttachments);
+                        }}
+                      />
+                    ) : null}
+                    {props.onPickDirectory ? (
+                      <DropdownMenuItem
+                        label={copy.referenceFolder}
+                        icon={<FolderOpen size={ICON_SIZE.control} aria-hidden="true" />}
+                        isDisabled={props.disabled || props.streaming === true || importActionBusy}
+                        onClick={() => {
+                          void runImportAction('directory', props.onPickDirectory);
                         }}
                       />
                     ) : null}
                     {props.mentionSkills ? (
                       <DropdownMenuItem
                         label={copy.chooseSkill}
-                        icon={<Sparkles size={15} aria-hidden="true" />}
+                        icon={<Sparkles size={ICON_SIZE.control} aria-hidden="true" />}
                         // Nothing to choose from means nothing to open. The
                         // entry types `/` into the draft, so an enabled item
                         // with an empty catalog spends the user's click writing
                         // a stray slash and popping an empty menu. Say why it is
                         // unavailable: the panel this replaced showed "no skills
                         // available", and a silent grey row answers nothing.
-                        isDisabled={props.disabled || props.mentionSkills.length === 0}
+                        //
+                        // Only a SETTLED empty catalog counts. The host clears
+                        // the list while re-fetching it (a Plan toggle or model
+                        // change does that with this menu open), and rendering
+                        // that transient `[]` as "no skills" grows this row by
+                        // a description line and back — the menu visibly jumps.
+                        // So the verdict is the host's settled flag when it
+                        // supplies one, and the row repaints only when the
+                        // catalog's emptiness actually changed.
+                        isDisabled={
+                          props.disabled
+                          || (props.mentionSkillsUnavailable
+                            ?? props.mentionSkills.length === 0)
+                        }
                         description={
-                          props.mentionSkills.length === 0 ? copy.noSkillsAvailable : undefined
+                          (props.mentionSkillsUnavailable
+                            ?? props.mentionSkills.length === 0)
+                            ? copy.noSkillsAvailable
+                            : undefined
                         }
-                        onClick={openSkillMenu}
+                        // Mid-refresh the row LOOKS like the previous catalog
+                        // but cannot act for the current one: opening the `/`
+                        // menu now would write a stray slash against a list
+                        // that is fail-closed empty. A loading click or Enter
+                        // is a complete no-op — nothing typed, menu left open —
+                        // so the same activation a beat later simply works.
+                        // `aria-busy` says so to assistive technology (the
+                        // geometry-stable row would otherwise announce
+                        // "available" and silently ignore the action); the
+                        // class is the same contract for tests and styling.
+                        // The gate lives INSIDE one always-present handler:
+                        // swapping the prop between undefined and a function
+                        // changes Item's internal structure, and the remount
+                        // would drop keyboard focus mid-refresh.
+                        aria-busy={props.mentionSkillsLoading === true ? true : undefined}
+                        className={
+                          props.mentionSkillsLoading === true
+                            ? 'maka-composer-skills-loading'
+                            : undefined
+                        }
+                        hasCloseOnSelect={props.mentionSkillsLoading !== true}
+                        onClick={() => {
+                          if (props.mentionSkillsLoading === true) return;
+                          openSkillMenu();
+                        }}
                       />
                     ) : null}
-                    {props.onPlanModeChange ? (
-                      <DropdownMenuCheckboxItem
-                        label={copy.planModeLabel}
-                        icon={<ListTodo size={15} aria-hidden="true" />}
-                        value={props.planModeActive === true}
+                    {props.onSetGoal ? (
+                      <DropdownMenuItem
+                        label={copy.setGoal}
+                        icon={<Target size={ICON_SIZE.control} aria-hidden="true" />}
                         isDisabled={
                           props.disabled
-                          || props.planModePending === true
-                          || Boolean(props.planModeDisabledReason)
+                          || props.goalActive === true
+                          || Boolean(props.goalDisabledReason)
                         }
-                        onChange={(checked) => {
-                          void props.onPlanModeChange?.(checked);
+                        description={
+                          props.goalActive === true
+                            ? copy.goalAlreadySet
+                            : props.goalDisabledReason
+                        }
+                        onClick={() => {
+                          void props.onSetGoal?.();
                         }}
-                        aria-description={props.planModeDisabledReason
-                          ?? (props.planModeActive ? copy.disablePlanMode : copy.enablePlanMode)}
                       />
                     ) : null}
-                    {props.onSwarmModeChange ? (
-                      <DropdownMenuCheckboxItem
-                        label={copy.swarmModeLabel}
-                        icon={<Network size={15} aria-hidden="true" />}
-                        value={props.swarmModeActive === true}
-                        isDisabled={
-                          props.disabled
-                          || props.swarmModePending === true
-                          || Boolean(props.swarmModeDisabledReason)
-                        }
-                        onChange={(checked) => {
-                          void props.onSwarmModeChange?.(checked);
-                        }}
-                        aria-description={props.swarmModeDisabledReason
-                          ?? (props.swarmModeActive ? copy.disableSwarmMode : copy.enableSwarmMode)}
-                      />
-                    ) : null}
-                    {props.onGraphModeChange ? (
-                      <DropdownMenuCheckboxItem
-                        label={copy.graphModeLabel}
-                        icon={<Workflow size={15} aria-hidden="true" />}
-                        value={props.graphModeActive === true}
-                        isDisabled={
-                          props.disabled
-                          || props.graphModePending === true
-                          || Boolean(props.graphModeDisabledReason)
-                        }
-                        onChange={(checked) => {
-                          void props.onGraphModeChange?.(checked);
-                        }}
-                        aria-description={props.graphModeDisabledReason
-                          ?? (props.graphModeActive ? copy.disableGraphMode : copy.enableGraphMode)}
-                      />
+                    {hasPlusMenuModes ? (
+                      <>
+                        {hasPlusMenuActions ? <DropdownMenuDivider /> : null}
+                        {props.onPlanModeChange ? (
+                          <DropdownMenuCheckboxItem
+                            label={copy.planModeLabel}
+                            icon={<ListTodo size={ICON_SIZE.control} aria-hidden="true" />}
+                            value={planModeActive}
+                            isDisabled={planModeDisabled}
+                            onChange={(next) => {
+                              void props.onPlanModeChange?.(next);
+                            }}
+                            endContent={planModeActive ? (
+                              <SelectionMark state="checked" size="sm" />
+                            ) : undefined}
+                            aria-description={
+                              props.planModeDisabledReason
+                              ?? (planModeActive ? copy.disablePlanMode : copy.enablePlanMode)
+                            }
+                          />
+                        ) : null}
+                        {props.onOrchestrationModeChange ? (
+                          <DropdownMenuRadioGroup
+                            label={copy.orchestrationModeAriaLabel}
+                            // No orchestration is no selection, not a value.
+                            value={orchestrationMode === 'default' ? undefined : orchestrationMode}
+                            // Astryx closes a menu on a radio commit. These
+                            // rows sit beside Plan, which stays open, and the
+                            // way back to no orchestration is the selected row
+                            // itself — both need the menu still there.
+                            hasCloseOnSelect={false}
+                            // A radio item reports its own value on every
+                            // activation, including when it is already the
+                            // selected one. That repeat is the user asking for
+                            // the mode they are already in, which is how they
+                            // leave it: the group empties instead of staying
+                            // put. The row they are on announces the change,
+                            // unlike two switches where the other row moved.
+                            onChange={(value) => {
+                              void props.onOrchestrationModeChange?.(
+                                value === orchestrationMode ? 'default' : (value as OrchestrationMode),
+                              );
+                            }}
+                          >
+                            {orchestrationOptions.map((option) => (
+                              <DropdownMenuRadioItem
+                                key={option.id}
+                                value={option.id}
+                                label={option.label}
+                                icon={option.icon}
+                                isDisabled={orchestrationModeDisabled}
+                                endContent={orchestrationMode === option.id ? (
+                                  <SelectionMark state="checked" size="sm" />
+                                ) : undefined}
+                                aria-description={props.orchestrationModeDisabledReason}
+                              />
+                            ))}
+                          </DropdownMenuRadioGroup>
+                        ) : null}
+                      </>
                     ) : null}
                   </DropdownMenu>
                 </span>
@@ -1415,7 +2090,6 @@ export const Composer = forwardRef<
                   }}
                   disabled={
                     props.disabled
-                    || props.permissionModePending === true
                     || Boolean(props.permissionModeDisabledReason)
                   }
                   disabledReason={props.permissionModeDisabledReason}
@@ -1431,13 +2105,18 @@ export const Composer = forwardRef<
                 {props.activeSession ? (
                   <ChatModelSwitcher
                     activeSession={props.activeSession}
+                    activeModelConnectionId={props.activeModelConnectionId}
+                    activeModelConnectionSlug={props.activeModelConnectionSlug}
                     activeModel={props.activeModel}
-                    activeConnectionLabel={props.activeConnectionLabel}
                     activeModelLabel={props.activeModelLabel}
                     currentProviderType={props.activeProviderType}
                     choices={props.modelChoices ?? []}
-                    pending={props.modelChangePending}
+                    hasConversationHistory={props.modelSwitchHasHistory}
+                    availability={modelSwitchAvailability}
                     disabledReason={modelSwitcherDisabledReason}
+                    isMenuOpen={modelPickerOpen}
+                    onMenuOpenChange={setModelPickerOpen}
+                    hideUnavailableCurrentOption={props.hideUnavailableCurrentModel}
                     renderProviderMark={props.renderProviderMark}
                     onChange={props.onModelChange}
                   />
@@ -1447,7 +2126,11 @@ export const Composer = forwardRef<
                     choices={props.modelChoices ?? []}
                     currentValue={
                       props.newChatModel
-                        ? modelChoiceValue(props.newChatModel.llmConnectionSlug, props.newChatModel.model)
+                        ? exactModelChoiceValue(
+                            props.newChatModel.llmConnectionId,
+                            props.newChatModel.llmConnectionSlug,
+                            props.newChatModel.model,
+                          )
                         : undefined
                     }
                     currentProviderType={props.newChatProviderType}
@@ -1455,16 +2138,19 @@ export const Composer = forwardRef<
                     onPick={props.onPickNewChatModel}
                   />
                 ) : (
-                  <ModelChipStatic label={modelChipLabel} onOpenSettings={props.onOpenModelSettings} />
+                  <ModelChipStatic
+                    label={modelChipLabel}
+                    onOpenSettings={props.onOpenModelSettings}
+                    showUnavailableStatus={props.showStaticModelUnavailableStatus}
+                  />
                 )}
                 {props.activeSession ? (
                   <ThinkingLevelSelector
                     levels={props.activeThinkingLevels ?? []}
                     current={props.activeThinkingLevel}
                     onChange={props.onThinkingLevelChange}
-                    disabled={Boolean(modelSwitcherDisabledReason) || props.modelChangePending}
+                    disabled={!modelSwitchAvailability.available}
                     disabledReason={thinkingSwitcherDisabledReason}
-                    loading={props.modelChangePending}
                   />
                 ) : (
                   <ThinkingLevelSelector
@@ -1473,6 +2159,7 @@ export const Composer = forwardRef<
                     onChange={props.onNewChatThinkingLevelChange}
                   />
                 )}
+                {props.contextUsage ? <ContextUsageAction {...props.contextUsage} /> : null}
               </div>
               {/* The project decides where a NEW chat starts, which makes it a
                   parameter of this send like the model beside it — so it sits
@@ -1500,64 +2187,48 @@ export const Composer = forwardRef<
                   which unmounts this button, so focus is handed back to the
                   input exactly as removing a Skill token does; otherwise a
                   keyboard user is dropped on `document.body`. */}
-              {activeModes.map((mode) => (
+              {activeModeMarks.map((mark) => (
                 <IconButton
-                  key={mode.id}
+                  key={mark.id}
                   variant="ghost"
                   type="button"
                   size="sm"
                   className="maka-composer-mode-button"
-                  data-mode={mode.id}
-                  label={mode.label}
-                  tooltip={mode.disabledReason ?? mode.onTitle}
-                  isDisabled={mode.isDisabled}
+                  data-mode={mark.id}
+                  label={mark.label}
+                  tooltip={mark.tooltip}
+                  isDisabled={mark.isDisabled}
                   onClick={() => {
-                    mode.onDeactivate();
+                    mark.onDeactivate();
                     window.requestAnimationFrame(() => focusInput());
                   }}
-                  icon={mode.icon}
+                  icon={mark.icon}
                 />
               ))}
+              {props.footerAccessory}
             </div>
           )}
-          sendActions={(
-            <div className="maka-composer-right-controls">
-              {showVoiceCapture ? (
-                <IconButton
-                  variant="ghost"
-                  type="button"
-                  size="sm"
-                  className="maka-composer-voice-button"
-                  data-state={props.voiceCaptureState ?? 'idle'}
-                  isDisabled={
-                    props.disabled
-                    || props.voiceCaptureState === 'requesting'
-                    || props.voiceCaptureState === 'processing'
-                    || props.voiceCaptureState === 'sending'
-                  }
-                  label={voiceCaptureLabel}
-                  tooltip={`${voiceCaptureLabel}${props.voiceProviderLabel ? ` · ${props.voiceProviderLabel}` : ''}`}
-                  onClick={(event) => {
-                    void props.onToggleVoiceCapture?.({ dictate: event.shiftKey });
-                  }}
-                  icon={<Mic size={15} aria-hidden="true" />}
-                />
-              ) : null}
-            </div>
-          )}
-          sendButton={props.streaming ? (
-            <UiButton
-              variant="primary"
+          sendButton={stopShown ? (
+            <IconButton
+              variant="secondary"
+              type="button"
               isDisabled={props.stopPending}
+              label={props.stopPending ? copy.stopping : copy.stopLabel}
+              aria-busy={props.stopPending ? 'true' : undefined}
+              data-pending={props.stopPending ? 'true' : undefined}
+              tooltip={props.stopPending ? copy.stopping : copy.stopLabel}
               onClick={() => {
                 if (props.stopPending) return;
                 void props.onStop();
               }}
-              aria-busy={props.stopPending ? 'true' : undefined}
-              data-pending={props.stopPending ? 'true' : undefined}
-              label={props.stopPending ? copy.stopping : copy.stopLabel}
+              icon={<Square size={ICON_SIZE.control} aria-hidden="true" />}
             />
           ) : (
+            // GLOBAL ANCHOR — DO NOT RESTYLE. This Send/Stop slot (its size,
+            // shape, glyph, and placement) is the one control the whole app
+            // navigates by; it has regressed multiple times from well-meaning
+            // "improvements". Queue affordances live in the pending plate
+            // above the card, never in this button.
             <IconButton
               variant="primary"
               type="submit"
@@ -1566,11 +2237,68 @@ export const Composer = forwardRef<
               aria-busy={sendPending ? 'true' : undefined}
               data-pending={sendPending ? 'true' : undefined}
               tooltip={sendTitle}
-              icon={<ArrowUp size={16} aria-hidden="true" />}
+              icon={<ArrowUp size={ICON_SIZE.chrome} aria-hidden="true" />}
             />
           )}
         />
       </form>
+      {attachmentLightbox && (
+        <Lightbox
+          // Driven by the flag, never by unmounting: the component must
+          // survive the close so Astryx runs dialog.close(), which is what
+          // hands focus back to the chip button that opened it (the native
+          // <dialog> contract keyboard users rely on).
+          isOpen={attachmentLightboxOpen}
+          onOpenChange={(isOpen) => {
+            if (!isOpen) setAttachmentLightboxOpen(false);
+          }}
+          hasZoom
+          media={attachmentLightbox}
+        />
+      )}
     </>
   );
 });
+
+function ContextUsageAction(props: {
+  usageTokens?: number;
+  declaredContextWindow?: number;
+  meteredContextWindow?: number;
+  metadataContextWindow?: number;
+  onOpen(): void;
+}) {
+  const copy = getConversationCopy(useUiLocale()).messages;
+  // A window from any source is enough to show a share, and the order is a
+  // claim about which window the number was earned against: the user's
+  // declaration first — it is the user's intent, and the only one that arms
+  // the compaction threshold — then the metered window frozen alongside the
+  // usage, so a live reading keeps its numerator and denominator from the
+  // same request, and only then the model's reported metadata. With no window
+  // at all the usage stands on its own.
+  const window =
+    props.declaredContextWindow ?? props.meteredContextWindow ?? props.metadataContextWindow;
+  const label =
+    props.usageTokens !== undefined && window !== undefined && window > 0
+      ? `${Math.round((props.usageTokens / window) * 100)}%`
+      : copy.systemNotes.contextUsageLabel;
+  const tooltip =
+    props.usageTokens === undefined
+      ? copy.systemNotes.contextUsageUnavailable
+      : window !== undefined && window > 0
+        ? copy.systemNotes.contextUsageShare(props.usageTokens, window)
+        : copy.systemNotes.contextUsageNoWindow(props.usageTokens);
+  return (
+    <UiButton
+      variant="ghost"
+      size="sm"
+      icon={<CircleGauge size={ICON_SIZE.meta} aria-hidden="true" />}
+      label={copy.systemNotes.contextUsageOpen}
+      tooltip={tooltip}
+      onClick={props.onOpen}
+    >
+      {label}
+    </UiButton>
+  );
+}
+
+export type ComposerProps = ComponentProps<typeof Composer>;

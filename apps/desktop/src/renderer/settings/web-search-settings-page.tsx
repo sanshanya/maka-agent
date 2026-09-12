@@ -1,15 +1,40 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { useRef, useState } from 'react';
-import { Link } from '@astryxdesign/core';
-import type { AppSettings, UpdateAppSettingsResult, WebSearchCredentialStatus } from '@maka/core';
-import { normalizeSearchUrl, webSearchCredentialStatusFromResponse } from '@maka/core';
+import { Banner, EmptyState, Link } from '@astryxdesign/core';
+import type { AppSettings, UpdateAppSettingsResult } from '@maka/core/settings';
+import type { WebSearchCredentialStatus } from '@maka/core/web-search';
+import { normalizeSearchUrl } from '@maka/core/search';
+import { webSearchCredentialStatusFromResponse } from '@maka/core/web-search';
 import { Button, Selector, StatusDot, TextInput, RelativeTime, Switch, redactSecrets, useMountedRef, useToast, useUiLocale } from '@maka/ui';
 import { getWebSearchSettingsCopy, type WebSearchSettingsCopy } from '../locales/settings-web-search-copy';
 import { getSettingsSharedCopy } from '../locales/settings-shared-copy.js';
 import { SettingsActions, SettingsField, SettingsPage, SettingsRow, SettingsSection } from './settings-section';
 import { PasswordInput } from './password-input';
 import { settingsActionErrorMessage } from './settings-error-copy';
-import { statusDotVariant } from './settings-status-badge';
+import { dotForStatus, type StatusSemantic } from '@maka/ui';
 import { useKeyedActionGuard } from './use-action-guard';
+import {
+  useRuntimeHostSettingsErrorReporter,
+  useRuntimeHostSettingsTarget,
+} from './runtime-host-settings-target.js';
 
 /**
  * PR-WEB-SEARCH-TAVILY-0: Settings → Web search.
@@ -20,7 +45,7 @@ import { useKeyedActionGuard } from './use-action-guard';
  * `MASKED_TOKEN_SENTINEL`). Re-submitting the sentinel is treated as
  * "keep current" in `mergeWebSearchSettings`.
  *
- * The test button calls `web-search:test` (main-process Tavily call)
+ * The test button calls Runtime Host `web-search.execute` (a Tavily request)
  * and surfaces ok/fail via toast. The live-query verifier runs a real query
  * and renders 3-5 plain-text rows.
  */
@@ -28,6 +53,7 @@ export function WebSearchSettingsPage(props: {
   settings: AppSettings;
   onUpdate(patch: Parameters<typeof window.maka.settings.update>[0]): Promise<UpdateAppSettingsResult>;
 }) {
+  const host = useRuntimeHostSettingsTarget();
   const locale = useUiLocale();
   const copy = getWebSearchSettingsCopy(locale);
   const sharedCopy = getSettingsSharedCopy(locale);
@@ -49,6 +75,7 @@ export function WebSearchSettingsPage(props: {
   const webSearchActionGuard = useKeyedActionGuard<'set-enabled' | 'credential' | 'test' | 'live-query'>();
   const liveQueryInputRef = useRef(liveQuery);
   const toast = useToast();
+  const reportHostError = useRuntimeHostSettingsErrorReporter();
 
   function updateLiveQuery(next: string) {
     liveQueryInputRef.current = next;
@@ -85,7 +112,10 @@ export function WebSearchSettingsPage(props: {
       return true;
     } catch (error) {
       if (webSearchMountedRef.current) {
-        toast.error(failureTitle, settingsActionErrorMessage(error, locale));
+        reportHostError(
+          failureTitle,
+          settingsActionErrorMessage(error, locale),
+        );
       }
       return false;
     }
@@ -152,7 +182,7 @@ export function WebSearchSettingsPage(props: {
       const result = await window.maka.webSearch.test({
         provider: webSearch.defaultProvider,
         apiKey: usesDraftKey ? draftKey : undefined,
-      });
+      }, host);
       if (!webSearchMountedRef.current) return;
       if (!usingModelSearch && !usesDraftKey && hasUsableKey) {
         void persistCredentialStatus(webSearchCredentialStatusFromResponse(result), testedCredentialVersion);
@@ -160,11 +190,17 @@ export function WebSearchSettingsPage(props: {
       if (result.ok) {
         toast.success(copy.credentialValid, copy.resultCount(result.results.length));
       } else {
-        toast.error(copy.testFailed, copy.errors[result.reason]);
+        reportHostError(
+          copy.testFailed,
+          copy.errors[result.reason],
+        );
       }
     } catch (err) {
       if (webSearchMountedRef.current) {
-        toast.error(copy.testError, settingsActionErrorMessage(err, locale));
+        reportHostError(
+          copy.testError,
+          settingsActionErrorMessage(err, locale),
+        );
       }
     } finally {
       releaseTest();
@@ -190,7 +226,7 @@ export function WebSearchSettingsPage(props: {
         provider: webSearch.defaultProvider,
         query: trimmed,
         limit: 5,
-      });
+      }, host);
       if (!isCurrentLiveQuery(queryOwner)) return;
       if (result.ok) {
         setLiveQueryResults(result.results);
@@ -221,7 +257,10 @@ export function WebSearchSettingsPage(props: {
   const statusCopy = usingModelSearch
     ? {
         label: webSearch.enabled ? copy.statuses.modelEnabled : copy.statuses.modelDisabled,
-        tone: webSearch.enabled ? ('info' as const) : ('warning' as const),
+        // Verified-and-on is proven health, which is what success is for.
+        // Off stays amber (`attention`) exactly as before — it was never one of
+        // the ruled `info` states, and this pass repaints nothing it did not name.
+        tone: webSearch.enabled ? ('success' as const) : ('attention' as const),
       }
     : presentWebSearchCredentialStatus(
         credentialSource,
@@ -272,7 +311,7 @@ export function WebSearchSettingsPage(props: {
           end={<div className="settingsWebSearchControlCluster">
             <div className="settingsWebSearchStatusCluster" role="group" aria-label={copy.statusAria}>
               <span className="settingsStatus">
-                <StatusDot variant={statusDotVariant(statusCopy.tone)} label={statusCopy.label} />
+                <StatusDot variant={dotForStatus(statusCopy.tone)} label={statusCopy.label} />
                 <span>{statusCopy.label}</span>
               </span>
               {hasCheckedAt && (
@@ -307,13 +346,13 @@ export function WebSearchSettingsPage(props: {
             isDisabled={usingEnvKey || credentialActionBusy}
             placeholder={usingEnvKey ? copy.envPlaceholder : hasStoredKey ? copy.storedPlaceholder : copy.keyPlaceholder}
             label={copy.key}
-            description={usingEnvKey ? copy.envKeyHelp : copy.savedKeyHelp}
+            description={usingEnvKey ? copy.envKeyHelp : (
+              <>
+                {copy.savedKeyHelp}
+                <Link href="https://tavily.com" target="_blank" rel="noreferrer noopener">tavily.com</Link>
+              </>
+            )}
           />
-          {!usingEnvKey && (
-            <small className="settingsQuietStatus">
-              <Link href="https://tavily.com" target="_blank" rel="noreferrer noopener">tavily.com</Link>
-            </small>
-          )}
         </SettingsField>
 
         <SettingsActions role="group" aria-label={copy.actions}>
@@ -371,9 +410,10 @@ export function WebSearchSettingsPage(props: {
             <div className="settingsWebSearchSearchControls">
               <Button
                 variant="primary"
-                isDisabled={liveQueryRunning || queryDisabledReason !== null}
+                isLoading={liveQueryRunning}
+                isDisabled={queryDisabledReason !== null}
                 onClick={() => void runLiveQuery()}
-                label={liveQueryRunning ? copy.searching : copy.search}
+                label={copy.search}
               />
               {!liveQueryRunning && queryDisabledReason && (
                 <small className="settingsWebSearchDisabledReason">{queryDisabledReason}</small>
@@ -384,9 +424,7 @@ export function WebSearchSettingsPage(props: {
       )}
 
       {liveQueryError && (
-        <div className="settingsConnectionMeta" role="alert">
-          <span>{copy.queryFailed(liveQueryError)}</span>
-        </div>
+        <Banner status="error" role="alert" title={copy.queryFailed(liveQueryError)} />
       )}
       {(() => {
         // PR-SETTINGS-WEB-SEARCH-URL-HARDEN-0: match the chat-side
@@ -416,7 +454,7 @@ export function WebSearchSettingsPage(props: {
                 )
             : null;
         if (safeRows && safeRows.length === 0 && !liveQueryError) {
-          return <div className="settingsConnectionMeta">{copy.noResults}</div>;
+          return <EmptyState isCompact title={copy.noResults} />;
         }
         if (safeRows && safeRows.length > 0) {
           return (
@@ -449,21 +487,25 @@ function presentWebSearchCredentialStatus(
   enabled: boolean,
   status: WebSearchCredentialStatus,
   copy: WebSearchSettingsCopy,
-): { label: string; tone: 'success' | 'info' | 'warning' | 'destructive' } {
-  if (credentialSource === 'none') return { label: copy.statuses.not_configured, tone: 'warning' };
+): { label: string; tone: StatusSemantic } {
+  if (credentialSource === 'none') return { label: copy.statuses.not_configured, tone: 'attention' };
   if (status === 'valid') {
     return enabled
       ? { label: copy.statuses.validEnabled, tone: 'success' }
-      : { label: copy.statuses.validDisabled, tone: 'info' };
+      // Valid credentials, feature off: a fact the user set, not a problem.
+      : { label: copy.statuses.validDisabled, tone: 'neutral' };
   }
-  if (status === 'invalid_credentials') return { label: copy.statuses.invalid_credentials, tone: 'destructive' };
-  if (status === 'rate_limited') return { label: copy.statuses.rate_limited, tone: 'warning' };
-  if (status === 'timeout') return { label: copy.statuses.timeout, tone: 'warning' };
-  if (status === 'network_error') return { label: copy.statuses.network_error, tone: 'warning' };
-  if (status === 'not_configured') return { label: copy.statuses.not_configured, tone: 'warning' };
+  if (status === 'invalid_credentials') return { label: copy.statuses.invalid_credentials, tone: 'error' };
+  if (status === 'rate_limited') return { label: copy.statuses.rate_limited, tone: 'attention' };
+  if (status === 'timeout') return { label: copy.statuses.timeout, tone: 'attention' };
+  if (status === 'network_error') return { label: copy.statuses.network_error, tone: 'attention' };
+  if (status === 'not_configured') return { label: copy.statuses.not_configured, tone: 'attention' };
   return enabled
-    ? { label: copy.statuses.unknownEnabled, tone: 'warning' }
-    : { label: copy.statuses.untested, tone: 'info' };
+    ? { label: copy.statuses.unknownEnabled, tone: 'attention' }
+    // Configured but never tested: setup is unfinished, and the amber says so.
+    // Testing moves it to success or error, completing the narrative; neutral
+    // would read as "all set" and break that story.
+    : { label: copy.statuses.untested, tone: 'attention' };
 }
 
 function presentWebSearchCredentialSource(

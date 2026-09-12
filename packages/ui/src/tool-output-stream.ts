@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /**
  * PR-UI-12 review fixup #2 (@kenji A3 review msg 365ff8b9).
  *
@@ -53,9 +72,10 @@
  *   - `truncated: false` when no cap hit
  */
 
+import { TOOL_OUTPUT_DELTA_MAX_CHARS } from '@maka/core/events';
 import type { ToolOutputChunk } from './materialize.js';
 import { redactSecrets } from './redact.js';
-import type { UiLocale } from '@maka/core';
+import type { UiLocale } from '@maka/core/ui-locale';
 import { getSharedUiCopy } from './shared-ui-copy.js';
 
 /**
@@ -66,20 +86,20 @@ import { getSharedUiCopy } from './shared-ui-copy.js';
  *   - 200 chunks: enough headroom that streamed line-by-line
  *     output of a 100-line script never hits the cap, while still
  *     bounding state churn for runaway tools.
- *   - 4 KB per chunk: matches runtime's
+ *   - Runtime event limit per chunk: matches
  *     `TOOL_OUTPUT_DELTA_MAX_CHARS` so renderer cap is consistent
  *     with main-side truncation; a chunk that arrives larger than
  *     this is a contract violation and we tail-truncate defensively.
  */
 export const TOOL_STREAM_MAX_CHUNKS = 200;
 export const TOOL_STREAM_MAX_TOTAL_CHARS = 16 * 1024;
-export const TOOL_STREAM_MAX_CHUNK_CHARS = 4 * 1024;
+export const TOOL_STREAM_MAX_CHUNK_CHARS = TOOL_OUTPUT_DELTA_MAX_CHARS;
 
 export interface ApplyToolOutputChunkOptions {
   maxChunks?: number;
   maxTotalChars?: number;
   maxChunkChars?: number;
-  locale?: UiLocale;
+  locale: UiLocale;
 }
 
 export interface ApplyToolOutputChunkResult {
@@ -122,12 +142,12 @@ export interface ApplyToolOutputChunkResult {
 export function applyToolOutputChunk(
   prevChunks: ToolOutputChunk[] | undefined,
   rawChunk: ToolOutputChunk,
-  options: ApplyToolOutputChunkOptions = {},
+  options: ApplyToolOutputChunkOptions,
 ): ApplyToolOutputChunkResult {
   const maxChunks = options.maxChunks ?? TOOL_STREAM_MAX_CHUNKS;
   const maxTotalChars = options.maxTotalChars ?? TOOL_STREAM_MAX_TOTAL_CHARS;
   const maxChunkChars = options.maxChunkChars ?? TOOL_STREAM_MAX_CHUNK_CHARS;
-  const truncatedChunkMarker = getSharedUiCopy(options.locale ?? 'zh').stream.toolChunkTruncated;
+  const truncatedChunkMarker = getSharedUiCopy(options.locale).stream.toolChunkTruncated;
 
   const list = prevChunks ?? [];
 

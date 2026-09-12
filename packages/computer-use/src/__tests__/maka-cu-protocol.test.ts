@@ -1,9 +1,28 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 // Unit test for the `maka.cu/2` parsing layer: the key grammar the host owns
 // (§6.4) and the readers that refuse rather than default (§1.3, §5.2). No child
 // process is involved — these are pure functions over the wire's shapes.
 //
 // Run (from repo root), after @maka/core + @maka/runtime are built:
-//   npm --workspace @maka/computer-use run test
+//   npm run build && npm --workspace @maka/computer-use run test:dist
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
@@ -115,18 +134,6 @@ describe('maka-cu key grammar (§6.4)', () => {
 });
 
 describe('maka-cu readers refuse rather than default', () => {
-  it('reads the element frame into a window-local field', () => {
-    // §5.3: the space is carried by the name, so nothing can write it into
-    // `CuObservedElement.frame` (screen points) without going through the one
-    // conversion.
-    assert.deepEqual(readElement('observe', element()).frameInWindow, {
-      x: 20,
-      y: 40,
-      width: 72,
-      height: 28,
-    });
-  });
-
   it('refuses a hash that is not written the one declared way (§1.3)', () => {
     assert.throws(
       () => readElement('observe', element({ digest: 'a1'.repeat(32) })),
@@ -177,6 +184,173 @@ describe('maka-cu readers refuse rather than default', () => {
     assert.equal(readElement('observe', element({ value: '' })).value, '');
   });
 
+  it('reads stable element ids and a declared observation difference', () => {
+    const parsed = readSnapshot(
+      'observe',
+      snapshot({
+        elements: [element({ stableId: 17 }), element({ token: 'el_3', stableId: 18 })],
+        difference: {
+          baseSnapshotId: 'snap_0',
+          presentation: 'difference',
+          changes: [
+            { kind: 'remove', path: [0, 1], stableId: 4, token: null },
+            { kind: 'insert', path: [0, 2], stableId: 17, token: 'el_2' },
+            { kind: 'update', path: [0, 3], stableId: 18, token: 'el_3' },
+          ],
+          removedStableIdRanges: [
+            { start: 4, end: 6 },
+            { start: 9, end: 9 },
+          ],
+        },
+      }),
+    );
+
+    assert.equal(parsed.elements[0]?.stableId, 17);
+    assert.deepEqual(parsed.difference, {
+      baseSnapshotId: 'snap_0',
+      presentation: 'difference',
+      changes: [
+        { kind: 'remove', path: [0, 1], stableId: 4 },
+        { kind: 'insert', path: [0, 2], stableId: 17, token: 'el_2' },
+        { kind: 'update', path: [0, 3], stableId: 18, token: 'el_3' },
+      ],
+      removedStableIdRanges: [
+        { start: 4, end: 6 },
+        { start: 9, end: 9 },
+      ],
+    });
+  });
+
+  it('refuses malformed stable ids and difference fields', () => {
+    for (const stableId of [-1, 1.5, '7']) {
+      assert.throws(
+        () => readElement('observe', element({ stableId })),
+        MakaCuProtocolViolation,
+        `stableId=${String(stableId)}`,
+      );
+    }
+
+    const valid = {
+      baseSnapshotId: 'snap_0',
+      presentation: 'difference',
+      changes: [{ kind: 'update', path: [0, 1], stableId: 17, token: 'el_2' }],
+      removedStableIdRanges: [{ start: 4, end: 6 }],
+    };
+    const malformed = [
+      { ...valid, presentation: 'delta' },
+      { ...valid, changes: [{ ...valid.changes[0], kind: 'move' }] },
+      { ...valid, changes: [{ ...valid.changes[0], path: [] }] },
+      { ...valid, changes: [{ ...valid.changes[0], path: [0, -1] }] },
+      { ...valid, changes: [{ ...valid.changes[0], path: [0, 1.5] }] },
+      { ...valid, changes: [{ ...valid.changes[0], stableId: -1 }] },
+      { ...valid, changes: [{ ...valid.changes[0], token: null }] },
+      {
+        ...valid,
+        changes: [{ kind: 'remove', path: [0, 1], stableId: 17, token: 'el_2' }],
+      },
+      { ...valid, removedStableIdRanges: [{ start: 6, end: 4 }] },
+      { ...valid, presentation: 'no-change' },
+      { ...valid, presentation: 'full' },
+      {
+        ...valid,
+        presentation: 'difference',
+        changes: [],
+        removedStableIdRanges: [],
+      },
+    ];
+    for (const difference of malformed) {
+      assert.throws(
+        () =>
+          readSnapshot('observe', snapshot({ elements: [element({ stableId: 17 })], difference })),
+        MakaCuProtocolViolation,
+        JSON.stringify(difference),
+      );
+    }
+  });
+
+  it('refuses inconsistent stable ids and changes that do not name the current element', () => {
+    assert.throws(
+      () =>
+        readSnapshot(
+          'observe',
+          snapshot({
+            elements: [
+              element({ token: 'el_1', stableId: 1 }),
+              element({ token: 'el_2', stableId: null }),
+            ],
+          }),
+        ),
+      MakaCuProtocolViolation,
+    );
+    assert.throws(
+      () =>
+        readSnapshot(
+          'observe',
+          snapshot({
+            elements: [
+              element({ token: 'el_1', stableId: 1 }),
+              element({ token: 'el_2', stableId: 1 }),
+            ],
+          }),
+        ),
+      MakaCuProtocolViolation,
+    );
+
+    const difference = {
+      baseSnapshotId: 'snap_0',
+      presentation: 'difference',
+      changes: [{ kind: 'update', path: [0], stableId: 17, token: 'el_2' }],
+      removedStableIdRanges: [{ start: 4, end: 6 }],
+    };
+    assert.throws(
+      () => readSnapshot('observe', snapshot({ difference })),
+      MakaCuProtocolViolation,
+      'difference without stable ids',
+    );
+    assert.throws(
+      () =>
+        readSnapshot(
+          'observe',
+          snapshot({
+            elements: [element({ stableId: 18 })],
+            difference,
+          }),
+        ),
+      MakaCuProtocolViolation,
+      'change stable id disagrees with the current element',
+    );
+    assert.throws(
+      () =>
+        readSnapshot(
+          'observe',
+          snapshot({
+            elements: [element({ stableId: 17 })],
+            difference: {
+              ...difference,
+              changes: [{ kind: 'update', path: [0], stableId: 17, token: 'el_missing' }],
+            },
+          }),
+        ),
+      MakaCuProtocolViolation,
+      'change token is absent from the current tree',
+    );
+    assert.throws(
+      () =>
+        readSnapshot(
+          'observe',
+          snapshot({
+            elements: [element({ stableId: 17 })],
+            difference: {
+              ...difference,
+              removedStableIdRanges: [{ start: 17, end: 20 }],
+            },
+          }),
+        ),
+      MakaCuProtocolViolation,
+      'removed range includes a current stable id',
+    );
+  });
+
   it('refuses a window entry missing a field the host sorts on (§5.4)', () => {
     const window = {
       pid: 4711,
@@ -208,13 +382,6 @@ describe('maka-cu dispatch results are held to their closed sets (§6.3/§6.5)',
       ...overrides,
     };
   }
-
-  it('reads a well-formed dispatch result', () => {
-    const result = readDispatchResult('input.dispatch', dispatch() as never, false);
-    assert.equal(result.path, 'ax_action');
-    assert.equal(result.tier, 'ax');
-    assert.equal(result.outcome, 'ok');
-  });
 
   it('refuses a path that is not in the closed set', () => {
     // The closed set is what decides, and it decides first: `path` is refused

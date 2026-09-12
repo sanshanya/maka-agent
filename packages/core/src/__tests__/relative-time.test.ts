@@ -1,54 +1,156 @@
-import { strict as assert } from 'node:assert';
-import { beforeEach, describe, it } from 'node:test';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
 import {
+  formatAbsoluteTimestamp,
+  formatCompactTimestamp,
   formatRelativeTimestamp,
+  formatSidebarTimestamp,
   nextRelativeRefreshDelay,
+  nextSidebarRefreshDelay,
   resetRelativeTimeFormatters,
 } from '../relative-time.js';
 
-const NOW = Date.parse('2026-05-29T12:00:00Z');
+const NOW = Date.UTC(2026, 7, 21, 12, 0, 0);
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
-beforeEach(resetRelativeTimeFormatters);
+describe('relative timestamp labels', () => {
+  it('holds a just-now label for the whole first minute, then switches to minutes', () => {
+    resetRelativeTimeFormatters();
 
-describe('relative time', () => {
-  it('formats locale, bucket, horizon, and clock-skew boundaries', () => {
-    const cases: Array<{
-      timestamp: number;
-      locale?: 'zh' | 'en';
-      matches: RegExp;
-      excludes?: RegExp;
-    }> = [
-      { timestamp: NOW - 8_000, matches: /秒/, excludes: /seconds?\s+ago/i },
-      { timestamp: NOW - 100, matches: /1.*second|秒|now|刚刚/i },
-      { timestamp: NOW - 30_000, matches: /30.*second|秒/i },
-      { timestamp: NOW - 5 * 60_000, matches: /5.*minute|分钟/i },
-      { timestamp: NOW - 5 * 60_000, locale: 'en', matches: /5 minutes ago/i, excludes: /分钟/ },
-      { timestamp: NOW - 5 * 60_000, locale: 'zh', matches: /5.*分钟/, excludes: /minutes ago/i },
-      { timestamp: NOW - 3 * 60 * 60_000, matches: /3.*hour|小时/i },
-      { timestamp: NOW - 2 * 24 * 60 * 60_000, matches: /2.*day|天/i },
-      { timestamp: NOW - 30 * 24 * 60 * 60_000, matches: /2026|4月|Apr|April/ },
-      {
-        timestamp: NOW + 5 * 60_000,
-        matches: /second|秒|now|刚刚/i,
-        excludes: /in 5 minutes|5 分钟后/,
-      },
-    ];
-    for (const { timestamp, locale, matches, excludes } of cases) {
-      const output = formatRelativeTimestamp(timestamp, NOW, locale);
-      assert.match(output, matches);
-      if (excludes) assert.doesNotMatch(output, excludes);
+    for (const ageMs of [0, 1_000, 30_000, 59_999]) {
+      assert.equal(formatRelativeTimestamp(NOW - ageMs, NOW, 'zh-CN'), '刚刚');
+      assert.equal(formatRelativeTimestamp(NOW - ageMs, NOW, 'en'), 'just now');
+      assert.equal(formatCompactTimestamp(NOW - ageMs, NOW, 'zh-CN'), '刚刚');
+      assert.equal(formatSidebarTimestamp(NOW - ageMs, NOW, 'zh-CN'), '刚刚');
+    }
+
+    assert.equal(formatRelativeTimestamp(NOW - 60_000, NOW, 'zh-CN'), '1分钟前');
+    assert.equal(formatRelativeTimestamp(NOW - 60_000, NOW, 'en'), '1 minute ago');
+  });
+
+  it('delays the ticker until the just-now window ends', () => {
+    assert.equal(nextRelativeRefreshDelay(NOW, NOW), 60_000);
+    assert.equal(nextRelativeRefreshDelay(NOW - 30_000, NOW), 30_000);
+    assert.equal(nextRelativeRefreshDelay(NOW - 60_000, NOW), 60_000);
+  });
+
+  it('uses scan-friendly units for sidebar timestamps', () => {
+    for (const locale of ['zh-CN', 'en'] as const) {
+      for (const [ageMs, expected] of [
+        [60_000, '1min'],
+        [46 * 60_000, '46min'],
+        [13 * 60 * 60_000, '13h'],
+        [3 * 24 * 60 * 60_000, '3d'],
+        [17 * 24 * 60 * 60_000, '17d'],
+        [29 * 24 * 60 * 60_000, '29d'],
+        [30 * 24 * 60 * 60_000, '1mo'],
+        [60 * 24 * 60 * 60_000, '2mo'],
+        [365 * 24 * 60 * 60_000, '1y'],
+      ] as const) {
+        assert.equal(formatSidebarTimestamp(NOW - ageMs, NOW, locale), expected);
+      }
     }
   });
 
-  it('selects refresh cadence by age', () => {
-    for (const [timestamp, expected] of [
-      [NOW - 5_000, 1_000],
-      [NOW - 10 * 60_000, 60_000],
-      [NOW - 5 * 60 * 60_000, 10 * 60_000],
-      [NOW - 30 * 24 * 60 * 60_000, null],
-    ] as const) {
-      assert.equal(nextRelativeRefreshDelay(timestamp, NOW), expected);
+  it('keeps the existing compact date fallback outside the sidebar', () => {
+    const ts = NOW - 17 * 24 * 60 * 60_000;
+    const expected = new Intl.DateTimeFormat('en-US', {
+      month: 'short',
+      day: 'numeric',
+    }).format(new Date(ts));
+
+    assert.equal(formatCompactTimestamp(ts, NOW, 'en'), expected);
+  });
+
+  it('refreshes sidebar timestamps at the next visible bucket', () => {
+    const nearRoundedDayBucketBoundary = NOW - (17 * 24 * 60 + 11 * 60 + 58) * 60_000;
+
+    assert.equal(formatSidebarTimestamp(nearRoundedDayBucketBoundary, NOW, 'en'), '17d');
+    assert.equal(nextSidebarRefreshDelay(nearRoundedDayBucketBoundary, NOW), 2 * 60_000);
+    assert.equal(nextSidebarRefreshDelay(NOW - 17 * 24 * 60 * 60_000, NOW), 12 * 60 * 60_000);
+    assert.equal(nextSidebarRefreshDelay(NOW - THIRTY_DAYS_MS, NOW), 15 * 24 * 60 * 60_000);
+    assert.equal(nextSidebarRefreshDelay(NOW - 365 * 24 * 60 * 60_000, NOW), 24 * 24 * 60 * 60_000);
+  });
+
+  it('treats a finite future timestamp as just now and schedules recovery', () => {
+    const futureTs = NOW + THIRTY_DAYS_MS;
+    const delay = nextRelativeRefreshDelay(futureTs, NOW);
+
+    assert.equal(delay, 60_000);
+    assert.equal(formatRelativeTimestamp(futureTs, NOW, 'en'), 'just now');
+    assert.equal(formatCompactTimestamp(futureTs, NOW, 'en'), 'just now');
+    assert.equal(formatSidebarTimestamp(futureTs, NOW, 'en'), 'just now');
+  });
+
+  it('keeps timestamp refresh delays within the scheduler bound', () => {
+    for (const ts of [
+      NOW - 60_000,
+      NOW - 60 * 60_000,
+      NOW,
+      NOW + THIRTY_DAYS_MS,
+      Number.POSITIVE_INFINITY,
+      Number.NaN,
+      Number.NEGATIVE_INFINITY,
+    ]) {
+      const delay = nextRelativeRefreshDelay(ts, NOW);
+      assert.ok(delay === null || (Number.isFinite(delay) && delay > 0 && delay <= 10 * 60_000));
+    }
+  });
+
+  it('reuses both formatters when relative and absolute readings alternate', () => {
+    resetRelativeTimeFormatters();
+    const OriginalDateTimeFormat = Intl.DateTimeFormat;
+    const OriginalRelativeTimeFormat = Intl.RelativeTimeFormat;
+    let constructions = 0;
+    function countConstructions(name: 'DateTimeFormat' | 'RelativeTimeFormat'): void {
+      const Original = Intl[name] as unknown as new (...args: unknown[]) => unknown;
+      function Counting(...args: unknown[]): unknown {
+        constructions += 1;
+        return new Original(...args);
+      }
+      Object.defineProperty(Intl, name, { value: Counting, configurable: true, writable: true });
+    }
+    countConstructions('DateTimeFormat');
+    countConstructions('RelativeTimeFormat');
+    try {
+      for (let round = 0; round < 5; round += 1) {
+        // The sidebar reads both per row: the relative label and, for the
+        // accessible name and the tooltip, the absolute one.
+        formatRelativeTimestamp(NOW - 60_000, NOW, 'en');
+        formatAbsoluteTimestamp(NOW - 60_000, 'en');
+      }
+      assert.equal(constructions, 2, 'one formatter of each kind for one locale');
+    } finally {
+      Object.defineProperty(Intl, 'DateTimeFormat', {
+        value: OriginalDateTimeFormat,
+        configurable: true,
+        writable: true,
+      });
+      Object.defineProperty(Intl, 'RelativeTimeFormat', {
+        value: OriginalRelativeTimeFormat,
+        configurable: true,
+        writable: true,
+      });
+      resetRelativeTimeFormatters();
     }
   });
 });

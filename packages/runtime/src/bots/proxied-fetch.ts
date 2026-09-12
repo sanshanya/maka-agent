@@ -1,16 +1,44 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { fetch, type Dispatcher, type RequestInit as UndiciRequestInit } from 'undici';
 import { matchesBypassList } from '../network/bypass-matcher.js';
 import { buildProxyDispatcher } from '../network/proxy-dispatcher.js';
 import { resolveActiveProxy } from '../network/active-proxy-state.js';
+import { FETCH_PROXY_SNAPSHOT } from '../network/scoped-fetch-transport.js';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 
-export type ProxiedFetchInit = UndiciRequestInit & {
-  signal?: AbortSignal;
+export type ProxiedFetchInit = Omit<
+  NonNullable<Parameters<typeof globalThis.fetch>[1]>,
+  'signal'
+> & {
+  signal?: AbortSignal | null;
   timeoutMs?: number;
 };
 
-export async function proxiedFetch(url: string, init: ProxiedFetchInit = {}): Promise<Response> {
+export async function proxiedFetch(
+  input: Parameters<typeof globalThis.fetch>[0],
+  init: ProxiedFetchInit = {},
+): Promise<Response> {
+  const url =
+    typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
   const proxy = resolveActiveProxy();
   let dispatcher: Dispatcher | undefined;
   if (proxy && !matchesBypassList(new URL(url).hostname, proxy.bypassList)) {
@@ -52,7 +80,10 @@ export async function proxiedFetch(url: string, init: ProxiedFetchInit = {}): Pr
       })
     : undefined;
 
-  const request = fetch(url, { ...fetchInit, dispatcher, signal: requestSignal }).catch((error) => {
+  const request = fetch(
+    input as Parameters<typeof fetch>[0],
+    { ...fetchInit, dispatcher, signal: requestSignal } as UndiciRequestInit,
+  ).catch((error) => {
     if (timedOut) return new Promise<never>(() => {});
     throw error;
   });
@@ -78,3 +109,8 @@ export async function proxiedFetch(url: string, init: ProxiedFetchInit = {}): Pr
   void disposeDispatcher(false);
   return response;
 }
+
+Object.defineProperty(proxiedFetch, FETCH_PROXY_SNAPSHOT, {
+  get: resolveActiveProxy,
+  enumerable: false,
+});

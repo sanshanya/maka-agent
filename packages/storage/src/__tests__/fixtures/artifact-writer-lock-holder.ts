@@ -1,8 +1,28 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { createHash } from 'node:crypto';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  createSqliteArtifactStore as createArtifactStore,
+  type ArtifactAuthorityStore,
+  createSqliteArtifactStoreWriteAuthority,
   type CreateArtifactInput,
 } from '../../artifact-store.js';
 import {
@@ -10,9 +30,9 @@ import {
   withLeaseBoundArtifactWriterLock,
 } from '../../artifact-writer-lock.js';
 import {
-  createHeadlessRootLease,
   prepareArtifactWriterLockAuthorityForLease,
   resolveExistingStorageRoot,
+  tryAcquireInteractiveRootOwner,
 } from '../../root-authority.js';
 
 const [workspaceRoot, modeOrTransientResidueSessionId, modeArgument] = process.argv.slice(2);
@@ -20,6 +40,10 @@ if (!workspaceRoot || !process.send) {
   throw new Error(
     'usage: artifact-writer-lock-holder <workspace-root> [transient-residue-session-id | --public-writer <session-id> | --authority-holder <root-id>]',
   );
+}
+
+async function listArtifacts(store: ArtifactAuthorityStore, sessionId: string) {
+  return (await store.listPage(sessionId, { offset: 0, limit: Number.MAX_SAFE_INTEGER })).records;
 }
 
 try {
@@ -63,22 +87,28 @@ async function runLockHolder(
 async function runAuthorityLockHolder(workspaceRoot: string, rootId: string): Promise<void> {
   const capability = await resolveExistingStorageRoot({
     path: workspaceRoot,
-    kind: 'headless',
+    kind: 'interactive',
     expectedRootId: rootId,
   });
-  const lease = createHeadlessRootLease(capability, 'write');
-  const authority = await prepareArtifactWriterLockAuthorityForLease(lease, 'headless');
-  await withLeaseBoundArtifactWriterLock(authority, async () => {
-    await send({ type: 'locked' });
-    await waitForRelease();
-  });
-  await send({ type: 'released' });
+  const owner = await tryAcquireInteractiveRootOwner(capability);
+  if (!owner) throw new Error('interactive storage root is already owned');
+  try {
+    const authority = await prepareArtifactWriterLockAuthorityForLease(owner.lease, 'interactive');
+    await withLeaseBoundArtifactWriterLock(authority, async () => {
+      await send({ type: 'locked' });
+      await waitForRelease();
+    });
+    await send({ type: 'released' });
+  } finally {
+    await owner.close();
+  }
 }
 
 async function runPublicWriter(workspaceRoot: string, sessionId: string): Promise<void> {
-  const store = createArtifactStore(workspaceRoot);
+  const authority = createSqliteArtifactStoreWriteAuthority(workspaceRoot);
+  const store = authority.store;
   try {
-    await store.list(sessionId);
+    await listArtifacts(store, sessionId);
     await send({ type: 'ready' });
     const command = await waitForCreateCommand();
     const mutation = store.create({
@@ -89,7 +119,7 @@ async function runPublicWriter(workspaceRoot: string, sessionId: string): Promis
     await send({ type: 'queued' });
     await send({ type: 'created', record: await mutation });
   } finally {
-    store.close?.();
+    authority.close();
   }
 }
 

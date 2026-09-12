@@ -1,10 +1,29 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Terminal } from '@earendil-works/pi-tui';
 
 export class FakeTerminal implements Terminal {
-  readonly columns = 80;
-  readonly rows = 24;
+  columns: number;
+  rows: number;
   readonly kittyProtocolActive = false;
   readonly progressStates: boolean[] = [];
   readonly writes: string[] = [];
@@ -15,10 +34,17 @@ export class FakeTerminal implements Terminal {
   // start() is called.
   startWriteIndex: number | null = null;
   private onInput: ((data: string) => void) | null = null;
+  private onResize: (() => void) | null = null;
 
-  start(onInput: (data: string) => void, _onResize: () => void): void {
+  constructor(columns = 80, rows = 24) {
+    this.columns = columns;
+    this.rows = rows;
+  }
+
+  start(onInput: (data: string) => void, onResize: () => void): void {
     this.startWriteIndex = this.writes.length;
     this.onInput = onInput;
+    this.onResize = onResize;
   }
 
   stop(): void {
@@ -51,6 +77,12 @@ export class FakeTerminal implements Terminal {
     this.onInput?.(data);
   }
 
+  resize(columns: number, rows: number): void {
+    this.columns = columns;
+    this.rows = rows;
+    this.onResize?.();
+  }
+
   output(): string {
     return this.writes.join('');
   }
@@ -67,15 +99,21 @@ export function plainTerminalOutput(output: string): string {
     .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
 }
 
-export function inputSurfaceRows(lines: readonly string[]): [number, number] {
+export function findInputSurfaceRows(lines: readonly string[]): [number, number] | undefined {
   const editorBorderIndexes = lines
     .map((line, index) => (/^─+$/.test(line) ? index : -1))
     .filter((index) => index >= 0);
-  assert.ok(editorBorderIndexes.length >= 2);
+  if (editorBorderIndexes.length < 2) return undefined;
   return [
     editorBorderIndexes[editorBorderIndexes.length - 2]!,
     editorBorderIndexes[editorBorderIndexes.length - 1]!,
   ];
+}
+
+export function inputSurfaceRows(lines: readonly string[]): [number, number] {
+  const rows = findInputSurfaceRows(lines);
+  assert.ok(rows, 'expected a settled input surface with top and bottom editor borders');
+  return rows;
 }
 
 /**
@@ -89,14 +127,15 @@ export function inputSurfaceRows(lines: readonly string[]): [number, number] {
  */
 export function autocompleteSuggestionLines(lines: readonly string[]): readonly string[] {
   if (!lines.some((line) => line.includes('→'))) return [];
-  const editorBorders = lines
-    .map((line, index) => (/^─+$/.test(line) ? index : -1))
-    .filter((index) => index >= 0);
-  if (editorBorders.length < 2) return [];
-  const editorTopBorder = editorBorders[editorBorders.length - 2]!;
-  let start = editorTopBorder;
+  const inputRows = findInputSurfaceRows(lines);
+  if (!inputRows) return [];
+  const [editorTopBorder] = inputRows;
+  const end = /^\s*\(\d+\/\d+\)\s*$/.test(lines[editorTopBorder - 1] ?? '')
+    ? editorTopBorder - 1
+    : editorTopBorder;
+  let start = end;
   while (start > 0 && /\/\w/.test(lines[start - 1]!)) start -= 1;
-  return lines.slice(start, editorTopBorder);
+  return lines.slice(start, end);
 }
 
 export function assertBottomPickerPlacement(
@@ -132,6 +171,15 @@ export function latestPlainLineContaining(output: string, text: string): string 
 // reader a log dive. MAKA_TEST_WAIT_BUDGET_MS overrides both.
 export const WAIT_BUDGET_MS =
   Number(process.env.MAKA_TEST_WAIT_BUDGET_MS ?? '') || (process.env.CI ? 5_000 : 250);
+
+/** Resolves once the TUI is in raw mode and has painted its first frame, so
+ *  typed input reaches a mounted editor instead of racing runner startup. */
+export async function waitForTuiPaint(terminal: FakeTerminal): Promise<void> {
+  await waitFor(
+    () => terminal.startWriteIndex !== null && terminal.writes.length > terminal.startWriteIndex,
+    'the first TUI paint after raw-mode start',
+  );
+}
 
 export async function waitFor(predicate: () => boolean, description?: string): Promise<void> {
   const deadline = Date.now() + WAIT_BUDGET_MS;

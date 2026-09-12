@@ -1,17 +1,34 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import type { BotIncomingMessage, BotRegistry, SessionManager } from '@maka/runtime';
-import type { SessionEvent } from '@maka/core';
+import type { BotIncomingMessage, BotRegistry } from '@maka/runtime/bots';
 import { createBotIncomingMainService } from '../bot-incoming-main.js';
-import { createEmbeddedBotSessionAdapter } from '../embedded-bot-session-adapter.js';
-import { SessionLifecycleError } from '../session-lifecycle.js';
+import { BotSessionUnavailableError } from '../bot-session-adapter.js';
+import { waitFor as pollFor } from '@maka/core/test-only/async-primitives';
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-  const deadline = Date.now() + 1_000;
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error('Timed out waiting for bot lifecycle test');
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
+  await pollFor(predicate, {
+    timeoutMs: 1_000,
+    message: 'Timed out waiting for bot lifecycle test',
+  });
 }
 
 describe('bot session lifecycle bindings', () => {
@@ -20,28 +37,24 @@ describe('bot session lifecycle bindings', () => {
     const sent: string[] = [];
     const replies: string[] = [];
     let ensureCalls = 0;
-    const runtime = {
+    const sessions = {
       async createSession() {
         const id = `bot-session-${created.length + 1}`;
         created.push(id);
-        return { id };
+        return id;
       },
-      async setPermissionMode() {},
-      sendMessage(sessionId: string, input: { turnId: string }) {
+      async prepareSession(sessionId: string) {
+        ensureCalls += 1;
+        if (sessionId === 'bot-session-1' && ensureCalls === 1) {
+          throw new BotSessionUnavailableError('archived');
+        }
+        return 'ready' as const;
+      },
+      async runTurn({ sessionId }: { sessionId: string }) {
         sent.push(sessionId);
-        return (async function* (): AsyncIterable<SessionEvent> {
-          yield {
-            type: 'text_complete',
-            id: `text-${sessionId}`,
-            turnId: input.turnId,
-            ts: Date.now(),
-            messageId: `message-${sessionId}`,
-            text: `reply from ${sessionId}`,
-          };
-          yield { type: 'complete', id: `complete-${sessionId}`, turnId: input.turnId, ts: Date.now(), stopReason: 'end_turn' };
-        })();
+        return { kind: 'completed' as const, text: `reply from ${sessionId}` };
       },
-    } as unknown as SessionManager;
+    };
 
     const service = createBotIncomingMainService({
       botRegistry: {
@@ -53,32 +66,7 @@ describe('bot session lifecycle bindings', () => {
           return true;
         },
       } as unknown as BotRegistry,
-      sessions: createEmbeddedBotSessionAdapter({
-        runtime,
-        createSession: (input) =>
-          runtime.createSession({ ...input, cwd: input.cwd ?? '/repo' }),
-        getDefaultConnectionSlug: async () => 'provider',
-        getReadyConnection: async () => ({
-          connection: { slug: 'provider' },
-          model: 'model',
-        }),
-        readSessionHeader: async () => ({
-          permissionMode: 'explore',
-          isArchived: false,
-          status: 'active',
-        }),
-        ensureSessionCanSend: async (sessionId) => {
-          ensureCalls += 1;
-          if (sessionId === 'bot-session-1' && ensureCalls === 2) {
-            throw new SessionLifecycleError('archived');
-          }
-        },
-        emitSessionsChanged() {},
-        runAgentTurn: async ({ iterator, turnId, onEvent }) => {
-          for await (const event of iterator) onEvent(event);
-          return { outcome: { kind: 'completed', turnId } } as never;
-        },
-      }),
+      sessions,
     });
 
     const base = {

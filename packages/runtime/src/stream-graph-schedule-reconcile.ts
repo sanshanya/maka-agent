@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import type {
   AgentGraphIntentClaim,
   AgentGraphIntentClaimResult,
@@ -5,6 +24,7 @@ import type {
 import {
   AgentGraphScheduleRevisionConflictError,
   type AgentGraphScheduleControlStore,
+  type AgentGraphSelectedResultInput,
   type AgentGraphScheduleUpdate,
   type AgentGraphScheduleUpdateSource,
 } from '@maka/core/agent-graph-schedule';
@@ -60,6 +80,9 @@ export interface ReconcileAgentGraphScheduleInput {
     input: ProvisionAgentGraphOperatorInput,
   ): Promise<ProvisionAgentGraphOperatorResult>;
   hydrateInputHandoffs?(records: readonly AgentGraphRecord[]): Promise<AgentGraphInputHandoff[]>;
+  resolveSelectedResultInputs?(
+    inputs: readonly AgentGraphSelectedResultInput[],
+  ): Promise<readonly AgentGraphRecord[]>;
   renderPrompt(input: RenderAgentGraphScheduledWorkPromptInput): string | Promise<string>;
   abortSignal?: AbortSignal;
   supervisor?: AgentGraphSupervisorObserver;
@@ -106,6 +129,7 @@ interface ScheduleSnapshot {
   topology: AgentGraphTraceTopology;
   provisions: AgentGraphOperatorProvision[];
   sourceByWorkId: Map<string, AgentGraphScheduleUpdateSource>;
+  selectedResultRecords: Map<string, AgentGraphRecord>;
 }
 
 interface PreparedWork {
@@ -149,9 +173,13 @@ export async function reconcileAgentGraphSchedule(
   const dispatches: AgentGraphDispatchedActivation[] = [];
   const stops: AgentGraphScheduleStopResult[] = [];
   const failures: AgentGraphScheduleReconciliationFailure[] = [];
+  // Resolved historical results are immutable for the lifetime of one
+  // reconciliation; cache them per source graph so repeated snapshot reads do
+  // not replay the full committed projection of a closed epoch.
+  const selectedResultCache: SelectedResultCache = new Map();
   let newActivationCount = 0;
   let observedExistingActivationCount = 0;
-  let snapshot = await readScheduleSnapshot(input);
+  let snapshot = await readScheduleSnapshot(input, selectedResultCache);
 
   for (let attempt = 0; attempt < MAX_RECONCILIATION_ATTEMPTS; attempt += 1) {
     if (input.abortSignal?.aborted) {
@@ -169,9 +197,9 @@ export async function reconcileAgentGraphSchedule(
 
     const stopWave = await applyScheduleStops(input, snapshot);
     stops.push(...stopWave.stops);
-    failures.push(...stopWave.failures);
+    for (const failure of stopWave.failures) recordReconciliationFailure(input, failures, failure);
     if (failures.length > 0) {
-      snapshot = await readScheduleSnapshot(input);
+      snapshot = await readScheduleSnapshot(input, selectedResultCache);
       return reconciliationResult(
         input.abortSignal?.aborted ? 'cancelled' : 'failed',
         newActivationCount,
@@ -191,17 +219,28 @@ export async function reconcileAgentGraphSchedule(
     const committedRecords = new Map(
       snapshot.observation.projection.records.map((record) => [record.recordId, record]),
     );
+    for (const record of snapshot.selectedResultRecords.values()) {
+      if (committedRecords.has(record.recordId)) {
+        throw new Error(
+          `Selected graph result id ${record.recordId} collides with the current graph`,
+        );
+      }
+    }
     const deferredWork: AgentGraphScheduleDeferredWork[] = [];
     let topologyChanged = false;
     let topologyStale = false;
 
     for (const work of orderedRequestedWork(snapshot.schedule)) {
-      if (work.target.kind !== 'agent' || provisionsByWork.has(work.workId)) continue;
+      if (work.target.kind === 'operator' || provisionsByWork.has(work.workId)) continue;
       if (snapshot.schedule.closed) {
         deferredWork.push({ work, reason: 'graph_closed' });
         continue;
       }
-      const missingInputIds = work.inputIds.filter((recordId) => !committedRecords.has(recordId));
+      const missingInputIds = missingWorkInputIds(
+        work,
+        committedRecords,
+        snapshot.selectedResultRecords,
+      );
       if (missingInputIds.length > 0) {
         deferredWork.push({ work, reason: 'input_not_committed', missingInputIds });
         continue;
@@ -212,7 +251,7 @@ export async function reconcileAgentGraphSchedule(
       }
       const source = snapshot.sourceByWorkId.get(work.workId);
       if (!source) {
-        failures.push({
+        recordReconciliationFailure(input, failures, {
           phase: 'topology',
           work,
           error: new Error(`Graph work ${work.workId} has no durable schedule source`),
@@ -235,11 +274,11 @@ export async function reconcileAgentGraphSchedule(
           topologyStale = true;
           break;
         }
-        failures.push({ phase: 'topology', work, error });
+        recordReconciliationFailure(input, failures, { phase: 'topology', work, error });
       }
     }
     if (topologyChanged || topologyStale) {
-      snapshot = await readScheduleSnapshot(input);
+      snapshot = await readScheduleSnapshot(input, selectedResultCache);
       if (failures.length === 0) continue;
     }
     if (failures.length > 0) {
@@ -262,7 +301,7 @@ export async function reconcileAgentGraphSchedule(
     }> = [];
 
     for (const work of orderedRequestedWork(snapshot.schedule)) {
-      if (work.target.kind === 'agent' && !provisionsByWork.has(work.workId)) continue;
+      if (work.target.kind !== 'operator' && !provisionsByWork.has(work.workId)) continue;
       let intent: AgentGraphRunnableIntent;
       try {
         intent = scheduledWorkIntent(
@@ -272,7 +311,7 @@ export async function reconcileAgentGraphSchedule(
           provisionsByWork.get(work.workId),
         );
       } catch (error) {
-        failures.push({ phase: 'schedule', work, error });
+        recordReconciliationFailure(input, failures, { phase: 'schedule', work, error });
         continue;
       }
       if (processedIntentIds.has(intent.intentId)) continue;
@@ -281,7 +320,11 @@ export async function reconcileAgentGraphSchedule(
         deferredWork.push({ work, reason: 'graph_closed' });
         continue;
       }
-      const missingInputIds = work.inputIds.filter((recordId) => !committedRecords.has(recordId));
+      const missingInputIds = missingWorkInputIds(
+        work,
+        committedRecords,
+        snapshot.selectedResultRecords,
+      );
       if (missingInputIds.length > 0) {
         deferredWork.push({
           work,
@@ -294,7 +337,7 @@ export async function reconcileAgentGraphSchedule(
     }
 
     if (failures.length > 0) {
-      snapshot = await readScheduleSnapshot(input);
+      snapshot = await readScheduleSnapshot(input, selectedResultCache);
       return reconciliationResult(
         'failed',
         newActivationCount,
@@ -322,9 +365,12 @@ export async function reconcileAgentGraphSchedule(
 
     const rendered = await Promise.allSettled(
       selected.map(async ({ work, intent }): Promise<PreparedWork> => {
-        const inputRecords = work.inputIds.map((recordId) =>
-          clonePlain(committedRecords.get(recordId)!),
-        );
+        const inputRecords = [
+          ...work.inputIds.map((recordId) => clonePlain(committedRecords.get(recordId)!)),
+          ...(work.selectedResultInputs ?? []).map((selected) =>
+            clonePlain(snapshot.selectedResultRecords.get(selectedResultKey(selected))!),
+          ),
+        ];
         const inputHandoffs = input.hydrateInputHandoffs
           ? await input.hydrateInputHandoffs(inputRecords)
           : [];
@@ -345,7 +391,7 @@ export async function reconcileAgentGraphSchedule(
       if (result.status === 'fulfilled') {
         prepared.push(result.value);
       } else {
-        failures.push({
+        recordReconciliationFailure(input, failures, {
           phase: 'render',
           work: selected[index]!.work,
           intent: selected[index]!.intent,
@@ -354,7 +400,7 @@ export async function reconcileAgentGraphSchedule(
       }
     });
     if (failures.length > 0) {
-      snapshot = await readScheduleSnapshot(input);
+      snapshot = await readScheduleSnapshot(input, selectedResultCache);
       return reconciliationResult(
         'failed',
         newActivationCount,
@@ -368,7 +414,13 @@ export async function reconcileAgentGraphSchedule(
     }
 
     const outcomes = await Promise.all(
-      prepared.map((work) => dispatchScheduledWork(input, work, snapshot.schedule.revision)),
+      prepared.map(async (work) => {
+        const outcome = await dispatchScheduledWork(input, work, snapshot.schedule.revision);
+        if (outcome.status === 'rejected') {
+          notifySupervisor(input.supervisor?.onReconciliationFailure, outcome.failure);
+        }
+        return outcome;
+      }),
     );
     let stale = false;
     for (const outcome of outcomes) {
@@ -391,7 +443,7 @@ export async function reconcileAgentGraphSchedule(
       }
     }
 
-    const nextSnapshot = await readScheduleSnapshot(input);
+    const nextSnapshot = await readScheduleSnapshot(input, selectedResultCache);
     if (stale || nextSnapshot.schedule.revision !== snapshot.schedule.revision) {
       snapshot = nextSnapshot;
       continue;
@@ -431,7 +483,7 @@ export async function reconcileAgentGraphSchedule(
     );
   }
 
-  snapshot = await readScheduleSnapshot(input);
+  snapshot = await readScheduleSnapshot(input, selectedResultCache);
   return reconciliationResult(
     'stale',
     newActivationCount,
@@ -446,6 +498,7 @@ export async function reconcileAgentGraphSchedule(
 
 async function readScheduleSnapshot(
   input: ReconcileAgentGraphScheduleInput,
+  selectedResultCache: SelectedResultCache,
 ): Promise<ScheduleSnapshot> {
   const [updates, provisions, claims] = await Promise.all([
     input.controlStore.listAgentGraphScheduleUpdates(input.topology.graphId),
@@ -456,14 +509,123 @@ async function readScheduleSnapshot(
   const observation = await input.observeGraph(topology);
   assertGraphObservation(input.topology.graphId, observation);
   notifySupervisor(input.supervisor?.onObservation, observation);
+  const schedule = projectAgentGraphSchedule(input.topology.graphId, updates);
+  const selectedInputs = schedule.work
+    .filter((work) => work.status === 'requested')
+    .flatMap((work) => work.selectedResultInputs ?? []);
+  const selectedResultRecords = await resolveSelectedResultRecords(
+    input,
+    selectedInputs,
+    selectedResultCache,
+  );
   return {
-    schedule: projectAgentGraphSchedule(input.topology.graphId, updates),
+    schedule,
     observation,
     claims,
     topology,
     provisions,
     sourceByWorkId: scheduleSourceByWorkId(updates),
+    selectedResultRecords,
   };
+}
+
+/** Missing inputs include unresolved selected historical result ids so an
+ * unresolvable source defers its own work item via `input_not_committed`. */
+function missingWorkInputIds(
+  work: AgentGraphScheduleWorkView,
+  committedRecords: ReadonlyMap<string, AgentGraphRecord>,
+  selectedResultRecords: ReadonlyMap<string, AgentGraphRecord>,
+): string[] {
+  return [
+    ...work.inputIds.filter((recordId) => !committedRecords.has(recordId)),
+    ...(work.selectedResultInputs ?? [])
+      .filter((selected) => !selectedResultRecords.has(selectedResultKey(selected)))
+      .map((selected) => selected.resultId),
+  ];
+}
+
+/** Historical resolution attempts keyed by source graph id, then result id. */
+type SelectedResultCache = Map<string, Map<string, AgentGraphRecord | undefined>>;
+
+/**
+ * Resolves selected historical result inputs, isolating failures per source
+ * graph: an unresolvable source omits its records so dependent work items
+ * defer with `input_not_committed` instead of wedging the whole graph.
+ * Contract violations that commit-time authorization already rejected
+ * (missing resolver, ambiguous result ids) still throw.
+ */
+async function resolveSelectedResultRecords(
+  input: ReconcileAgentGraphScheduleInput,
+  selectedInputs: readonly AgentGraphSelectedResultInput[],
+  cache: SelectedResultCache,
+): Promise<Map<string, AgentGraphRecord>> {
+  if (selectedInputs.length === 0) return new Map();
+  if (!input.resolveSelectedResultInputs) {
+    throw new Error('Selected graph result inputs require a Runtime Host resolver');
+  }
+  const distinct = [
+    ...new Map(
+      selectedInputs.map((selected) => [
+        `${selected.sourceGraphId}\u0000${selected.resultId}`,
+        selected,
+      ]),
+    ).values(),
+  ];
+  const bySource = new Map<string, AgentGraphSelectedResultInput[]>();
+  for (const selected of distinct) {
+    const group = bySource.get(selected.sourceGraphId);
+    if (group) {
+      group.push(selected);
+    } else {
+      bySource.set(selected.sourceGraphId, [selected]);
+    }
+  }
+  for (const [sourceGraphId, group] of bySource) {
+    let cached = cache.get(sourceGraphId);
+    if (!cached) {
+      cached = new Map();
+      cache.set(sourceGraphId, cached);
+    }
+    const pending = group.filter((selected) => !cached.has(selected.resultId));
+    if (pending.length === 0) continue;
+    // Cache unsuccessful attempts for this reconciliation too. Repeated
+    // snapshot reads must not replay a resolver that already failed or
+    // returned records that violate its identity contract.
+    pending.forEach((selected) => cached.set(selected.resultId, undefined));
+    let records: readonly AgentGraphRecord[];
+    try {
+      records = await input.resolveSelectedResultInputs(pending);
+    } catch {
+      continue;
+    }
+    if (
+      records.length !== pending.length ||
+      records.some((record, index) => {
+        const selected = pending[index]!;
+        return record.graphId !== selected.sourceGraphId || record.recordId !== selected.resultId;
+      })
+    ) {
+      continue;
+    }
+    records.forEach((record) => cached.set(record.recordId, record));
+  }
+  const resolved = new Map<string, AgentGraphRecord>();
+  const sourceByRecordId = new Map<string, string>();
+  for (const selected of distinct) {
+    const record = cache.get(selected.sourceGraphId)?.get(selected.resultId);
+    if (!record) continue;
+    const previousSource = sourceByRecordId.get(record.recordId);
+    if (previousSource !== undefined && previousSource !== record.graphId) {
+      throw new Error(`Selected graph result id ${record.recordId} is ambiguous`);
+    }
+    sourceByRecordId.set(record.recordId, record.graphId);
+    resolved.set(selectedResultKey(selected), clonePlain(record));
+  }
+  return resolved;
+}
+
+function selectedResultKey(selected: AgentGraphSelectedResultInput): string {
+  return `${selected.sourceGraphId}\u0000${selected.resultId}`;
 }
 
 async function applyScheduleStops(
@@ -676,11 +838,11 @@ function scheduledWorkIntent(
   work: AgentGraphScheduleWorkView,
   provision?: AgentGraphOperatorProvision,
 ): AgentGraphRunnableIntent {
-  if (work.target.kind === 'agent') {
+  if (work.target.kind !== 'operator') {
     if (
       !provision ||
       provision.workId !== work.workId ||
-      provision.agentId !== work.target.agentId
+      (work.target.kind === 'agent' ? provision.agentId !== work.target.agentId : false)
     ) {
       throw new Error(`Graph work ${work.workId} has no matching topology provision`);
     }
@@ -706,6 +868,9 @@ function scheduledWorkIntent(
     workId: work.workId,
     target: work.target,
     inputIds: work.inputIds,
+    ...(work.selectedResultInputs?.length
+      ? { selectedResultInputs: work.selectedResultInputs }
+      : {}),
     ...(work.replaces ? { replaces: work.replaces } : {}),
   });
   const readinessContextFingerprint = stableHash({
@@ -715,6 +880,9 @@ function scheduledWorkIntent(
     operatorId,
     targetSessionId: topologyBinding.sessionId,
     inputIds: work.inputIds,
+    ...(work.selectedResultInputs?.length
+      ? { selectedResultInputs: work.selectedResultInputs }
+      : {}),
   });
   return {
     schemaVersion: 1,
@@ -727,7 +895,10 @@ function scheduledWorkIntent(
     targetSessionId: topologyBinding.sessionId,
     policyKind: 'supervisor',
     triggerRouteIds: [],
-    triggerRecordIds: [...work.inputIds],
+    triggerRecordIds: [
+      ...work.inputIds,
+      ...(work.selectedResultInputs ?? []).map((input) => input.resultId),
+    ],
   };
 }
 
@@ -747,8 +918,8 @@ function buildOperatorProvisionInput(
   source: AgentGraphScheduleUpdateSource,
   expectedScheduleRevision: number,
 ): ProvisionAgentGraphOperatorInput {
-  if (work.target.kind !== 'agent') {
-    throw new Error(`Graph work ${work.workId} does not target a catalog agent`);
+  if (work.target.kind === 'operator') {
+    throw new Error(`Graph work ${work.workId} targets an existing operator`);
   }
   const operatorHash = stableHash({
     schemaVersion: SCHEDULE_INTENT_SCHEMA_VERSION,
@@ -784,7 +955,9 @@ function buildOperatorProvisionInput(
   return {
     graphId: topology.graphId,
     workId: work.workId,
-    agentId: work.target.agentId,
+    ...(work.target.kind === 'preset'
+      ? { subagentId: work.target.presetId }
+      : { agentId: work.target.agentId }),
     operatorId,
     source,
     edges,
@@ -954,6 +1127,15 @@ function reconciliationResult(
     schedule: snapshot.schedule,
     observation: snapshot.observation,
   };
+}
+
+function recordReconciliationFailure(
+  input: ReconcileAgentGraphScheduleInput,
+  failures: AgentGraphScheduleReconciliationFailure[],
+  failure: AgentGraphScheduleReconciliationFailure,
+): void {
+  failures.push(failure);
+  notifySupervisor(input.supervisor?.onReconciliationFailure, failure);
 }
 
 function dedupeStops(

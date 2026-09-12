@@ -1,8 +1,29 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import {
   CONNECTION_CATALOG_MAX_CONNECTIONS,
   CONNECTION_CATALOG_MAX_ENABLED_MODEL_IDS,
+  CONNECTION_CATALOG_MAX_ENTRIES_PER_CONNECTION,
   CONNECTION_CATALOG_MAX_MODELS_PER_CONNECTION,
   decodeCanonicalConnectionBaseUrl,
+  decodeModelCatalogEntry,
   decodeCanonicalRuntimePolicy,
   decodeConnectionModel,
   decodeConnectionModelId,
@@ -11,6 +32,7 @@ import {
   decodeConnectionTarget,
   decodeConnectionTestSummary,
   decodeConnectionVersionBasis,
+  decodeRuntimePolicyEntityId,
   decodeCredentialLocator,
   decodeCredentialStatus,
   decodeCredentialVersionBasis,
@@ -18,10 +40,16 @@ import {
   normalizeCreateCatalogConnectionInput,
   normalizeDeleteCredentialInput,
   normalizeRemoveCatalogConnectionInput,
+  normalizeOptionalRequestBodyOverlay,
+  normalizeNetworkProxyUpdate,
+  normalizeNetworkProxyCredentialTarget,
+  normalizeRequestHeaderUpdates,
   normalizeRuntimePolicyMutation,
   normalizeSetCredentialInput,
   normalizeSetDefaultConnectionTargetInput,
   normalizeUpdateCatalogConnectionInput,
+  REQUEST_HEADERS_MAX_BYTES,
+  RequestCustomizationValidationError,
   RuntimePolicyDomainDecodeError,
   type ConnectionCatalogEntry,
   type ConnectionModel,
@@ -33,14 +61,23 @@ import {
   type CredentialVersionBasis,
   type DeleteCredentialInput,
   type MutateRuntimePolicyInput,
+  type NetworkProxyCredentialTarget,
   type RemoveCatalogConnectionInput,
+  type RequestHeaderUpdate,
   type RevisionConflict,
   type RuntimePolicySnapshot,
+  type UpdateNetworkProxyInput,
   type SetCredentialInput,
   type SetDefaultConnectionTargetInput,
   type UpdateCatalogConnectionInput,
 } from '@maka/core/runtime-policy';
-import { requireExactRecord, requireRecord } from './codec.js';
+import type { ModelCatalogEntry } from '@maka/core/model-catalog';
+export type { ModelCatalogEntry } from '@maka/core/model-catalog';
+import { normalizeRelayModelProfiles, type RelayModelProfile } from '@maka/core/model-thinking';
+// The client subgraph cannot import core subpaths directly (dependency
+// boundary); the wire types it needs are re-exported through this file.
+export type { RelayModelProfile, RelayModelProfiles } from '@maka/core/model-thinking';
+import { requireExactRecord, requireShapedRecord, requireRecord } from './codec.js';
 import { invalidProtocolFrame } from './errors.js';
 import { defineOperation } from './operation-spec.js';
 
@@ -49,7 +86,6 @@ export const CONNECTION_CATALOG_PAGE_MAX_BYTES = 48 * 1024;
 export const RUNTIME_POLICY_SNAPSHOT_MAX_BYTES = 48 * 1024;
 export const CREDENTIAL_SECRET_MAX_BYTES = 10 * 1024;
 
-const CONNECTION_MUTATION_MAX_ENABLED_MODEL_IDS = 64;
 const QUERY_ERRORS = [
   'host_not_ready',
   'host_draining',
@@ -75,12 +111,26 @@ export type RuntimePolicyMutateInput = MutateRuntimePolicyInput;
 export type RuntimePolicyMutateResult =
   | { readonly kind: 'committed'; readonly revision: number }
   | RevisionConflict;
+export type RuntimePolicyNetworkProxyUpdateInput = UpdateNetworkProxyInput;
+export type RuntimePolicyNetworkProxyUpdateResult =
+  | {
+      readonly kind: 'committed';
+      readonly revision: number;
+      readonly credentialStatus: CredentialStatus;
+    }
+  | RevisionConflict
+  | {
+      readonly kind: 'proxy_target_mismatch';
+      readonly expected: NetworkProxyCredentialTarget;
+      readonly actual: NetworkProxyCredentialTarget;
+    }
+  | CredentialStale;
 
 export type ConnectionCatalogCursor =
   | { readonly connectionIndex: number; readonly part: 'connection' }
   | {
       readonly connectionIndex: number;
-      readonly part: 'enabled_model_id' | 'model';
+      readonly part: 'enabled_model_id' | 'model' | 'catalog_entry';
       readonly itemIndex: number;
     };
 
@@ -94,14 +144,29 @@ export type ConnectionCatalogQueryInput =
 
 export type ConnectionCatalogHeaderItem = Omit<
   ConnectionCatalogEntry,
-  'enabledModelIds' | 'models'
+  // The three the paginator splits into their own items, plus two the Host
+  // keeps to itself: `modelsFetchedAt` is when the Host last ran discovery —
+  // its own bookkeeping, which no client reads — and
+  // `lastTestModelFactsFingerprint` is durable invalidation metadata.
+  | 'enabledModelIds'
+  | 'models'
+  | 'relayModelProfiles'
+  | 'modelsFetchedAt'
+  | 'lastTestModelFactsFingerprint'
 > & {
   readonly kind: 'connection';
   readonly connectionIndex: number;
   readonly enabledModelIdCount: number;
   readonly modelCount: number;
+  readonly catalogEntryCount: number;
 };
 
+/**
+ * The Host owns the model catalog. Clients show what these items say, and do
+ * not work out model facts from a registry or metadata they bundle.
+ *
+ * Only add a field some client shows. Host bookkeeping stays in the Host.
+ */
 export type ConnectionCatalogPageItem =
   | ConnectionCatalogHeaderItem
   | {
@@ -109,12 +174,36 @@ export type ConnectionCatalogPageItem =
       readonly connectionIndex: number;
       readonly itemIndex: number;
       readonly modelId: string;
+      /**
+       * The model's relay profile, when the connection declares one.
+       * Profiles travel per item instead of in one header table so the
+       * paginator can always split a catalog — a header item is atomic.
+       */
+      readonly relayProfile?: RelayModelProfile;
     }
   | {
       readonly kind: 'model';
       readonly connectionIndex: number;
       readonly itemIndex: number;
-      readonly model: ConnectionModel;
+      /**
+       * The stored row with the user's `model-facts.json` overrides already
+       * merged in. Which fields an override touched stays with the Host — the
+       * one reader of that provenance is its own context-budget policy, on the
+       * execution connection rather than on this page.
+       */
+      readonly model: Omit<ConnectionModel, 'factOverriddenFields'>;
+    }
+  | {
+      /**
+       * One model as the Host resolved it — the stored row merged with the
+       * model metadata the Host owns. Clients render these instead of merging
+       * against a bundled copy of their own, so two clients of different
+       * versions attached to one Host describe a model identically.
+       */
+      readonly kind: 'catalog_entry';
+      readonly connectionIndex: number;
+      readonly itemIndex: number;
+      readonly entry: ModelCatalogEntry;
     };
 
 export type ConnectionCatalogQueryResult =
@@ -136,10 +225,7 @@ export type CreateCatalogConnectionResult =
   | CatalogConnectionCommitted
   | RevisionConflict
   | { readonly kind: 'connection_exists'; readonly slug: string };
-export type UpdateCatalogConnectionResult =
-  | CatalogConnectionCommitted
-  | ConnectionStale
-  | { readonly kind: 'invalid_default_target'; readonly target: ConnectionTarget };
+export type UpdateCatalogConnectionResult = CatalogConnectionCommitted | ConnectionStale;
 export type RemoveCatalogConnectionResult = CatalogCommitted | ConnectionStale;
 export type SetDefaultConnectionTargetResult =
   | CatalogCommitted
@@ -176,6 +262,7 @@ export type CredentialVaultQueryResult =
 export type SetCredentialResult =
   | CredentialCommitted
   | { readonly kind: 'connection_not_found' }
+  | ConnectionStale
   | CredentialStale;
 export type DeleteCredentialResult =
   | CredentialCommitted
@@ -183,6 +270,23 @@ export type DeleteCredentialResult =
   | CredentialStale;
 export type CredentialVaultSetInput = SetCredentialInput;
 export type CredentialVaultDeleteInput = DeleteCredentialInput;
+
+export interface ConnectionRequestHeadersQueryInput {
+  readonly connectionId: string;
+}
+
+export type ConnectionRequestHeadersQueryResult =
+  | { readonly kind: 'found'; readonly names: readonly string[] }
+  | { readonly kind: 'connection_not_found' };
+
+export interface ConnectionRequestHeadersReplaceInput {
+  readonly connectionId: string;
+  readonly headers: readonly RequestHeaderUpdate[];
+}
+
+export type ConnectionRequestHeadersReplaceResult =
+  | { readonly kind: 'committed' | 'unchanged'; readonly names: readonly string[] }
+  | { readonly kind: 'connection_not_found' };
 
 interface CredentialCommitted {
   readonly kind: 'committed';
@@ -218,6 +322,17 @@ export const RUNTIME_POLICY_OPERATION_SPECS = {
     errors: MUTATION_ERRORS,
     decodeInput: decodeRuntimePolicyMutation,
     decodeOutput: decodeRuntimePolicyMutationResult,
+  }),
+  'runtime.policy.network-proxy.update': defineOperation<
+    RuntimePolicyNetworkProxyUpdateInput,
+    RuntimePolicyNetworkProxyUpdateResult,
+    (typeof MUTATION_ERRORS)[number]
+  >({
+    mode: 'command',
+    availability: 'ready',
+    errors: MUTATION_ERRORS,
+    decodeInput: decodeRuntimePolicyNetworkProxyUpdate,
+    decodeOutput: decodeRuntimePolicyNetworkProxyUpdateResult,
   }),
   'connection.catalog.query': defineOperation<
     ConnectionCatalogQueryInput,
@@ -307,6 +422,28 @@ export const RUNTIME_POLICY_OPERATION_SPECS = {
     decodeInput: decodeDeleteCredentialInput,
     decodeOutput: decodeDeleteCredentialResult,
   }),
+  'connection.request-headers.query': defineOperation<
+    ConnectionRequestHeadersQueryInput,
+    ConnectionRequestHeadersQueryResult,
+    (typeof CREDENTIAL_QUERY_ERRORS)[number]
+  >({
+    mode: 'query',
+    availability: 'ready',
+    errors: CREDENTIAL_QUERY_ERRORS,
+    decodeInput: decodeConnectionRequestHeadersQueryInput,
+    decodeOutput: decodeConnectionRequestHeadersQueryResult,
+  }),
+  'connection.request-headers.replace': defineOperation<
+    ConnectionRequestHeadersReplaceInput,
+    ConnectionRequestHeadersReplaceResult,
+    (typeof MUTATION_ERRORS)[number]
+  >({
+    mode: 'command',
+    availability: 'ready',
+    errors: MUTATION_ERRORS,
+    decodeInput: decodeConnectionRequestHeadersReplaceInput,
+    decodeOutput: decodeConnectionRequestHeadersReplaceResult,
+  }),
 } as const;
 
 function decodeEmptyInput(value: unknown): RuntimePolicyQueryInput {
@@ -340,6 +477,51 @@ function decodeRuntimePolicyMutationResult(value: unknown): RuntimePolicyMutateR
     return { kind: 'committed', revision: revision(committed.revision, 'runtime policy revision') };
   }
   return revisionConflict(item, 'runtime policy mutation result');
+}
+
+function decodeRuntimePolicyNetworkProxyUpdate(
+  value: unknown,
+): RuntimePolicyNetworkProxyUpdateInput {
+  const input = decodeDomain(() => normalizeNetworkProxyUpdate(value));
+  if (
+    input.credential.kind === 'replace' &&
+    Buffer.byteLength(input.credential.secret, 'utf8') > CREDENTIAL_SECRET_MAX_BYTES
+  ) {
+    throw invalidProtocolFrame('Invalid network proxy credential secret');
+  }
+  return input;
+}
+
+function decodeRuntimePolicyNetworkProxyUpdateResult(
+  value: unknown,
+): RuntimePolicyNetworkProxyUpdateResult {
+  const item = requireRecord(value, 'network proxy update result');
+  if (item.kind === 'committed') {
+    const committed = requireExactRecord(item, 'network proxy update committed result', [
+      'kind',
+      'revision',
+      'credentialStatus',
+    ]);
+    return {
+      kind: 'committed',
+      revision: revision(committed.revision, 'runtime policy revision'),
+      credentialStatus: decodeDomain(() => decodeCredentialStatus(committed.credentialStatus)),
+    };
+  }
+  if (item.kind === 'credential_stale') return credentialStale(item);
+  if (item.kind === 'proxy_target_mismatch') {
+    const mismatch = requireExactRecord(item, 'network proxy target mismatch', [
+      'kind',
+      'expected',
+      'actual',
+    ]);
+    return {
+      kind: 'proxy_target_mismatch',
+      expected: decodeDomain(() => normalizeNetworkProxyCredentialTarget(mismatch.expected)),
+      actual: decodeDomain(() => normalizeNetworkProxyCredentialTarget(mismatch.actual)),
+    };
+  }
+  return revisionConflict(item, 'network proxy update result');
 }
 
 function decodeCatalogQueryInput(value: unknown): ConnectionCatalogQueryInput {
@@ -430,7 +612,7 @@ function catalogCursor(value: unknown): ConnectionCatalogCursor {
       part: 'connection',
     };
   }
-  if (item.part === 'enabled_model_id' || item.part === 'model') {
+  if (item.part === 'enabled_model_id' || item.part === 'model' || item.part === 'catalog_entry') {
     const cursor = requireExactRecord(item, 'connection catalog cursor', [
       'connectionIndex',
       'part',
@@ -439,7 +621,9 @@ function catalogCursor(value: unknown): ConnectionCatalogCursor {
     const maxItems =
       item.part === 'enabled_model_id'
         ? CONNECTION_CATALOG_MAX_ENABLED_MODEL_IDS
-        : CONNECTION_CATALOG_MAX_MODELS_PER_CONNECTION;
+        : item.part === 'model'
+          ? CONNECTION_CATALOG_MAX_MODELS_PER_CONNECTION
+          : CONNECTION_CATALOG_MAX_ENTRIES_PER_CONNECTION;
     return {
       connectionIndex: integer(
         cursor.connectionIndex,
@@ -454,15 +638,29 @@ function catalogCursor(value: unknown): ConnectionCatalogCursor {
   throw invalidProtocolFrame('Invalid connection catalog cursor part');
 }
 
+// A single profile on an enabled_model_id item. The host emits values the
+// canonical store already validated, so this sanitizes (drops the unusable)
+// rather than re-running the strict table decoder — which would demand an
+// enabledModelIds argument the item does not carry.
+function decodeRelayProfile(value: unknown): RelayModelProfile {
+  const sanitized = normalizeRelayModelProfiles({ m: value })?.m;
+  if (sanitized === undefined) {
+    throw invalidProtocolFrame('Invalid enabled model id relay profile');
+  }
+  return sanitized;
+}
+
 function catalogPageItem(value: unknown): ConnectionCatalogPageItem {
   const item = requireRecord(value, 'connection catalog page item');
   if (item.kind === 'enabled_model_id') {
-    const enabled = requireExactRecord(item, 'enabled model id item', [
-      'kind',
-      'connectionIndex',
-      'itemIndex',
-      'modelId',
-    ]);
+    // Exact-on-the-required-four, relayProfile optional: most models declare
+    // nothing, and requireExactRecord would make the key mandatory.
+    const enabled = requireShapedRecord(
+      item,
+      'enabled model id item',
+      ['kind', 'connectionIndex', 'itemIndex', 'modelId'],
+      ['relayProfile'],
+    );
     return {
       kind: 'enabled_model_id',
       connectionIndex: integer(
@@ -478,6 +676,9 @@ function catalogPageItem(value: unknown): ConnectionCatalogPageItem {
         CONNECTION_CATALOG_MAX_ENABLED_MODEL_IDS - 1,
       ),
       modelId: decodeDomain(() => decodeConnectionModelId(enabled.modelId)),
+      ...(enabled.relayProfile === undefined
+        ? {}
+        : { relayProfile: decodeDomain(() => decodeRelayProfile(enabled.relayProfile)) }),
     };
   }
   if (item.kind === 'model') {
@@ -504,6 +705,30 @@ function catalogPageItem(value: unknown): ConnectionCatalogPageItem {
       model: decodeDomain(() => decodeConnectionModel(modelItem.model)),
     };
   }
+  if (item.kind === 'catalog_entry') {
+    const entryItem = requireExactRecord(item, 'connection catalog entry item', [
+      'kind',
+      'connectionIndex',
+      'itemIndex',
+      'entry',
+    ]);
+    return {
+      kind: 'catalog_entry',
+      connectionIndex: integer(
+        entryItem.connectionIndex,
+        'connection index',
+        0,
+        CONNECTION_CATALOG_MAX_CONNECTIONS - 1,
+      ),
+      itemIndex: integer(
+        entryItem.itemIndex,
+        'item index',
+        0,
+        CONNECTION_CATALOG_MAX_ENTRIES_PER_CONNECTION - 1,
+      ),
+      entry: decodeDomain(() => decodeModelCatalogEntry(entryItem.entry)),
+    };
+  }
   if (item.kind !== 'connection')
     throw invalidProtocolFrame('Invalid connection catalog page item kind');
   const header = optionalRecord(
@@ -520,10 +745,11 @@ function catalogPageItem(value: unknown): ConnectionCatalogPageItem {
       'baseUrl',
       'enabled',
       'modelSource',
-      'modelsFetchedAt',
       'lastTest',
+      'requestBodyOverlay',
       'enabledModelIdCount',
       'modelCount',
+      'catalogEntryCount',
     ],
     [
       'kind',
@@ -536,11 +762,9 @@ function catalogPageItem(value: unknown): ConnectionCatalogPageItem {
       'enabled',
       'enabledModelIdCount',
       'modelCount',
+      'catalogEntryCount',
     ],
   );
-  if ((header.modelSource === undefined) !== (header.modelsFetchedAt === undefined)) {
-    throw invalidProtocolFrame('Invalid connection header model discovery fields');
-  }
   const provider = decodeDomain(() => decodeProviderType(header.providerType));
   const baseUrl =
     header.baseUrl === undefined
@@ -561,6 +785,10 @@ function catalogPageItem(value: unknown): ConnectionCatalogPageItem {
       revision: header.revision,
     }),
   );
+  const requestBodyOverlay =
+    header.requestBodyOverlay === undefined
+      ? undefined
+      : decodeDomain(() => normalizeOptionalRequestBodyOverlay(header.requestBodyOverlay));
   return {
     kind: 'connection',
     connectionIndex: integer(
@@ -577,19 +805,10 @@ function catalogPageItem(value: unknown): ConnectionCatalogPageItem {
     ...(baseUrl === undefined ? {} : { baseUrl }),
     enabled: boolean(header.enabled, 'connection enabled'),
     ...(header.modelSource === undefined ? {} : { modelSource: modelSource(header.modelSource) }),
-    ...(header.modelsFetchedAt === undefined
-      ? {}
-      : {
-          modelsFetchedAt: integer(
-            header.modelsFetchedAt,
-            'models fetched at',
-            0,
-            Number.MAX_SAFE_INTEGER,
-          ),
-        }),
     ...(header.lastTest === undefined
       ? {}
       : { lastTest: decodeDomain(() => decodeConnectionTestSummary(header.lastTest)) }),
+    ...(requestBodyOverlay === undefined ? {} : { requestBodyOverlay }),
     enabledModelIdCount: integer(
       header.enabledModelIdCount,
       'enabled model id count',
@@ -597,6 +816,12 @@ function catalogPageItem(value: unknown): ConnectionCatalogPageItem {
       CONNECTION_CATALOG_MAX_ENABLED_MODEL_IDS,
     ),
     modelCount,
+    catalogEntryCount: integer(
+      header.catalogEntryCount,
+      'catalog entry count',
+      0,
+      CONNECTION_CATALOG_MAX_ENTRIES_PER_CONNECTION,
+    ),
   };
 }
 
@@ -635,9 +860,7 @@ function decodeCreateConnectionResult(value: unknown): CreateCatalogConnectionRe
 
 function decodeUpdateConnectionResult(value: unknown): UpdateCatalogConnectionResult {
   const item = requireRecord(value, 'update connection result');
-  if (item.kind === 'committed') return catalogConnectionCommitted(item);
-  if (item.kind === 'connection_stale') return connectionStale(item);
-  return invalidDefaultTarget(item, 'update connection result');
+  return item.kind === 'committed' ? catalogConnectionCommitted(item) : connectionStale(item);
 }
 
 function decodeRemoveConnectionResult(value: unknown): RemoveCatalogConnectionResult {
@@ -717,7 +940,11 @@ function decodeCredentialQueryResult(value: unknown): CredentialVaultQueryResult
 
 function decodeSetCredentialInput(value: unknown): SetCredentialInput {
   const input = decodeDomain(() => normalizeSetCredentialInput(value));
-  if (Buffer.byteLength(input.secret, 'utf8') > CREDENTIAL_SECRET_MAX_BYTES) {
+  const maxBytes =
+    input.locator.scope === 'connection' && input.locator.kind === 'request_headers'
+      ? REQUEST_HEADERS_MAX_BYTES
+      : CREDENTIAL_SECRET_MAX_BYTES;
+  if (Buffer.byteLength(input.secret, 'utf8') > maxBytes) {
     throw invalidProtocolFrame('Invalid credential secret');
   }
   return input;
@@ -734,6 +961,7 @@ function decodeSetCredentialResult(value: unknown): SetCredentialResult {
     requireExactRecord(item, 'credential connection not found result', ['kind']);
     return { kind: 'connection_not_found' };
   }
+  if (item.kind === 'connection_stale') return connectionStale(item);
   return credentialStale(item);
 }
 
@@ -745,6 +973,82 @@ function decodeDeleteCredentialResult(value: unknown): DeleteCredentialResult {
     return { kind: 'connection_not_found' };
   }
   return credentialStale(item);
+}
+
+function decodeConnectionRequestHeadersQueryInput(
+  value: unknown,
+): ConnectionRequestHeadersQueryInput {
+  const input = requireExactRecord(value, 'connection request headers query input', [
+    'connectionId',
+  ]);
+  return {
+    connectionId: decodeDomain(() => decodeRuntimePolicyEntityId(input.connectionId)),
+  };
+}
+
+function decodeConnectionRequestHeadersQueryResult(
+  value: unknown,
+): ConnectionRequestHeadersQueryResult {
+  const result = requireRecord(value, 'connection request headers query result');
+  if (result.kind === 'connection_not_found') {
+    requireExactRecord(result, 'connection request headers connection not found result', ['kind']);
+    return { kind: 'connection_not_found' };
+  }
+  const found = requireExactRecord(result, 'connection request headers found result', [
+    'kind',
+    'names',
+  ]);
+  if (found.kind !== 'found') {
+    throw invalidProtocolFrame('Invalid connection request headers query result');
+  }
+  return { kind: 'found', names: decodeRequestHeaderNames(found.names) };
+}
+
+function decodeConnectionRequestHeadersReplaceInput(
+  value: unknown,
+): ConnectionRequestHeadersReplaceInput {
+  const input = requireExactRecord(value, 'connection request headers replace input', [
+    'connectionId',
+    'headers',
+  ]);
+  return {
+    connectionId: decodeDomain(() => decodeRuntimePolicyEntityId(input.connectionId)),
+    headers: decodeRequestHeaderUpdates(input.headers),
+  };
+}
+
+function decodeConnectionRequestHeadersReplaceResult(
+  value: unknown,
+): ConnectionRequestHeadersReplaceResult {
+  const result = requireRecord(value, 'connection request headers replace result');
+  if (result.kind === 'connection_not_found') {
+    requireExactRecord(result, 'connection request headers connection not found result', ['kind']);
+    return { kind: 'connection_not_found' };
+  }
+  const saved = requireExactRecord(result, 'connection request headers saved result', [
+    'kind',
+    'names',
+  ]);
+  if (saved.kind !== 'committed' && saved.kind !== 'unchanged') {
+    throw invalidProtocolFrame('Invalid connection request headers replace result');
+  }
+  return { kind: saved.kind, names: decodeRequestHeaderNames(saved.names) };
+}
+
+function decodeRequestHeaderNames(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) throw invalidProtocolFrame('Invalid request header names');
+  return decodeRequestHeaderUpdates(value.map((name) => ({ name }))).map(({ name }) => name);
+}
+
+function decodeRequestHeaderUpdates(value: unknown): readonly RequestHeaderUpdate[] {
+  try {
+    return normalizeRequestHeaderUpdates(value);
+  } catch (error) {
+    if (error instanceof RequestCustomizationValidationError) {
+      throw invalidProtocolFrame(error.message);
+    }
+    throw error;
+  }
 }
 
 function validateCatalogPageStructure(
@@ -811,6 +1115,8 @@ function catalogCursorPartOrder(part: ConnectionCatalogCursor['part']): number {
       return 1;
     case 'model':
       return 2;
+    case 'catalog_entry':
+      return 3;
   }
 }
 
@@ -901,7 +1207,7 @@ function modelSource(value: unknown): 'fetched' | 'fallback' {
 }
 
 function assertMutationEnabledModelIds(values: readonly string[]): void {
-  if (values.length > CONNECTION_MUTATION_MAX_ENABLED_MODEL_IDS) {
+  if (values.length > CONNECTION_CATALOG_MAX_ENABLED_MODEL_IDS) {
     throw invalidProtocolFrame('Invalid enabled model ids');
   }
 }

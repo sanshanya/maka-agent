@@ -1,204 +1,302 @@
-import { test, expect } from './fixtures';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
-// Workbar product journey. Narrow max-height and "toggle unmounted without a
-// session" are pinned in chat-shell-layout-contract (CSS + chrome actions source).
-test('session tools share one user-controlled workbar', async ({ sessionWorkbarWindow: page }) => {
-  const workbar = page.getByRole('complementary', { name: '会话工作栏' });
-  const tabs = workbar.getByRole('navigation', { name: '会话工作栏栏目' });
+import { awaitSendReady, COMPOSER_INPUT, test, expect } from './fixtures';
+import type { Page } from '@playwright/test';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
-  await expect(tabs.getByRole('button', { name: /任务/ })).toHaveAttribute('aria-current', 'page');
-  await expect(tabs.getByRole('button', { name: /浏览器/ })).toHaveCount(0);
-  await expect(tabs.getByRole('button', { name: /文件/ })).toBeEnabled();
-  await expect(
-    workbar.getByRole('tree', { name: '活跃会话任务' }).getByText('完成会话任务台账升级'),
-  ).toBeVisible();
+async function openGitChanges(page: Page) {
+  const composer = page.locator(COMPOSER_INPUT);
+  await composer.fill('create review session');
+  await awaitSendReady(page);
+  await composer.press('Enter');
+  await expect(page.getByText(/Fake backend received: create review session/)).toBeVisible();
+  await page.getByRole('button', { name: '展开任务工作栏' }).click();
+  await expect(page.getByRole('list', { name: '打开工具' })).toBeVisible();
+  await page.getByRole('button', { name: /变更.*查看当前 Git 工作区变化/ }).click();
+  return page.getByRole('region', { name: 'Git 变更' });
+}
 
-  // Sizing is config handed to Astryx Resizable (#1861), and each part fails
-  // silently: a vertical separator is what makes the drag read clientX, and
-  // ArrowLeft has to widen an end-of-row panel. The width assertion is the
-  // load-bearing one — the aria-* values mirror hook state, not the panel.
-  const resize = page.getByRole('separator', { name: '调整会话工作栏宽度' });
-  await expect(resize).toHaveAttribute('aria-orientation', 'vertical');
-  await expect(resize).toHaveAttribute('aria-valuemin', '320');
-  await expect(resize).toHaveAttribute('aria-valuemax', '600');
-  await resize.focus();
-  await resize.press('ArrowLeft');
-  // 480 default (session-workbar-layout.ts) + the hook's 10px keyboard step.
-  await expect(resize).toHaveAttribute('aria-valuenow', '490');
-  await expect(workbar).toHaveCSS('width', '490px');
+async function createSession(page: Page, prompt: string) {
+  const composer = page.locator(COMPOSER_INPUT);
+  await composer.fill(prompt);
+  await awaitSendReady(page);
+  await composer.press('Enter');
+  await expect(page.getByText(`Fake backend received: ${prompt}`)).toBeVisible();
+  await expect(page.getByRole('button', { name: '重新生成' })).toHaveCount(1, {
+    timeout: 20_000,
+  });
+  const sidebar = page.getByRole('navigation', { name: '任务列表' });
+  const expandSidebar = page.getByRole('button', { name: '展开侧边栏' });
+  if (await expandSidebar.isVisible()) await expandSidebar.click();
+  const sessionId = await sidebar
+    .locator('[data-session-id]:has([aria-current="page"])')
+    .getAttribute('data-session-id');
+  expect(sessionId).toBeTruthy();
+  return { composer, sessionId: sessionId!, sidebar };
+}
 
-  // The seam is the canvas between two plates, and it is asserted as a GAP,
-  // not as a colour. Comparing the workbar's tone to another surface is what
-  // this used to do, and it passed while the column was invisible: it was
-  // compared to the sidebar, which paints the same value the conversation does,
-  // so "the workbar matches" and "the workbar has no boundary" were the same
-  // assertion. Every default palette but darwin dark resolves all three to
-  // `oklch(1 0 0)`.
-  const conversation = page.locator('.mainColumn');
-  const workbarBox = (await workbar.boundingBox())!;
-  const conversationBox = (await conversation.boundingBox())!;
-  const gutter = workbarBox.x - (conversationBox.x + conversationBox.width);
-  expect(Math.round(gutter)).toBe(4);
-  // And it is really canvas showing through, not a third surface: the frame
-  // holding both plates paints nothing.
-  await expect(page.locator('.maka-panel-detail')).toHaveCSS(
-    'background-color',
-    'rgba(0, 0, 0, 0)',
-  );
-  await expect(workbar).toHaveCSS('border-left-width', '0px');
-
-  // Two plates, one line. Each keeps the titlebar clearance as its own padding,
-  // so their top edges agree without either reaching outside its box for it —
-  // the previous formulation hung the column above the frame's padding box,
-  // which made the frame scroll the overhang into view on the first focus.
-  // Measured after the handle above took focus, which is what caught that.
-  expect(Math.round(workbarBox.y)).toBe(Math.round(conversationBox.y));
-  expect(Math.round(workbarBox.height)).toBe(Math.round(conversationBox.height));
-
-  // Pointer drag, grabbed near the bottom of the divider: Astryx's default
-  // side-placed grab zone lifts itself half its height off the handle, so a
-  // low grab is what proves `pillPlacement="center"` is still holding the hit
-  // area open. The fractional delta proves the width stays a whole pixel in
-  // both the panel and the value screen readers announce.
-  const box = (await resize.boundingBox())!;
-  const y = box.y + box.height * 0.9;
-  await page.mouse.move(box.x, y);
-  await page.mouse.down();
-  await page.mouse.move(box.x - 20.5, y, { steps: 2 });
-  await page.mouse.up();
-  await expect(workbar).toHaveCSS('width', '511px');
-  await expect(resize).toHaveAttribute('aria-valuenow', '511');
-
-  // Cmd+Tab mid-drag and release outside the app: Astryx only ends a drag on
-  // pointerup/pointercancel, so without a blur guard the listeners survive and
-  // the panel keeps tracking a button-less pointer while `body` stays stuck at
-  // `user-select: none`.
-  await page.mouse.move(box.x - 20.5, y);
-  await page.mouse.down();
-  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
-  await page.mouse.move(box.x - 200, y, { steps: 2 });
-  await page.mouse.up();
-  await expect(workbar).toHaveCSS('width', '511px');
-  await expect(page.locator('body')).toHaveCSS('user-select', 'auto');
-
-  // Which key the width lands on is the load-bearing decision of #1861 and the
-  // one thing every assertion above stays green through: `useResizable`'s
-  // `autoSaveId` writes synchronously on each committed size (~90 writes per
-  // drag), so the width stays on Maka's debounced key instead. Switching to
-  // `autoSaveId` would orphan the user's stored width silently.
-  await expect
-    .poll(() => page.evaluate(() => localStorage.getItem('maka-session-workbar-width-v1')))
-    .toBe('511');
-  expect(
-    await page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith('astryx-resizable:'))),
-  ).toEqual([]);
-
-  // Keyboard-driven disclosure, observed through what the user can read: a
-  // collapsed section hides its rows, and Enter on the trigger reveals them.
-  const recent = workbar.getByRole('button', { name: /最近结束/ });
-  const recentRow = workbar.getByText('验证 Goal 一次提醒门禁');
-  await expect(recent).toHaveAttribute('aria-expanded', 'false');
-  await expect(recentRow).toBeHidden();
-
-  await recent.focus();
-  await recent.press('Enter');
-  await expect(recent).toHaveAttribute('aria-expanded', 'true');
-  await expect(recentRow).toBeVisible();
-
-  // One toggle, in one place, across its own state change. It used to hand off
-  // to a second button inside the workbar's tab row while the workbar was open,
-  // so the control a user clicks twice moved between those two clicks. The
-  // titlebar is also the only row that already reserves `env(titlebar-area-*)`,
-  // which is what keeps this button clear of the Windows caption strip.
-  const collapse = page.getByRole('button', { name: '收起会话工作栏' });
-  const openBox = (await collapse.boundingBox())!;
-  await expect(collapse).toHaveAttribute('aria-expanded', 'true');
-  await collapse.click();
-
-  // Collapsing animates, which is only possible because ONE box survives it.
-  // The column itself does not — it subscribes to task changes and can own a
-  // live embedded browser — so the box stays behind at zero width and the column
-  // is torn down when the width transition ends. Each half fails silently: lose
-  // the box and the panel snaps shut, leave the column mounted and a closed
-  // panel keeps working. `toBeHidden` alone would pass for both, so the count is
-  // what actually holds the teardown.
-  // The frames themselves are not observable here — the E2E fixture caps every
-  // transition to 0.01ms on purpose — so what animates is held by the CSS
-  // contract in session-workbar-layout.test.ts, and this covers the end state.
-  const motion = page.locator('.maka-workbar-motion');
-  await expect(workbar).toHaveCount(0);
-  await expect(motion).toHaveCount(1);
-  await expect(motion).toHaveCSS('width', '0px');
-  await expect(page.locator('.maka-workbar-resize-handle')).toHaveCount(0);
-
-  const expand = page.getByRole('button', { name: '展开会话工作栏' });
-  await expect(expand).toHaveAttribute('aria-expanded', 'false');
-  expect(await expand.boundingBox()).toMatchObject({ x: openBox.x, y: openBox.y });
-  await expand.click();
-  await expect(workbar).toBeVisible();
-  // The width the drag above landed on, restored rather than reset.
-  await expect(motion).toHaveCSS('width', '511px');
-  await tabs.getByRole('button', { name: /文件/ }).click();
-  await expect(workbar.getByText('暂无生成文件')).toBeVisible();
-
-  await page.locator('button[aria-label="展开侧边栏"]').dispatchEvent('click');
+test('right workbar visibility belongs to each Session and survives reload', async ({
+  window: page,
+}) => {
+  const first = await createSession(page, 'first workbar owner');
+  const panel = page.locator('.maka-session-workbar[data-placement="right"]');
+  await page.getByRole('button', { name: '展开任务工作栏' }).click();
   await page
-    .getByRole('navigation', { name: '对话列表' })
-    .getByRole('button', { name: '扩展', exact: true })
-    .dispatchEvent('click');
-  await expect(workbar).toBeHidden();
-  await expect(page.getByRole('main', { name: '扩展' })).toBeVisible();
+    .getByRole('list', { name: '打开工具' })
+    .getByRole('button', { name: /变更.*查看当前 Git 工作区变化/ })
+    .click();
+  await page.getByRole('button', { name: '打开用量追踪' }).click();
+  await expect(page.locator(
+    '.maka-session-workbar-panel[data-overlay][data-placement="right"] [data-maka-contract="session-inspector"]',
+  )).toBeVisible();
+  await expect(panel).toBeVisible();
+  await first.sidebar.getByRole('button', { name: '新任务', exact: true }).click();
+  const second = await createSession(page, 'second workbar owner');
+  await expect(panel).toBeHidden();
+  await first.sidebar.locator(`[data-session-id=${JSON.stringify(first.sessionId)}]`).click();
+  await expect(panel).toBeVisible();
+  await page.reload();
+  await expect(page.locator(COMPOSER_INPUT)).toBeVisible();
+  const sidebar = page.getByRole('navigation', { name: '任务列表' });
+  const expandSidebar = page.getByRole('button', { name: '展开侧边栏' });
+  if (await expandSidebar.isVisible()) await expandSidebar.click();
+  await sidebar.locator(`[data-session-id=${JSON.stringify(first.sessionId)}]`).click();
+  await expect(panel).toBeVisible();
+  await sidebar.locator(`[data-session-id=${JSON.stringify(second.sessionId)}]`).click();
+  await expect(panel).toBeHidden();
 });
 
-// The journey above runs under the fixture's global 0.01ms transition cap, so
-// it can only ever see settled states. That cap is deliberate — every other
-// assertion in this file would be timing-dependent without it — but it also
-// means nothing in the suite watches the collapse actually happen, and the one
-// defect that lived here was invisible for exactly that reason: the column was
-// torn down 5ms into the slide and the 280ms animation ran on an empty box,
-// which no settled-state assertion can distinguish from a correct collapse.
-//
-// So this test lifts the cap for itself and watches the frames. It collapses
-// TWICE, because the first collapse was the one that worked.
-test('the column stays mounted for the whole slide, every time', async ({
-  sessionWorkbarWindow: page,
+test('a collapsed workbar never flashes during the first send', async ({
+  window: page,
 }) => {
-  await expect(page.getByRole('complementary', { name: '会话工作栏' })).toBeVisible();
-  await page.evaluate(() => document.documentElement.removeAttribute('data-maka-e2e-fixture'));
-
-  const motion = page.locator('.maka-workbar-motion');
-  const collapseOnce = async () => {
-    // Sample the box's width and whether the column is still under it, on every
-    // frame, from the click until the box reaches zero.
-    const frames = await page.evaluate(async () => {
-      const box = document.querySelector('.maka-workbar-motion') as HTMLElement;
-      const seen: { width: number; mounted: boolean }[] = [];
-      (document.querySelector('button[aria-label="收起会话工作栏"]') as HTMLElement).click();
-      const started = performance.now();
-      while (performance.now() - started < 600) {
-        seen.push({
-          width: Number.parseFloat(getComputedStyle(box).width),
-          mounted: document.querySelector('.maka-session-workbar') !== null,
-        });
-        if (seen.length > 1 && seen.at(-1)!.width === 0) break;
-        await new Promise((resolve) => requestAnimationFrame(resolve));
+  await page.evaluate(() => {
+    const watch = { visibleRightWorkbar: false };
+    const inspect = () => {
+      const panel = document.querySelector<HTMLElement>(
+        '.maka-session-workbar[data-placement="right"]',
+      );
+      if (
+        panel &&
+        getComputedStyle(panel).display !== 'none' &&
+        panel.getBoundingClientRect().width > 0
+      ) {
+        watch.visibleRightWorkbar = true;
       }
-      return seen;
+    };
+    const observer = new MutationObserver(inspect);
+    observer.observe(document.body, {
+      subtree: true,
+      childList: true,
+      attributes: true,
     });
-    // It really animated — a snap would give two samples, not a spread.
-    const widths = new Set(frames.map((frame) => frame.width));
-    expect(widths.size).toBeGreaterThan(8);
-    // And the column was under the box the whole way down, not just at the top.
-    const carried = frames.filter((frame) => frame.width > 0);
-    expect(carried.every((frame) => frame.mounted)).toBe(true);
-    // Then it goes, once the box is shut.
-    await expect(page.getByRole('complementary', { name: '会话工作栏' })).toHaveCount(0);
-    await expect(motion).toHaveCSS('width', '0px');
-  };
+    (
+      window as typeof window & {
+        __makaFirstSendWorkbarWatch?: typeof watch;
+        __makaFirstSendWorkbarWatchStop?: () => void;
+      }
+    ).__makaFirstSendWorkbarWatch = watch;
+    (
+      window as typeof window & {
+        __makaFirstSendWorkbarWatchStop?: () => void;
+      }
+    ).__makaFirstSendWorkbarWatchStop = () => {
+      inspect();
+      observer.disconnect();
+    };
+  });
 
-  await collapseOnce();
-  await page.getByRole('button', { name: '展开会话工作栏' }).click();
-  await expect(page.getByRole('complementary', { name: '会话工作栏' })).toBeVisible();
-  await expect(motion).toHaveCSS('width', '480px');
-  await collapseOnce();
+  const composer = page.locator(COMPOSER_INPUT);
+  await composer.fill('create a session without opening the workbar');
+  await page.getByRole('button', { name: '发送' }).click();
+  const expandWorkbar = page.getByRole('button', { name: '展开任务工作栏' });
+  await expect(expandWorkbar).toBeVisible({
+    timeout: 20_000,
+  });
+
+  const watch = await page.evaluate(() => {
+    const target = window as typeof window & {
+      __makaFirstSendWorkbarWatch?: { visibleRightWorkbar: boolean };
+      __makaFirstSendWorkbarWatchStop?: () => void;
+    };
+    target.__makaFirstSendWorkbarWatchStop?.();
+    return target.__makaFirstSendWorkbarWatch;
+  });
+  expect(watch?.visibleRightWorkbar, 'the collapsed right workbar stayed hidden').toBe(false);
+
+  await expandWorkbar.evaluate((button) => button.click());
+  await expect(
+    page.locator('.maka-session-workbar[data-placement="right"]'),
+  ).toBeVisible();
+});
+
+async function waitForCompanionForkId(page: Page, sourceSessionId: string) {
+  let forkId: string | undefined;
+  await expect
+    .poll(async () => {
+      forkId = (await page.evaluate(() => window.maka.sessions.list())).find(
+        (session) => session.id !== sourceSessionId,
+      )?.id;
+      return forkId;
+    })
+    .not.toBeUndefined();
+  return forkId!;
+}
+
+test('Git changes re-read the workspace after the app regains focus', async ({
+  gitReviewWindow,
+}) => {
+  const panel = await openGitChanges(gitReviewWindow.page);
+  await expect(panel.getByText('新增 4 行')).toBeVisible();
+
+  await writeFile(join(gitReviewWindow.projectRoot, 'base.txt'), 'base\nunstaged\nexternal\n');
+  await gitReviewWindow.page.evaluate(() => window.dispatchEvent(new Event('focus')));
+
+  await expect(panel.getByText('新增 5 行')).toBeVisible();
+});
+
+test('Terminal ownership follows the active Session and stops the old resource', async ({
+  window: page,
+}) => {
+  const { composer, sessionId, sidebar } = await createSession(
+    page,
+    'create terminal owner session',
+  );
+  await page.getByRole('button', { name: '展开任务工作栏' }).click();
+  await page
+    .getByRole('button', { name: /终端.*查看当前任务的终端运行和实时输出/ })
+    .click();
+
+  const terminal = page.getByRole('region', { name: '任务终端' });
+  await expect(terminal).toBeVisible();
+  const terminalRef = await terminal.getAttribute('data-terminal-ref');
+  expect(terminalRef).toBeTruthy();
+  await expect
+    .poll(async () =>
+      (await page.evaluate((id) => window.maka.shellRuns.list(id), sessionId))
+        .find((update) => update.result.ref === terminalRef)
+        ?.result.status,
+    )
+    .toBe('running');
+
+  await sidebar.getByRole('button', { name: '新任务', exact: true }).click();
+  await expect(terminal).toHaveCount(0);
+  await expect
+    .poll(async () =>
+      (await page.evaluate((id) => window.maka.shellRuns.list(id), sessionId))
+        .find((update) => update.result.ref === terminalRef)
+        ?.result.status,
+    )
+    .not.toBe('running');
+
+  await composer.fill('create replacement session');
+  await awaitSendReady(page);
+  await composer.press('Enter');
+  await expect(page.getByText('Fake backend received: create replacement session')).toBeVisible();
+  await page.getByRole('button', { name: '展开任务工作栏' }).click();
+  await expect(page.getByRole('list', { name: '打开工具' })).toBeVisible();
+});
+
+test('Side Chat survives collapse, confirms close, and cleans up on source switch', async ({
+  window: page,
+}) => {
+  const { composer, sessionId, sidebar } = await createSession(
+    page,
+    'create side chat source session',
+  );
+  await page.getByRole('button', { name: '展开任务工作栏' }).click();
+  const openSideChat = page.getByRole('button', {
+    name: /侧边对话.*在不打断主任务的情况下追问和只读探索/,
+  });
+  await openSideChat.click();
+
+  const companion = page.locator('.maka-quote-companion');
+  await expect(companion).toBeVisible();
+
+  // The companion forks lazily on the first send, not when the panel opens.
+  const sideComposer = companion.locator(COMPOSER_INPUT);
+  await sideComposer.fill('inspect this source without changing it');
+  await sideComposer.press('Enter');
+  await expect(companion).toContainText(
+    'Fake backend received: inspect this source without changing it',
+  );
+  const firstForkId = await waitForCompanionForkId(page, sessionId);
+  await expect(sidebar.locator(`[data-session-id=${JSON.stringify(firstForkId)}]`)).toHaveCount(0);
+
+  await page.getByRole('button', { name: '收起任务工作栏' }).click();
+  await expect(companion).toBeAttached();
+  await expect(companion).not.toBeVisible();
+  await expect
+    .poll(async () =>
+      (await page.evaluate(() => window.maka.sessions.list()))
+        .some((session) => session.id === firstForkId),
+    )
+    .toBe(true);
+  await page.getByRole('button', { name: '展开任务工作栏' }).click();
+  await expect(companion).toBeVisible();
+
+  // Closing is the same [+] menu that opens: the face already on screen carries
+  // a checkmark, and picking it again asks to close it.
+  const closeActiveSideChat = async () => {
+    await page.getByRole('button', { name: '打开或关闭工作栏的面' }).first().click();
+    await page
+      .getByRole('menu')
+      .getByRole('menuitem', { name: '侧边对话', exact: true })
+      .click();
+  };
+  await closeActiveSideChat();
+  const confirmation = page.getByRole('dialog');
+  await expect(confirmation).toContainText('这个临时侧边对话会被永久删除');
+  await confirmation.getByRole('button', { name: '取消' }).click();
+  await expect(companion).toBeVisible();
+
+  await closeActiveSideChat();
+  await confirmation.getByRole('button', { name: '关闭侧边对话' }).click();
+  await expect(companion).toHaveCount(0);
+  await expect
+    .poll(async () =>
+      (await page.evaluate(() => window.maka.sessions.list()))
+        .some((session) => session.id === firstForkId),
+    )
+    .toBe(false);
+
+  await page.getByRole('button', { name: '展开任务工作栏' }).click();
+  await expect(page.getByRole('list', { name: '打开工具' })).toBeVisible();
+  await openSideChat.click();
+  await expect(companion).toBeVisible();
+  // Fork again on the reopened panel's first send.
+  const reopenedComposer = companion.locator(COMPOSER_INPUT);
+  await reopenedComposer.fill('inspect once more before switching away');
+  await reopenedComposer.press('Enter');
+  await expect(companion).toContainText(
+    'Fake backend received: inspect once more before switching away',
+  );
+  const secondForkId = await waitForCompanionForkId(page, sessionId);
+
+  await sidebar.getByRole('button', { name: '新任务', exact: true }).click();
+  await expect(companion).toHaveCount(0);
+  await expect
+    .poll(async () =>
+      (await page.evaluate(() => window.maka.sessions.list()))
+        .some((session) => session.id === secondForkId),
+    )
+    .toBe(false);
+  await expect(composer).toHaveText('');
 });

@@ -1,4 +1,23 @@
-import { useState, type FormEvent } from 'react';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Button, HStack, TextInput } from '@astryxdesign/core';
 import { Dialog, DialogHeader } from '@astryxdesign/core/Dialog';
 import { Layout, LayoutContent, LayoutFooter } from '@astryxdesign/core/Layout';
@@ -30,7 +49,7 @@ export interface SessionRenameTarget {
  * dialog is what those actions already look like.
  *
  * One button, no 取消: the header's close control and Escape are already two
- * ways out, which is the convention `PlanReminderFormDialog` set.
+ * ways out, which is the convention `ScheduledTaskFormDialog` set.
  */
 export function SessionRenameDialog(props: {
   target: SessionRenameTarget;
@@ -43,10 +62,30 @@ export function SessionRenameDialog(props: {
   // `key` at the call site), so the seed is the name as it was when the menu
   // item was chosen, and nothing has to be synchronised while it is open.
   const [name, setName] = useState(target.name);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const input = inputRef.current;
+    if (!input) return;
+
+    const focusAndSelect = () => {
+      input.focus({ preventScroll: true });
+      input.select();
+    };
+
+    focusAndSelect();
+    const frame = window.requestAnimationFrame(() => {
+      // Closing a menu and opening a native dialog both manage focus. If
+      // either handoff wins after this effect, take ownership back once the
+      // dialog has settled.
+      if (document.activeElement !== input) focusAndSelect();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
 
   const trimmed = name.trim();
-  // The row's own vocabulary: a conversation is 对话 everywhere else in the
-  // sidebar, and the header doubles as the field's (hidden) label.
+  // The row's own vocabulary: a session is 任务 everywhere the user can see
+  // one, and the header doubles as the field's (hidden) label.
   const title = target.kind === 'project' ? copy.renameProjectTitle : copy.renameAriaLabel;
 
   function submit(event: FormEvent<HTMLFormElement>) {
@@ -62,7 +101,6 @@ export function SessionRenameDialog(props: {
   return (
     <Dialog isOpen onOpenChange={props.onOpenChange} purpose="form" width={440}>
       <Layout
-        height="auto"
         header={
           <DialogHeader
             title={title}
@@ -86,6 +124,7 @@ export function SessionRenameDialog(props: {
           <LayoutContent>
             <form id="maka-session-rename-form" onSubmit={submit}>
               <TextInput
+                ref={inputRef}
                 label={title}
                 // Hidden: the dialog's own header already says what is being
                 // renamed, and Astryx clips the whole label block — a

@@ -1,4 +1,28 @@
-import { SKILL_INVOCATION_TOKEN_SOURCE } from '@maka/core';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { SKILL_INVOCATION_TOKEN_SOURCE } from '@maka/core/skill-invocation-token';
+import {
+  decodeSkillInvocationResult,
+  type SkillInvocationFailure,
+  type SkillInvocationResult,
+} from '@maka/core/skill-invocation';
 import {
   gateSkillsByHostCapabilities,
   loadSkillInstructionsFromScan,
@@ -12,6 +36,7 @@ import {
   failedSkillInvocationReceipt,
   loadedSkillInvocationReceipt,
   overflowSkillInvocationReceipt,
+  skillInvocationLoadedEntry,
   type PerRequestSkillInvocationFailureReason,
   type SkillInvocationReceipt,
 } from './skill-invocation-receipt.js';
@@ -54,22 +79,7 @@ export interface SkillInvocationToken {
   end: number;
 }
 
-export type SkillInvocationFailure =
-  | {
-      request: string;
-      reason: PerRequestSkillInvocationFailureReason;
-    }
-  | {
-      reason: 'too_many_requests';
-      requestLimit: number;
-    };
-
-export interface SkillInvocationResult {
-  loaded: Array<{ id: string; name: string }>;
-  failed: SkillInvocationFailure[];
-  /** One bounded outcome per distinct request, including all-failed sends. */
-  receipts: SkillInvocationReceipt[];
-}
+export type { SkillInvocationFailure, SkillInvocationResult } from '@maka/core/skill-invocation';
 
 export type PreparedSkillInvocationMessage =
   | {
@@ -256,7 +266,7 @@ async function prepareSkillInvocation(input: {
   const passthrough: PreparedSkillInvocationMessage = {
     disposition: 'passthrough',
     sendText: input.text,
-    skillInvocation: { loaded: [], failed: [], receipts: [] },
+    skillInvocation: validatedSkillInvocationResult({ loaded: [], failed: [], receipts: [] }),
   };
   const tokens = parseSkillInvocationTokens(input.text);
   const requestSet = distinctInvocationRequests([
@@ -266,11 +276,11 @@ async function prepareSkillInvocation(input: {
   if (requestSet.overflow) {
     return {
       disposition: 'blocked',
-      skillInvocation: {
+      skillInvocation: validatedSkillInvocationResult({
         loaded: [],
         failed: [{ reason: 'too_many_requests', requestLimit: MAX_SKILL_INVOCATION_REQUESTS }],
         receipts: [overflowSkillInvocationReceipt(MAX_SKILL_INVOCATION_REQUESTS)],
-      },
+      }),
     };
   }
   const requests = requestSet.requests;
@@ -301,11 +311,11 @@ async function prepareSkillInvocation(input: {
         receipts.push(failedSkillInvocationReceipt('explicit', entry.request, entry.result.reason));
       }
     }
-    const skillInvocation: SkillInvocationResult = {
-      loaded: loaded.map((skill) => ({ id: skill.id, name: skill.name })),
+    const skillInvocation = validatedSkillInvocationResult({
+      loaded: loaded.map(skillInvocationLoadedEntry),
       failed: failures,
       receipts,
-    };
+    });
     if (loaded.length === 0) return { disposition: 'blocked', skillInvocation };
     return {
       disposition: 'ready',
@@ -315,7 +325,7 @@ async function prepareSkillInvocation(input: {
   } catch {
     return {
       disposition: 'blocked',
-      skillInvocation: {
+      skillInvocation: validatedSkillInvocationResult({
         loaded: [],
         failed: requests.map((request) => ({
           request: boundSkillInvocationRequest(request),
@@ -324,9 +334,13 @@ async function prepareSkillInvocation(input: {
         receipts: requests.map((request) =>
           failedSkillInvocationReceipt('explicit', request, 'resolution_failed'),
         ),
-      },
+      }),
     };
   }
+}
+
+function validatedSkillInvocationResult(value: SkillInvocationResult): SkillInvocationResult {
+  return decodeSkillInvocationResult(value);
 }
 
 type DistinctInvocationRequests = { overflow: false; requests: string[] } | { overflow: true };

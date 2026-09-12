@@ -1,16 +1,35 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import { access, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { AGENT_GRAPH_INTENT_CLAIM_SCHEMA_VERSION } from '@maka/core/agent-graph-control';
-import type { RootExecutionDescriptor } from '@maka/core/agent-run';
+import type { RootExecutionDescriptor } from '@maka/core/runtime-invocation';
 import { createSqliteAgentRunStore, type AdmitRootTurnInput } from '../agent-run-store.js';
 
 describe('claimed agent graph root admission', () => {
   test('round-trips an exact, deeply frozen durable descriptor', async () => {
-    await withTempRoot(async (root) => {
-      const store = createSqliteAgentRunStore(root);
+    await withTempRoot(async (_root, openStore) => {
+      const store = openStore();
       const result = await store.admitRootTurn(admissionInput());
       assert.equal(result.kind, 'admitted');
       assert.equal(result.admission.execution.kind, 'claimed_agent_graph_intent');
@@ -21,7 +40,7 @@ describe('claimed agent graph root admission', () => {
       assert.equal(Object.isFrozen(result.admission.execution), true);
       assert.equal(Object.isFrozen(result.admission.execution.claim), true);
 
-      const reopened = createSqliteAgentRunStore(root);
+      const reopened = openStore();
       const stored = await reopened.readRootTurnAdmission('session-child', 'turn-next');
       assert.deepEqual(stored, result.admission);
       assert.equal(Object.isFrozen(stored?.execution), true);
@@ -32,8 +51,8 @@ describe('claimed agent graph root admission', () => {
   });
 
   test('rejects descriptor unknown fields and malformed claims', async () => {
-    await withTempRoot(async (root) => {
-      const store = createSqliteAgentRunStore(root);
+    await withTempRoot(async (_root, openStore) => {
+      const store = openStore();
       await assert.rejects(
         () =>
           store.admitRootTurn(
@@ -78,8 +97,8 @@ describe('claimed agent graph root admission', () => {
   });
 
   test('rejects every claim target identity drift before writing admission', async () => {
-    await withTempRoot(async (root) => {
-      const store = createSqliteAgentRunStore(root);
+    await withTempRoot(async (root, openStore) => {
+      const store = openStore();
       for (const [field, value] of [
         ['targetSessionId', 'different-session'],
         ['targetTurnId', 'different-turn'],
@@ -118,8 +137,8 @@ describe('claimed agent graph root admission', () => {
   });
 
   test('rejects queue sources and a missing canonical UserMessage', async () => {
-    await withTempRoot(async (root) => {
-      const store = createSqliteAgentRunStore(root);
+    await withTempRoot(async (root, openStore) => {
+      const store = openStore();
       await assert.rejects(
         () =>
           store.admitRootTurn(
@@ -203,11 +222,22 @@ function baseClaim() {
   };
 }
 
-async function withTempRoot(run: (root: string) => Promise<void>): Promise<void> {
+async function withTempRoot(
+  run: (
+    root: string,
+    openStore: () => ReturnType<typeof createSqliteAgentRunStore>,
+  ) => Promise<void>,
+): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'maka-claimed-graph-admission-'));
+  const stores: ReturnType<typeof createSqliteAgentRunStore>[] = [];
   try {
-    await run(root);
+    await run(root, () => {
+      const store = createSqliteAgentRunStore(root);
+      stores.push(store);
+      return store;
+    });
   } finally {
+    for (const store of stores.reverse()) store.close?.();
     await rm(root, { recursive: true, force: true });
   }
 }

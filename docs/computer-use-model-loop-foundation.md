@@ -1,3 +1,34 @@
+---
+doc_id: computer-use-model-loop-foundation
+title: "Computer Use Model-Loop Foundation"
+language: en
+source_language: en
+implementation_status: current
+document_status: current
+translation_status: source-only
+last_verified: 2026-09-11
+owners:
+  - maka-backend
+---
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
 # Computer Use Model-Loop Foundation
 
 ## Product Boundary
@@ -32,9 +63,8 @@ Maka keeps the same separation:
 - semantic element actions and verified AX/CDP value updates are retained;
 - coordinate click, scroll, drag, key input, and pixel fallback are described
   as disabled and fail closed;
-- the OpenAI native `computer_call` loop is an observation-only experimental
-  path by default;
-- a whole native action batch is validated before any action executes.
+- provider adapters use the same `maka_computer` contract rather than a
+  separate native Computer Use loop.
 
 No provider adapter may infer a missing observation ID or silently bind an
 action to the current frame.
@@ -47,14 +77,13 @@ provider responses.
 
 ### OpenAI Responses
 
-`gpt-5.6-sol` completed:
+`gpt-5.6-sol` completed the product path:
 
 ```text
 list_apps -> observe -> set_value -> verified finish
 ```
 
-The standalone provider loop completed in four to five turns. The full product
-path also passed:
+The full product path passed:
 
 ```text
 getAIModel
@@ -67,10 +96,6 @@ getAIModel
 
 The product path persisted tool calls and results, emitted permission-safe
 telemetry, and reached the verified final value.
-
-The same deployment accepted the GA native `computer` tool. Under
-observation-only instructions it returned only `screenshot`, and the bounded
-transport/codec loop completed the screenshot continuation in two turns.
 
 ### Anthropic
 
@@ -116,7 +141,6 @@ The core `maka_computer` parser remains strict and provider neutral.
 
 This foundation does not:
 
-- enable native OpenAI click, type, scroll, drag, or key execution;
 - reconnect a compatibility CGEvent path;
 - add the real AppKit AX provider runner (that is the next evidence-layer PR);
 - resolve PID reuse, stale driver nodes, or executor lifecycle hardening;

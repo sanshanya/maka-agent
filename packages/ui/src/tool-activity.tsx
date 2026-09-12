@@ -1,28 +1,61 @@
-import { useEffect, useRef, type ComponentType } from 'react';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { useEffect, useRef, useState } from 'react';
+import { countDiffLineStats } from '@maka/core/unified-diff';
+import { isInFlightToolStatus } from '@maka/core/tool-result-status';
+import { type ToolResultContent } from '@maka/core/events';
+import { type UiLocale } from '@maka/core/ui-locale';
 import {
-  countDiffLineStats,
-  isInFlightToolStatus,
-  type ToolResultContent,
-  type UiLocale,
-} from '@maka/core';
-import {
+  Blocks,
+  ICON_SIZE,
   Check,
-  Clock,
+  ChevronRight,
   Copy,
-  Repeat,
+  GitBranch,
+  Globe,
+  Monitor,
+  Plug,
+  Settings,
   ShieldAlert,
-  type LucideProps,
+  Workflow,
+  type LucideIcon,
 } from './icons.js';
 import { useClipboardCopyFeedback } from './clipboard-feedback.js';
 import { useUiLocale } from './locale-context.js';
-import { type ToolActivityItem, type ToolOutputChunk } from './materialize.js';
-import { isConnectorTool, resolveToolDisplayName } from './tool-activity/display-name.js';
-import { computerActionLabel } from './tool-activity/computer-action-label.js';
+import {
+  toolActivityPresentationStatus,
+  type ToolActivityItem,
+  type ToolOutputChunk,
+} from './materialize.js';
+import { isConnectorTool, resolveToolDisplayName, workHubControlStatus } from './tool-activity/display-name.js';
+import {
+  computerActionLabel,
+  computerActionLabelIncludesTarget,
+  computerActionTarget,
+  isComputerTool,
+} from './tool-activity/computer-action-label.js';
 import {
   extractErrorText,
-  isAutomationTool,
   isCancelledToolResult,
   isPermissionDeniedToolResult,
+  isRequiresBypassToolResult,
   resultOwnsOwnPanel,
   withLiveStreamFallback,
 } from './tool-activity/result-projection.js';
@@ -33,11 +66,20 @@ import {
   Button as UiButton,
   Banner,
   ChatToolCalls,
+  List,
+  ListItem,
+  StatusDot,
+  Text,
   type ChatToolCallItem,
+  VisuallyHidden,
 } from '@astryxdesign/core';
 import { ToolCodeBlock, ToolDetailReveal } from './tool-activity/tool-code-block.js';
 import { cn } from './ui.js';
-import { describeLoadToolResult, formatToolIntent } from './tool-format.js';
+import {
+  describeLoadToolResult,
+  formatToolIntent,
+  type LoadToolGroupKind,
+} from './tool-format.js';
 import {
   formatDuration,
   formatUserVisibleToolText,
@@ -54,103 +96,80 @@ import {
   ToolResultPreview,
 } from './tool-activity/tool-result-preview.js';
 import { getToolActivityCopy } from './tool-activity/copy.js';
+import { dotForStatus, type StatusSemantic } from './status-vocabulary.js';
 
-/** Friendly card for a `load_tools` result; falls back to JSON on unexpected shapes. */
-function LoadToolResultPreview(props: { args: unknown; value: unknown }) {
+/** Friendly card for tool-search and historical loader results. */
+function LoadToolResultPreview(props: {
+  args: unknown;
+  value: unknown;
+  actionIdentity: string;
+}) {
   const locale = useUiLocale();
   const desc = describeLoadToolResult(props.args, props.value, locale);
   if (!desc) {
-    return <ToolResultPreview content={{ kind: 'json', value: props.value }} />;
+    return (
+      <ToolResultPreview
+        content={{ kind: 'json', value: props.value }}
+        actionIdentity={props.actionIdentity}
+      />
+    );
   }
+  const Icon = loadToolGroupIcon(desc.kind);
+  const copy = getToolActivityCopy(locale).loadTools;
   return (
     <div className={previewVariants({ part: 'load-tool' })} data-kind="load_tool">
-      <p className={previewVariants({ part: 'load-tool-title' })}>{desc.title}</p>
-      <p className={previewVariants({ part: 'load-tool-count' })}>{desc.countLabel}</p>
-      <p className={previewVariants({ part: 'load-tool-tools' })}>{desc.toolsText}</p>
-      <p className={previewVariants({ part: 'load-tool-footer' })}>{desc.footer}</p>
+      <span className="maka-load-tool-icon" aria-hidden="true">
+        <Icon size={ICON_SIZE.chrome} />
+      </span>
+      <div className="maka-load-tool-summary">
+        <p className={previewVariants({ part: 'load-tool-title' })}>{desc.title}</p>
+        <p className="maka-load-tool-description">{desc.description}</p>
+        <p className={previewVariants({ part: 'load-tool-count' })}>
+          <span>{desc.label}</span>
+          <span className="maka-load-tool-separator" aria-hidden="true" />
+          <span>{desc.countLabel}</span>
+        </p>
+      </div>
+      {(desc.groupId || desc.toolIds.length > 0) && (
+        <details className="maka-load-tool-technical">
+          <summary>{copy.technicalDetails}</summary>
+          <dl>
+            {desc.groupId && (
+              <>
+                <dt>{copy.groupId}</dt>
+                <dd><code>{desc.groupId}</code></dd>
+              </>
+            )}
+            {desc.toolIds.length > 0 && (
+              <>
+                <dt>{copy.toolIds}</dt>
+                <dd><code>{desc.toolIds.join('\n')}</code></dd>
+              </>
+            )}
+          </dl>
+        </details>
+      )}
     </div>
   );
 }
 
-// ── Automation result preview ───────────────────────────────────────────────
-
-const AUTOMATION_RESULT_ICON_CLASS = 'maka-automation-result-icon';
-
-/** Icon for one automation description: recurring schedules cycle, one-shots tick. */
-function automationScheduleIcon(text: string): ComponentType<LucideProps> {
-  return /Schedule: (every |cron )/.test(text) ? Repeat : Clock;
-}
-
-/**
- * Compact preview card for the unified Automation tool's text results
- * (created / deleted / listed). The tool returns human-readable text, so this
- * parses its stable first-line shapes; anything unrecognized (pause/resume,
- * errors) falls back to the generic text preview.
- */
-function AutomationResultPreview(props: { text: string }) {
-  const copy = getToolActivityCopy(useUiLocale()).automation;
-  const text = props.text;
-
-  // mode:create success — "Automation created: "NAME" (kind[, durable])\nID: …\nSchedule: …\nNext fire: …"
-  const created = text.match(/^Automation created: "(.+?)" \((.+?)\)\n/);
-  if (created) {
-    const schedule = text.match(/^Schedule: (.+)$/m)?.[1];
-    const nextFire = text.match(/^Next fire: (.+)$/m)?.[1];
-    const Icon = automationScheduleIcon(text);
-    return (
-      <div className={previewVariants({ part: 'load-tool' })} data-kind="automation_create">
-        <p className={previewVariants({ part: 'load-tool-title' })}>
-          <Icon size={14} aria-hidden="true" className={AUTOMATION_RESULT_ICON_CLASS} />
-          {copy.created(redactSecrets(created[1] ?? ''))}
-        </p>
-        {schedule && <p className={previewVariants({ part: 'load-tool-count' })}>{redactSecrets(schedule)}</p>}
-        {nextFire && nextFire !== 'N/A' && <p className={previewVariants({ part: 'load-tool-tools' })}>{copy.nextFire(redactSecrets(nextFire))}</p>}
-        <p className={previewVariants({ part: 'load-tool-footer' })}>{redactSecrets(created[2] ?? '')}</p>
-      </div>
-    );
+function loadToolGroupIcon(kind: LoadToolGroupKind): LucideIcon {
+  switch (kind) {
+    case 'browser':
+      return Globe;
+    case 'computer_use':
+      return Monitor;
+    case 'mcp':
+      return Plug;
+    case 'rive':
+      return Workflow;
+    case 'agent':
+      return GitBranch;
+    case 'settings':
+      return Settings;
+    default:
+      return Blocks;
   }
-
-  // mode:delete — "Automation "id" deleted." / not-found message
-  const deleted = text.match(/^Automation "(.+?)" (deleted\.|not found or not owned by this session\.)$/);
-  if (deleted) {
-    const ok = deleted[2] === 'deleted.';
-    return (
-      <div className={previewVariants({ part: 'load-tool' })} data-kind="automation_delete">
-        <p className={previewVariants({ part: 'load-tool-title' })}>
-          <Check size={14} aria-hidden="true" className={AUTOMATION_RESULT_ICON_CLASS} />
-          {ok ? copy.deleted : copy.notFound}
-        </p>
-      </div>
-    );
-  }
-
-  // mode:list — automation blocks separated by "---", or the empty-list message.
-  const isList = text === 'No automations for this session.' || /^\[[A-Z]+\] .+ \((heartbeat|cron)/.test(text);
-  if (isList) {
-    const blocks = text === 'No automations for this session.' ? [] : text.split('\n---\n');
-    return (
-      <div className={previewVariants({ part: 'load-tool' })} data-kind="automation_list">
-        <p className={previewVariants({ part: 'load-tool-title' })}>
-          <Clock size={14} aria-hidden="true" className={AUTOMATION_RESULT_ICON_CLASS} />
-          {copy.list(blocks.length)}
-        </p>
-        {blocks.length === 0 && <p className={previewVariants({ part: 'load-tool-count' })}>{copy.empty}</p>}
-        {blocks.slice(0, 5).map((block, i) => {
-          const head = block.split('\n')[0] ?? '';
-          const BlockIcon = automationScheduleIcon(block);
-          return (
-            <p key={i} className={previewVariants({ part: 'load-tool-tools' })}>
-              <BlockIcon size={12} aria-hidden="true" className={AUTOMATION_RESULT_ICON_CLASS} />
-              {redactSecrets(head)}
-            </p>
-          );
-        })}
-      </div>
-    );
-  }
-
-  // Fallback for pause/resume confirmations, errors, or unexpected shapes.
-  return <ToolResultPreview content={{ kind: 'text', text }} />;
 }
 
 /**
@@ -159,16 +178,31 @@ function AutomationResultPreview(props: { text: string }) {
  * row's expansion state internally — this panel is the seam where the product
  * decides what a result looks like, and it is asserted directly.
  */
-export function ToolCallDetail({ item }: { item: ToolActivityItem }) {
+export function ToolCallDetail({
+  item,
+  activityObserved = true,
+  onSwitchToBypassAndRetry,
+}: {
+  item: ToolActivityItem;
+  activityObserved?: boolean;
+  onSwitchToBypassAndRetry?(): void | Promise<void>;
+}) {
   const locale = useUiLocale();
   const cancelled = isCancelledToolResult(item.result);
   const sandboxBlocked = isSandboxDeniedTool(item);
+  const requiresBypass = isRequiresBypassToolResult(item.result);
   // Cancel is not a failure; stale errored+cancelled must not paint as failed.
   const failedOutcome = item.status === 'errored' && !cancelled;
   const permissionDenied = isPermissionDeniedToolResult(item.result);
-  const running = isInFlightToolStatus(item.status);
+  const running = activityObserved && isInFlightToolStatus(toolActivityPresentationStatus(item));
+  const outputActionIdentity = [
+    computerActionLabel(item, locale) ?? resolveToolDisplayName(item, locale),
+    item.intent ? formatToolIntent(item.intent) : undefined,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join(' · ');
   const ptyControlResult = item.toolName === 'WriteStdin' && item.result?.kind === 'shell_run';
-  const ownsPanel = resultOwnsOwnPanel(item);
+  const ownsPanel = resultOwnsOwnPanel(item) || requiresBypass;
   // Sandbox only — ordinary failures use ChatToolCalls status=error on the row.
   const showSandboxBanner = sandboxBlocked && failedOutcome && !ptyControlResult;
   // Skip invocation when the owned panel already prints the command.
@@ -180,7 +214,7 @@ export function ToolCallDetail({ item }: { item: ToolActivityItem }) {
     && item.outputChunks.length > 0
     && !ownsPanel
     && (running || !item.result);
-  const showResult = !!item.result && !permissionDenied;
+  const showResult = !!item.result && !permissionDenied && !requiresBypass;
   const displayResult = showResult && item.result
     ? withLiveStreamFallback(item.result, item.outputChunks, {
       truncated: item.outputTruncated === true,
@@ -212,17 +246,23 @@ export function ToolCallDetail({ item }: { item: ToolActivityItem }) {
       {showSandboxBanner && (
         <SandboxBlockedBanner result={displayResult ?? item.result} />
       )}
+      {requiresBypass && (
+        <RequiresBypassBanner onSwitchToBypassAndRetry={onSwitchToBypassAndRetry} />
+      )}
       {showResult && ownsPanel && displayResult && (
         isConnectorTool(item.toolName) && displayResult.kind === 'json' ? (
-          <LoadToolResultPreview args={item.args} value={displayResult.value} />
-        ) : isAutomationTool(item.toolName) && displayResult.kind === 'text' ? (
-          <AutomationResultPreview text={displayResult.text} />
+          <LoadToolResultPreview
+            args={item.args}
+            value={displayResult.value}
+            actionIdentity={outputActionIdentity}
+          />
         ) : (
           <ToolResultPreview
             content={displayResult}
             toolName={item.toolName}
             args={item.args}
             shellRunSource={item.shellRunSource}
+            actionIdentity={outputActionIdentity}
           />
         )
       )}
@@ -234,6 +274,7 @@ export function ToolCallDetail({ item }: { item: ToolActivityItem }) {
         <ToolOutputSurface
           kind="live_stream"
           heading={showInvocation ? invocationLine : undefined}
+          actionIdentity={outputActionIdentity}
         >
           <ToolOutputStream
             chunks={item.outputChunks!}
@@ -258,17 +299,24 @@ export function ToolCallDetail({ item }: { item: ToolActivityItem }) {
                   // Only raw args dumps are JSON; quiet bodies stay untokenized.
                   language={argsBody ? 'json' : undefined}
                   title={title}
+                  actionIdentity={outputActionIdentity}
                 />
               );
             }
             if (showInvocation && invocationLine && !showResult) {
-              return <ToolCodeBlock code={invocationLine} />;
+              return <ToolCodeBlock code={invocationLine} actionIdentity={outputActionIdentity} />;
             }
             if (showResult && !ownsPanel && displayResult) {
-              return <ToolResultPreview content={displayResult} toolName={item.toolName} />;
+              return (
+                <ToolResultPreview
+                  content={displayResult}
+                  toolName={item.toolName}
+                  actionIdentity={outputActionIdentity}
+                />
+              );
             }
             if (showInvocation && invocationLine) {
-              return <ToolCodeBlock code={invocationLine} />;
+              return <ToolCodeBlock code={invocationLine} actionIdentity={outputActionIdentity} />;
             }
             return null;
           })()}
@@ -279,16 +327,176 @@ export function ToolCallDetail({ item }: { item: ToolActivityItem }) {
 }
 
 /**
- * Every tool row renders through Astryx `ChatToolCalls` — one component, one
- * visual language, whatever the status. The six product statuses fold into
- * Astryx's four: `interrupted` and sandbox denials are failures that carry
- * their own word in `errorMessage`, and the detail panel (banner, command,
- * output, previews) rides along in `resultDetail`.
+ * Ordinary tool evidence renders through Astryx `ChatToolCalls`; linked child
+ * sessions render through Astryx `ListItem` because their primary action is
+ * navigation, not inline evidence expansion. Adjacent segments preserve the
+ * source order without restoring a vendor activation patch.
  */
-export function ToolTrow({ items }: { items: ToolActivityItem[] }) {
+export function ToolTrow({
+  items,
+  activityObserved = true,
+  onOpenLinkedSession,
+  onSwitchToBypassAndRetry,
+}: {
+  items: ToolActivityItem[];
+  activityObserved?: boolean;
+  onOpenLinkedSession?(sessionId: string): void;
+  onSwitchToBypassAndRetry?(): void | Promise<void>;
+}) {
   const locale = useUiLocale();
   if (items.length === 0) return null;
-  const calls: ChatToolCallItem[] = items.map((item) => ({
+  const segments = toolTrowSegments(items, locale, activityObserved, onSwitchToBypassAndRetry);
+
+  // ChatToolCalls owns expandable tool evidence. Linked child sessions are
+  // navigation targets instead, so they render through Astryx's compact List:
+  // one native clickable row, with no parallel action button.
+  return (
+    <>
+      {segments.map((segment) => segment.kind === 'tools' ? (
+        <ChatToolCalls
+          key={segment.key}
+          className="maka-tool-activity-card"
+          data-activity-observed={activityObserved}
+          data-maka-transcript-boundary=""
+          calls={segment.calls}
+        />
+      ) : (
+        <LinkedAgentList
+          key={segment.key}
+          rows={segment.rows}
+          activityObserved={activityObserved}
+          locale={locale}
+          onOpenLinkedSession={onOpenLinkedSession}
+        />
+      ))}
+    </>
+  );
+}
+
+/** Whether a visible, collapsed ChatToolCalls row owns the active spinner. */
+export function toolTrowHasVisibleSpinner(items: readonly ToolActivityItem[]): boolean {
+  return items.some((item, index) =>
+    !isLinkedAgentResult(item.result)
+    && isInFlightToolStatus(toolActivityPresentationStatus(item))
+    && (index === items.length - 1 || isLinkedAgentResult(items[index + 1]?.result)),
+  );
+}
+
+type LinkedAgentRow = {
+  key: string;
+  name: string;
+  status: Extract<ToolResultContent, { kind: 'subagent' }>['status'];
+  readOnly: boolean;
+  target?: string;
+  duration?: string;
+  failureClass?: string;
+  childSessionId?: string;
+};
+
+type ToolTrowSegment =
+  | { kind: 'tools'; key: string; calls: ChatToolCallItem[] }
+  | { kind: 'agents'; key: string; rows: LinkedAgentRow[] };
+
+function toolTrowSegments(
+  items: ToolActivityItem[],
+  locale: UiLocale,
+  activityObserved: boolean,
+  onSwitchToBypassAndRetry?: () => void | Promise<void>,
+): ToolTrowSegment[] {
+  const segments: ToolTrowSegment[] = [];
+  let computerTarget: string | undefined;
+  for (const item of items) {
+    const rows = linkedAgentRows(item, locale);
+    const previous = segments.at(-1);
+    if (rows) {
+      if (previous?.kind === 'agents') previous.rows.push(...rows);
+      else segments.push({ kind: 'agents', key: item.toolUseId, rows });
+      continue;
+    }
+    const ownComputerTarget = computerActionTarget(item, locale);
+    if (ownComputerTarget) computerTarget = ownComputerTarget;
+    const call = standardToolCall(
+      item,
+      locale,
+      activityObserved,
+      isComputerTool(item) && !computerActionLabelIncludesTarget(item)
+        ? computerTarget
+        : undefined,
+      onSwitchToBypassAndRetry,
+    );
+    if (previous?.kind === 'tools') previous.calls.push(call);
+    else segments.push({ kind: 'tools', key: item.toolUseId, calls: [call] });
+  }
+  return segments;
+}
+
+function LinkedAgentList(props: {
+  activityObserved: boolean;
+  rows: LinkedAgentRow[];
+  locale: UiLocale;
+  onOpenLinkedSession?: (sessionId: string) => void;
+}) {
+  const activityCopy = getToolActivityCopy(props.locale);
+  const copy = activityCopy.agent;
+  return (
+    <List density="compact" data-maka-transcript-boundary="">
+      {props.rows.map((row) => {
+        const childSessionId = row.childSessionId;
+        const open = childSessionId && props.onOpenLinkedSession
+          ? () => props.onOpenLinkedSession?.(childSessionId)
+          : undefined;
+        const status = copy.subagentStatus[row.status];
+        return (
+          <ListItem
+            key={row.key}
+            startContent={(
+              <StatusDot
+                variant={dotForStatus(linkedAgentStatusSemantic(row.status))}
+                label={status}
+                isPulsing={props.activityObserved && row.status === 'running'}
+              />
+            )}
+            label={(
+              <span className="maka-subagent-session-label">
+                <Text type="label" maxLines={1}>
+                  {row.name}
+                </Text>
+                {row.target ? (
+                  <Text type="body" color="secondary" maxLines={1} className="maka-subagent-session-summary">
+                    {row.target}
+                  </Text>
+                ) : null}
+                {row.failureClass ? (
+                  <VisuallyHidden>{activityCopy.errorLabel}: {row.failureClass}</VisuallyHidden>
+                ) : null}
+              </span>
+            )}
+            endContent={(
+              <span className="maka-subagent-session-end">
+                <Text type="supporting" color="secondary">
+                  {[subagentStats(row.status, row.readOnly, props.locale), row.duration]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </Text>
+                {open ? <ChevronRight size={ICON_SIZE.meta} aria-hidden="true" /> : null}
+              </span>
+            )}
+            onClick={open}
+          />
+        );
+      })}
+    </List>
+  );
+}
+
+function standardToolCall(
+  item: ToolActivityItem,
+  locale: UiLocale,
+  activityObserved: boolean,
+  inferredTarget?: string,
+  onSwitchToBypassAndRetry?: () => void | Promise<void>,
+): ChatToolCallItem {
+  return {
     key: item.toolUseId,
     // The name is what a person reads to tell one call from the next, and for
     // Computer Use the display name is "Maka Computer" — a noun, identical on
@@ -296,34 +504,125 @@ export function ToolTrow({ items }: { items: ToolActivityItem[] }) {
     // arguments says what happened instead.
     name: computerActionLabel(item, locale) ?? resolveToolDisplayName(item, locale),
     status: astryxToolStatus(item),
-    target: item.intent ? formatToolIntent(item.intent) : undefined,
+    target: collapsedToolTarget(item, locale, inferredTarget),
     duration: formatDuration(item.durationMs) ?? undefined,
     errorMessage: toolCallErrorMessage(item, locale),
-    stats: outcomeWord(item, locale),
+    stats: item.progress && isInFlightToolStatus(toolActivityPresentationStatus(item))
+      ? `${item.progress.current}/${item.progress.total}`
+      : outcomeWord(item, locale),
     ...diffStats(itemDiffs(item)),
     resultDetail: (
       <ToolDetailReveal>
-        <ToolCallDetail item={item} />
+        <ToolCallDetail
+          item={item}
+          activityObserved={activityObserved}
+          onSwitchToBypassAndRetry={onSwitchToBypassAndRetry}
+        />
       </ToolDetailReveal>
     ),
-  }));
-
-  // No defaultIsExpanded: opening a group is the reader's move. Seeding it open
-  // from in-flight status latches, since the prop is uncontrolled and the
-  // timeline key is stable (see timelineEntryKey). Cost: the collapsed header
-  // projects the last call, which can settle before a parallel sibling.
-  //
-  // A group's own +/- is the whole turn's, not the last call's: a run of five
-  // Edits collapses to one line, and "what did this turn change" is the
-  // question that line has to answer. Per-call counts stay on the rows inside.
-  return <ChatToolCalls calls={calls} {...diffStats(items.flatMap(itemDiffs))} />;
+  };
 }
 
 /**
- * Green `+N` / red `-N`, from the shared structural parse. One diff for a row,
- * every diff in the run for the collapsed group header. Zero stays unpainted,
- * so a run that changed no file leaves the header as it was rather than
- * wearing a "0 changes" badge.
+ * What the collapsed row (and a collapsed group's header) says about the call.
+ * `intent` wins when the runtime authored one; otherwise fall back to the
+ * shared invocation line derived from the call's args — or, during the live
+ * window, from the bounded wire args preview (full args arrive at turn end).
+ * Only the first line is shown, hard-capped so a long command cannot stretch
+ * the group header (Astryx ellipsizes too, but the header row is shared).
+ */
+function collapsedToolTarget(
+  item: ToolActivityItem,
+  locale: UiLocale,
+  preferred?: string,
+): string | undefined {
+  if (workHubControlStatus(item)) return undefined;
+  if (item.intent) return formatToolIntent(item.intent);
+  const line = preferred ?? formatToolInvocationLine(item, locale);
+  if (!line) return undefined;
+  const firstLine = line.split('\n')[0]!.trim();
+  if (!firstLine) return undefined;
+  return firstLine.length > 120 ? `${firstLine.slice(0, 119)}…` : firstLine;
+}
+
+function linkedAgentRows(
+  item: ToolActivityItem,
+  locale: UiLocale,
+): LinkedAgentRow[] | undefined {
+  const result = item.result;
+  if (!isLinkedAgentResult(result)) return undefined;
+  if (result?.kind === 'subagent') {
+    const name = redactSecrets(result.agentName.trim()) || resolveToolDisplayName(item, locale);
+    return [{
+      key: item.toolUseId,
+      name,
+      status: result.status,
+      readOnly: result.permissionMode === 'explore',
+      target: item.intent
+        ? formatToolIntent(item.intent)
+        : boundedAgentSummary(result.summary),
+      duration: formatDuration(item.durationMs ?? result.durationMs) ?? undefined,
+      failureClass: result.failureClass ? redactSecrets(result.failureClass) : undefined,
+      childSessionId: result.childSessionId,
+    }];
+  }
+  return result.items.map((child) => {
+    const name = redactSecrets((child.agentName || child.itemId).trim()) || child.profile;
+    return {
+      key: `${item.toolUseId}:${child.itemId}`,
+      name,
+      status: child.status,
+      readOnly: child.profile === 'local_read',
+      target: boundedAgentSummary(child.summary),
+      duration: formatDuration(child.durationMs) ?? undefined,
+      failureClass: child.failureClass ? redactSecrets(child.failureClass) : undefined,
+      childSessionId: child.childSessionId,
+    } satisfies LinkedAgentRow;
+  });
+}
+
+function isLinkedAgentResult(
+  result: ToolActivityItem['result'],
+): result is Extract<ToolResultContent, { kind: 'subagent' | 'agent_swarm' }> {
+  return result?.kind === 'subagent'
+    || (result?.kind === 'agent_swarm' && result.items.length > 0);
+}
+
+type LinkedAgentStatus = Extract<ToolResultContent, { kind: 'subagent' }>['status'];
+
+const LINKED_AGENT_STATUS_SEMANTIC = {
+  completed: 'success',
+  running: 'active',
+  waiting_for_user: 'attention',
+  failed: 'error',
+  cancelled: 'neutral',
+} satisfies Record<LinkedAgentStatus, StatusSemantic>;
+
+function linkedAgentStatusSemantic(status: LinkedAgentStatus): StatusSemantic {
+  return LINKED_AGENT_STATUS_SEMANTIC[status];
+}
+
+function subagentStats(
+  status: Extract<ToolResultContent, { kind: 'subagent' }>['status'],
+  readOnly: boolean,
+  locale: UiLocale,
+): string {
+  const copy = getToolActivityCopy(locale).agent;
+  return [copy.subagentStatus[status], readOnly ? copy.readOnly : undefined]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+function boundedAgentSummary(summary: string): string | undefined {
+  const normalized = redactSecrets(summary.trim());
+  if (!normalized) return undefined;
+  return normalized.length <= 280 ? normalized : `${normalized.slice(0, 279)}…`;
+}
+
+/**
+ * Green `+N` / red `-N`, from the shared structural parse. Each visible call
+ * owns its diff counts. Zero stays unpainted so unchanged calls do not wear a
+ * misleading "0 changes" badge.
  */
 function diffStats(diffs: string[]): { additions?: number; deletions?: number } {
   let additions = 0;
@@ -345,12 +644,11 @@ function itemDiffs(item: ToolActivityItem): string[] {
 }
 
 function astryxToolStatus(item: ToolActivityItem): ChatToolCallItem['status'] {
-  switch (item.status) {
+  switch (toolActivityPresentationStatus(item)) {
     case 'completed': return 'complete';
     case 'errored':
     case 'interrupted': return 'error';
     case 'running': return 'running';
-    default: return 'pending';
   }
 }
 
@@ -363,10 +661,50 @@ function astryxToolStatus(item: ToolActivityItem): ChatToolCallItem['status'] {
  */
 function toolCallErrorMessage(item: ToolActivityItem, locale: UiLocale): string | undefined {
   if (item.status !== 'errored') return undefined;
+  if (isRequiresBypassToolResult(item.result)) {
+    return getToolActivityCopy(locale).requiresBypass.errorMessage;
+  }
   return summarizeErrorText(formatUserVisibleToolText(
     redactSecrets(extractErrorText(item.result, locale)),
     locale,
   )).replace(/^Error:\s*/i, '');
+}
+
+function RequiresBypassBanner(props: {
+  onSwitchToBypassAndRetry?(): void | Promise<void>;
+}) {
+  const copy = getToolActivityCopy(useUiLocale()).requiresBypass;
+  const [pending, setPending] = useState(false);
+
+  async function switchAndRetry() {
+    if (!props.onSwitchToBypassAndRetry || pending) return;
+    setPending(true);
+    try {
+      await props.onSwitchToBypassAndRetry();
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <Banner
+      status="warning"
+      className="maka-requires-bypass-banner"
+      icon={<ShieldAlert size={ICON_SIZE.chrome} aria-hidden="true" />}
+      title={copy.title}
+      description={copy.description}
+      endContent={props.onSwitchToBypassAndRetry ? (
+        <UiButton
+          variant="primary"
+          size="sm"
+          isDisabled={pending}
+          aria-busy={pending || undefined}
+          onClick={() => void switchAndRetry()}
+          label={pending ? copy.pending : copy.action}
+        />
+      ) : undefined}
+    />
+  );
 }
 
 /**
@@ -455,7 +793,7 @@ function SandboxBlockedBanner(props: {
     <Banner
       status="warning"
       className="maka-sandbox-blocked-banner"
-      icon={<ShieldAlert size={16} aria-hidden="true" />}
+      icon={<ShieldAlert size={ICON_SIZE.chrome} aria-hidden="true" />}
       title={bannerCopy.title}
       description={(
         <span className="maka-sandbox-blocked-description">
@@ -478,7 +816,7 @@ function SandboxBlockedBanner(props: {
           aria-busy={copyPending ? 'true' : undefined}
           isDisabled={copyPending}
           onClick={() => void copy()}
-          icon={copyPhase === 'copied' ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+          icon={copyPhase === 'copied' ? <Check size={ICON_SIZE.control} aria-hidden="true" /> : <Copy size={ICON_SIZE.control} aria-hidden="true" />}
           label={copyLabel}
         />
       ) : undefined}

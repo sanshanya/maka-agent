@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -7,21 +26,29 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, test } from 'node:test';
 
-import type { AgentRunHeader, RuntimeEvent } from '@maka/core';
-import { createSessionStore, createSqliteRuntimeStore } from '@maka/storage';
-import { createSqliteAgentRunStore } from '@maka/storage';
+import type { RuntimeEvent } from '@maka/core/runtime-event';
+import type { RuntimeInvocationRecord } from '@maka/core/runtime-invocation';
+import {
+  buildInvocationOpenedEvent,
+  runtimeInvocationOutcome,
+} from '@maka/core/runtime-invocation';
+import { createSessionStore } from '@maka/storage/session-store';
+import { createSqliteRuntimeStore } from '@maka/storage/sqlite-runtime-store';
+import { createSqliteAgentRunStore } from '@maka/storage/agent-run-store';
 
 import { type RuntimeContinuationFailpoint } from '../agent-run.js';
 import { BackendRegistry, SessionManager } from '../session-manager.js';
-import { FakeBackend } from '../fake-backend.js';
+import { FakeBackend } from '../test-only/fake-backend.js';
+import { terminateChildProcessTree } from '../process-tree-terminator.js';
+import { testInvocationOpening } from './invocation-fixture.js';
 
 const CRASH_CHILD_ENV = 'MAKA_RUNTIME_CONTINUATION_CRASH_CHILD';
+const CRASH_CHILD_READY_TIMEOUT_MS = process.platform === 'win32' ? 30_000 : 10_000;
+const CRASH_HARNESS_TIMEOUT_MS = process.platform === 'win32' ? 180_000 : 60_000;
 const FAILPOINTS: readonly RuntimeContinuationFailpoint[] = [
   'after_continuation_claim_committed',
-  'after_run_created',
   'after_continuation_start_committed',
   'after_terminal_event_committed',
-  'after_terminal_header_committed',
 ];
 
 if (process.env[CRASH_CHILD_ENV] === '1') {
@@ -29,7 +56,7 @@ if (process.env[CRASH_CHILD_ENV] === '1') {
 } else {
   describe('runtime resume phase 1 process crash harness', () => {
     test('reopens and repairs every committed continuation prefix after SIGKILL', {
-      timeout: 60_000,
+      timeout: CRASH_HARNESS_TIMEOUT_MS,
     }, async () => {
       const root = await mkdtemp(join(tmpdir(), 'maka-runtime-continuation-crash-'));
       try {
@@ -46,9 +73,11 @@ if (process.env[CRASH_CHILD_ENV] === '1') {
             session.id,
           );
           assert.ok(claimState, `${failpoint} did not persist the continuation claim`);
-          const runsBeforeRecovery = await runStore.listSessionRuns(session.id);
-          const continuation = runsBeforeRecovery.find(
-            (run) => run.runId === claimState.claim.target.runId,
+          const invocationsBeforeRecovery = await runtimeEventStore.listSessionInvocations(
+            session.id,
+          );
+          const continuation = invocationsBeforeRecovery.find(
+            (invocation) => invocation.runId === claimState.claim.target.runId,
           );
           const prefix = await runtimeEventStore.readRuntimeEvents(
             session.id,
@@ -60,6 +89,7 @@ if (process.env[CRASH_CHILD_ENV] === '1') {
           await store.close?.();
           const {
             manager,
+            agentRunStore: recoveryAgentRunStore,
             runtimeEventStore: recoveryRuntimeStore,
             sessionStore: recoverySessionStore,
           } = createManager(workspaceRoot);
@@ -67,10 +97,10 @@ if (process.env[CRASH_CHILD_ENV] === '1') {
             sourceRunId: 'source-run',
           });
           assert.equal(repeatedPlan.disposition, 'park');
+          // A crash after the terminal event is not an unfinished claim: the
+          // event is the continuation's ending, so the boundary already has one.
           assert.deepEqual(repeatedPlan.rejectionReasons, [
-            failpoint === 'after_continuation_claim_committed' ||
-            failpoint === 'after_run_created' ||
-            failpoint === 'after_terminal_event_committed'
+            failpoint === 'after_continuation_claim_committed'
               ? 'continuation_claim_repair_required'
               : failpoint === 'after_continuation_start_committed'
                 ? 'continuation_started_indeterminate'
@@ -78,7 +108,11 @@ if (process.env[CRASH_CHILD_ENV] === '1') {
           ]);
 
           await manager.recoverInterruptedSessions();
-          const repaired = await runStore.readRun(session.id, claimState.claim.target.runId);
+          const repaired = await readInvocation(
+            recoveryRuntimeStore,
+            session.id,
+            claimState.claim.target.runId,
+          );
           const repairedEvents = await recoveryRuntimeStore.readRuntimeEvents(
             session.id,
             claimState.claim.target.runId,
@@ -88,7 +122,7 @@ if (process.env[CRASH_CHILD_ENV] === '1') {
           );
           if (failpoint === 'after_continuation_start_committed') {
             assert.equal(terminalEvents.length, 0);
-            assert.equal(['created', 'running'].includes(repaired.status), true);
+            assert.equal(runtimeInvocationOutcome(repaired), undefined);
             const parked = await manager.planAuthoritativeSafeBoundaryContinuation(session.id, {
               sourceRunId: 'source-run',
             });
@@ -96,12 +130,12 @@ if (process.env[CRASH_CHILD_ENV] === '1') {
           } else {
             assert.equal(terminalEvents.length, 1, `${failpoint} must recover one terminal fact`);
             assert.ok(
-              repaired.status === 'completed' ||
-                repaired.status === 'failed' ||
-                repaired.status === 'cancelled',
+              runtimeInvocationOutcome(repaired),
               `${failpoint} left the continuation non-terminal`,
             );
           }
+          recoveryAgentRunStore.close?.();
+          runStore.close?.();
           recoveryRuntimeStore.close();
           await recoverySessionStore.close?.();
         }
@@ -126,16 +160,7 @@ async function runCrashChild(): Promise<void> {
   const runStore = createSqliteAgentRunStore(workspaceRoot);
   const runtimeEventStore = createCrashRuntimeStore(workspaceRoot);
   const backends = new BackendRegistry();
-  backends.register(
-    'fake',
-    (ctx) =>
-      new FakeBackend({
-        sessionId: ctx.sessionId,
-        header: ctx.header,
-        store: ctx.store,
-        appendMessage: ctx.appendMessage,
-      }),
-  );
+  backends.register('ai-sdk', (ctx) => new FakeBackend({ sessionId: ctx.sessionId }));
   let id = 0;
   let resolveSelectedFailpoint!: () => void;
   const selectedFailpointReached = new Promise<void>((resolve) => {
@@ -153,7 +178,7 @@ async function runCrashChild(): Promise<void> {
     safeBoundaryResumeEnabled: true,
     inspectContinuationSafety: async () => stableSafetyObservation(),
     continuationFailpoint: async (point) => {
-      if (point !== failpoint || point === 'after_terminal_header_committed') return;
+      if (point !== failpoint) return;
       await suspendCrashChild(point, resolveSelectedFailpoint);
     },
     newId: () => `id-${++id}`,
@@ -161,18 +186,15 @@ async function runCrashChild(): Promise<void> {
       let ts = 10;
       return () => ++ts;
     })(),
-    runtimeSource: 'test',
   });
   const session = await manager.createSession({
     cwd: workspaceRoot,
-    backend: 'fake',
     llmConnectionSlug: 'fake',
     model: 'fake-model',
-    permissionMode: 'execute',
+    permissionMode: 'ask',
     name: 'continuation crash child',
   });
-  await runStore.createRun(sourceHeader(session.id, workspaceRoot));
-  for (const event of sourceEvents(session.id)) {
+  for (const event of sourceEvents(session.id, workspaceRoot)) {
     await runtimeEventStore.appendRuntimeEvent(session.id, 'source-run', event);
   }
   const plan = await manager.planAuthoritativeSafeBoundaryContinuation(session.id, {
@@ -182,13 +204,6 @@ async function runCrashChild(): Promise<void> {
     throw new Error(`expected continuation: ${plan.rejectionReasons.join(',')}`);
   for await (const _event of manager.resumeSafeBoundaryContinuation(plan.continuation)) {
     // drain until the selected failpoint suspends the child
-  }
-  if (failpoint === 'after_terminal_header_committed') {
-    const continuation = await runStore.readRun(session.id, plan.continuation.runId);
-    if (continuation.status !== 'completed') {
-      throw new Error(`continuation terminal header did not settle: ${continuation.status}`);
-    }
-    await suspendCrashChild(failpoint, resolveSelectedFailpoint);
   }
   // Terminal projection finalization may continue after the public event stream
   // closes. Wait for the selected durable boundary instead of racing that
@@ -212,6 +227,7 @@ async function suspendCrashChild(
 
 function createManager(workspaceRoot: string): {
   manager: SessionManager;
+  agentRunStore: ReturnType<typeof createSqliteAgentRunStore>;
   runtimeEventStore: ReturnType<typeof createSqliteRuntimeStore>;
   sessionStore: ReturnType<typeof createSessionStore>;
 } {
@@ -219,18 +235,10 @@ function createManager(workspaceRoot: string): {
   const runStore = createSqliteAgentRunStore(workspaceRoot);
   const runtimeEventStore = createCrashRuntimeStore(workspaceRoot);
   const backends = new BackendRegistry();
-  backends.register(
-    'fake',
-    (ctx) =>
-      new FakeBackend({
-        sessionId: ctx.sessionId,
-        header: ctx.header,
-        store: ctx.store,
-        appendMessage: ctx.appendMessage,
-      }),
-  );
+  backends.register('ai-sdk', (ctx) => new FakeBackend({ sessionId: ctx.sessionId }));
   let id = 100;
   return {
+    agentRunStore: runStore,
     runtimeEventStore,
     sessionStore: store,
     manager: new SessionManager({
@@ -242,7 +250,6 @@ function createManager(workspaceRoot: string): {
       inspectContinuationSafety: async () => stableSafetyObservation(),
       newId: () => `recovery-id-${++id}`,
       now: Date.now,
-      runtimeSource: 'test',
     }),
   };
 }
@@ -279,7 +286,7 @@ async function crashContinuationAt(
   // Wait for `close` so the following reopen and recursive cleanup cannot race
   // a dead child that still owns the SQLite files.
   const closed = once(child, 'close') as Promise<[number | null, NodeJS.Signals | null]>;
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + CRASH_CHILD_READY_TIMEOUT_MS;
   while (
     !stdout.includes(`READY:${failpoint}\n`) &&
     child.exitCode === null &&
@@ -288,33 +295,54 @@ async function crashContinuationAt(
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   if (!stdout.includes(`READY:${failpoint}\n`)) {
-    child.kill('SIGKILL');
+    await killCrashChild(child);
     await closed;
     throw new Error(`${failpoint} child did not reach boundary: ${stderr || stdout}`);
   }
-  assert.equal(child.kill('SIGKILL'), true);
+  assert.equal(await killCrashChild(child), true);
   const [exitCode, signal] = await closed;
   assert.ok(exitCode !== 0 || signal !== null);
 }
 
+function killCrashChild(child: ReturnType<typeof spawn>): Promise<boolean> {
+  if (process.platform === 'win32') return terminateChildProcessTree(child, 'SIGKILL');
+  return Promise.resolve(child.kill('SIGKILL'));
+}
+
+/** The one invocation that opened this run, once its ledger says it opened. */
+async function readInvocation(
+  runtimeEventStore: ReturnType<typeof createSqliteRuntimeStore>,
+  sessionId: string,
+  runId: string,
+): Promise<RuntimeInvocationRecord> {
+  const found = (await runtimeEventStore.listSessionInvocations(sessionId)).find(
+    (invocation) => invocation.runId === runId,
+  );
+  if (!found) throw new Error(`Runtime invocation not found: ${runId}`);
+  return found;
+}
+
+/**
+ * What a crash at each boundary left durable.
+ *
+ * A continuation's opening fact rides its continuation-start event, so a crash
+ * before that commit leaves the target invocation unopened. There is no separate
+ * run record left over to disagree with the ledger.
+ */
 function assertPrefix(
   failpoint: RuntimeContinuationFailpoint,
-  header: AgentRunHeader | undefined,
+  invocation: RuntimeInvocationRecord | undefined,
   events: readonly RuntimeEvent[],
 ): void {
   if (failpoint === 'after_continuation_claim_committed') {
-    assert.equal(header, undefined);
+    assert.equal(invocation, undefined);
     assert.deepEqual(events, []);
     return;
   }
-  assert.ok(header);
-  if (failpoint === 'after_run_created') {
-    assert.equal(header.status, 'created');
-    assert.deepEqual(events, []);
-    return;
-  }
+  assert.ok(invocation);
   assert.equal(events[0]?.actions?.continuationStart?.protocol, 'continuation_start_v2');
   if (failpoint === 'after_continuation_start_committed') {
+    assert.equal(runtimeInvocationOutcome(invocation), undefined);
     assert.equal(
       events.some((event) => event.actions?.endInvocation === true),
       false,
@@ -322,34 +350,10 @@ function assertPrefix(
     return;
   }
   assert.equal(events.filter((event) => event.actions?.endInvocation === true).length, 1);
-  if (failpoint === 'after_terminal_event_committed') {
-    assert.equal(['created', 'running'].includes(header.status), true);
-    return;
-  }
-  assert.equal(header.status, 'completed');
+  assert.ok(runtimeInvocationOutcome(invocation));
 }
 
-function sourceHeader(sessionId: string, cwd: string): AgentRunHeader {
-  return {
-    runId: 'source-run',
-    invocationId: 'source-invocation',
-    sessionId,
-    turnId: 'source-turn',
-    status: 'failed',
-    backendKind: 'fake',
-    llmConnectionSlug: 'fake',
-    modelId: 'fake-model',
-    cwd,
-    workspaceIdentity: 'workspace-1',
-    permissionMode: 'execute',
-    createdAt: 1,
-    updatedAt: 2,
-    completedAt: 2,
-    failureClass: 'app_restarted',
-  };
-}
-
-function sourceEvents(sessionId: string): RuntimeEvent[] {
+function sourceEvents(sessionId: string, cwd: string): RuntimeEvent[] {
   const identity = {
     sessionId,
     invocationId: 'source-invocation',
@@ -357,6 +361,29 @@ function sourceEvents(sessionId: string): RuntimeEvent[] {
     turnId: 'source-turn',
   };
   return [
+    buildInvocationOpenedEvent({
+      id: 'source-open',
+      run: identity,
+      openedAt: 1,
+      opening: testInvocationOpening({
+        route: {
+          provenance: 'runtime',
+          backendKind: 'fake',
+          llmConnectionId: 'fake-connection',
+          llmConnectionSlug: 'fake',
+          modelId: 'fake-model',
+        },
+        configuration: {
+          cwd,
+          workspaceIdentity: 'workspace-1',
+          permissionMode: 'ask',
+          collaborationMode: 'agent',
+          orchestrationMode: 'default',
+          orchestrationSource: 'session',
+          toolMode: 'direct',
+        },
+      }),
+    }),
     {
       ...identity,
       id: 'source-user',

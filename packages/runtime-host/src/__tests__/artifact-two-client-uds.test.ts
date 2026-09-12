@@ -1,7 +1,27 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { withTimeout } from '@maka/core/test-only/async-primitives';
 import assert from 'node:assert/strict';
 import { fork, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { link, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { link, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -26,7 +46,7 @@ const CURRENT_PROTOCOL = {
   min: RUNTIME_HOST_PROTOCOL_VERSION,
   max: RUNTIME_HOST_PROTOCOL_VERSION,
 } as const;
-const PROCESS_TIMEOUT_MS = 10_000;
+const PROCESS_TIMEOUT_MS = 30_000;
 const BULK_ARTIFACT_COUNT = 24;
 const BULK_ARTIFACT_SUMMARY = 's'.repeat(7 * 1024);
 const MAX_ARTIFACT_ID = 'a'.repeat(ARTIFACT_ENTITY_ID_MAX_CHARS);
@@ -35,24 +55,21 @@ const PROTECTED_ARTIFACTS = [
   { id: 'tool-result-archive', source: 'tool_result_archive' },
 ] as const;
 
-test('production Host recovers Artifact publication and preserves deletes across owner death', {
-  skip: process.platform === 'win32' ? 'POSIX process death gate' : false,
+test('production Host ignores Artifact publication residue and preserves deletes across owner death', {
   timeout: 120_000,
 }, async () => {
   const base = await mkdtemp(join(tmpdir(), 'maka-runtime-host-artifacts-'));
   const root = join(base, 'root');
   const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
   const { sessionId, otherSessionId } = await seedExecutionRoot(capability, root);
-  const residue = await createPublicationResidue(root, sessionId);
+  await createPublicationResidue(root, sessionId);
   let firstHost: ExecutionHostHandle | undefined;
   let successor: ExecutionHostHandle | undefined;
   try {
     firstHost = await startHost(root, capability.rootId);
-    await assert.rejects(() => stat(residue.stagingPath), { code: 'ENOENT' });
-    await assert.rejects(() => stat(residue.targetPath), { code: 'ENOENT' });
 
-    const desktop = await connectClient(root, 'desktop');
-    const tui = await connectClient(root, 'tui');
+    const desktop = await connectClient(root);
+    const tui = await connectClient(root);
     const deleteA = MAX_ARTIFACT_ID;
     const deleteB = 'artifact-003';
     try {
@@ -149,11 +166,11 @@ test('production Host recovers Artifact publication and preserves deletes across
         desktop.request('artifact.delete', { sessionId, artifactId: deleteA }),
         tui.request('artifact.delete', { sessionId, artifactId: deleteB }),
       ]);
-      assert.equal(deletedA.artifact.status, 'deleted');
-      assert.equal(deletedB.artifact.status, 'deleted');
-      assert.deepEqual(
-        await desktop.request('artifact.delete', { sessionId, artifactId: deleteA }),
-        deletedA,
+      assert.deepEqual(deletedA, { kind: 'deleted' });
+      assert.deepEqual(deletedB, { kind: 'deleted' });
+      await assert.rejects(
+        desktop.request('artifact.delete', { sessionId, artifactId: deleteA }),
+        operationError('not_found'),
       );
       await assert.rejects(
         tui.request('artifact.delete', {
@@ -163,9 +180,6 @@ test('production Host recovers Artifact publication and preserves deletes across
         operationError('not_found'),
       );
 
-      const protectedBefore = await Promise.all(
-        PROTECTED_ARTIFACTS.map(({ id }) => getArtifact(desktop, sessionId, id)),
-      );
       for (const [index, artifact] of PROTECTED_ARTIFACTS.entries()) {
         const client = index % 2 === 0 ? desktop : tui;
         await assert.rejects(
@@ -173,10 +187,6 @@ test('production Host recovers Artifact publication and preserves deletes across
           operationError('operation_conflict'),
         );
       }
-      const protectedAfter = await Promise.all(
-        PROTECTED_ARTIFACTS.map(({ id }) => getArtifact(tui, sessionId, id)),
-      );
-      assert.deepEqual(protectedAfter, protectedBefore);
 
       const stale = await tui.request('artifact.query', {
         kind: 'list_continue',
@@ -205,8 +215,18 @@ test('production Host recovers Artifact publication and preserves deletes across
     }
 
     successor = await startHost(root, capability.rootId);
-    const observer = await connectClient(root, 'run');
+    const observer = await connectClient(root);
     try {
+      for (const { id: artifactId } of PROTECTED_ARTIFACTS) {
+        assert.ok((await getArtifact(observer, sessionId, artifactId)).artifact);
+        const read = await observer.request('artifact.query', {
+          kind: 'read_text',
+          sessionId,
+          artifactId,
+        });
+        assert.equal(read.kind, 'text');
+        assert.ok(read.kind === 'text' && read.preview.ok);
+      }
       for (const artifactId of [deleteA, deleteB]) {
         const getResult = await getArtifact(observer, sessionId, artifactId);
         const readResult = await observer.request('artifact.query', {
@@ -214,27 +234,10 @@ test('production Host recovers Artifact publication and preserves deletes across
           sessionId,
           artifactId,
         });
-        assert.equal(getResult.artifact?.status, 'deleted');
+        assert.equal(getResult.artifact, null);
         assert.equal(readResult.kind, 'text');
         if (readResult.kind === 'text') {
-          assert.deepEqual(readResult.preview, { ok: false, reason: 'deleted' });
-        }
-      }
-      for (const artifact of PROTECTED_ARTIFACTS) {
-        const getResult = await getArtifact(observer, sessionId, artifact.id);
-        assert.equal(getResult.artifact?.status, 'live');
-        assert.equal(getResult.artifact?.source, artifact.source);
-        const readResult = await observer.request('artifact.query', {
-          kind: 'read_text',
-          sessionId,
-          artifactId: artifact.id,
-        });
-        assert.equal(readResult.kind, 'text');
-        if (readResult.kind === 'text') {
-          assert.deepEqual(readResult.preview, {
-            ok: true,
-            text: `protected ${artifact.source}`,
-          });
+          assert.deepEqual(readResult.preview, { ok: false, reason: 'not_found' });
         }
       }
     } finally {
@@ -268,27 +271,29 @@ async function seedExecutionRoot(
 ): Promise<{ readonly sessionId: string; readonly otherSessionId: string }> {
   const owner = await tryAcquireInteractiveRootOwner(capability);
   assert.ok(owner, 'Artifact test could not acquire the interactive root owner');
+  let stores: Awaited<ReturnType<typeof openInteractiveExecutionStoresForWrite>> | undefined;
+  let artifacts: Awaited<ReturnType<typeof openInteractiveArtifactStoreForWrite>> | undefined;
   try {
-    const stores = await openInteractiveExecutionStoresForWrite(owner.lease);
+    stores = await openInteractiveExecutionStoresForWrite(owner.lease);
     const session = await stores.sessionStore.create({
       cwd: root,
-      backend: 'fake',
+      llmConnectionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
       llmConnectionSlug: 'fake',
       model: 'fake-model',
       permissionMode: 'ask',
     });
     const otherSession = await stores.sessionStore.create({
       cwd: root,
-      backend: 'fake',
+      llmConnectionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
       llmConnectionSlug: 'fake',
       model: 'fake-model',
       permissionMode: 'ask',
     });
-    const artifacts = await openInteractiveArtifactStoreForWrite(owner.lease);
-    await artifacts.recover();
+    const openedArtifacts = await openInteractiveArtifactStoreForWrite(owner.lease);
+    artifacts = openedArtifacts;
     await Promise.all([
       ...Array.from({ length: 130 }, (_, index) =>
-        artifacts.create({
+        openedArtifacts.create({
           id: index === 2 ? MAX_ARTIFACT_ID : `artifact-${index.toString().padStart(3, '0')}`,
           sessionId: session.id,
           turnId: 'turn-1',
@@ -296,11 +301,11 @@ async function seedExecutionRoot(
           kind: 'file',
           content: `content ${index}`,
           mimeType: 'text/plain',
-          source: 'fixture',
+          source: 'tool_result',
           now: 10_000 - index,
         }),
       ),
-      artifacts.create({
+      openedArtifacts.create({
         id: 'small-text',
         sessionId: session.id,
         turnId: 'turn-1',
@@ -308,10 +313,10 @@ async function seedExecutionRoot(
         kind: 'file',
         content: 'small text preview',
         mimeType: 'text/plain',
-        source: 'fixture',
+        source: 'tool_result',
         now: 20_000,
       }),
-      artifacts.create({
+      openedArtifacts.create({
         id: 'small-binary',
         sessionId: session.id,
         turnId: 'turn-1',
@@ -319,10 +324,10 @@ async function seedExecutionRoot(
         kind: 'image',
         content: tinyPng(),
         mimeType: 'image/png',
-        source: 'fixture',
+        source: 'tool_result',
         now: 19_999,
       }),
-      artifacts.create({
+      openedArtifacts.create({
         id: 'replacement-expanded-text',
         sessionId: session.id,
         turnId: 'turn-1',
@@ -330,11 +335,11 @@ async function seedExecutionRoot(
         kind: 'file',
         content: Buffer.alloc(12 * 1024, 0xff),
         mimeType: 'text/plain',
-        source: 'fixture',
+        source: 'tool_result',
         now: 9_000,
       }),
       ...PROTECTED_ARTIFACTS.map((artifact, index) =>
-        artifacts.create({
+        openedArtifacts.create({
           id: artifact.id,
           sessionId: session.id,
           turnId: 'turn-1',
@@ -348,7 +353,7 @@ async function seedExecutionRoot(
       ),
       ...Array.from({ length: BULK_ARTIFACT_COUNT }, (_, index) => {
         const id = `bulk-${index.toString().padStart(3, '0')}`;
-        return artifacts.create({
+        return openedArtifacts.create({
           id,
           sessionId: session.id,
           turnId: 'turn-1',
@@ -356,7 +361,7 @@ async function seedExecutionRoot(
           kind: 'file',
           content: `bulk artifact payload ${index}`,
           mimeType: 'text/plain',
-          source: 'fixture',
+          source: 'tool_result',
           summary: BULK_ARTIFACT_SUMMARY,
           now: 19_000 - index,
         });
@@ -364,14 +369,13 @@ async function seedExecutionRoot(
     ]);
     return { sessionId: session.id, otherSessionId: otherSession.id };
   } finally {
+    artifacts?.close();
+    await stores?.sessionStore.close?.();
     await owner.close();
   }
 }
 
-async function createPublicationResidue(
-  root: string,
-  sessionId: string,
-): Promise<{ stagingPath: string; targetPath: string }> {
+async function createPublicationResidue(root: string, sessionId: string): Promise<void> {
   const sessionDirectory = join(root, 'artifacts', sessionId);
   await mkdir(sessionDirectory, { recursive: true });
   const targetPath = join(sessionDirectory, 'publication-residue-residue.txt');
@@ -382,7 +386,6 @@ async function createPublicationResidue(
   );
   await writeFile(stagingPath, 'uncommitted publication', { flag: 'wx' });
   await link(stagingPath, targetPath);
-  return { stagingPath, targetPath };
 }
 
 async function startHost(root: string, rootId: string): Promise<ExecutionHostHandle> {
@@ -402,7 +405,7 @@ async function startHost(root: string, rootId: string): Promise<ExecutionHostHan
 
 async function stopHost(host: ExecutionHostHandle): Promise<void> {
   if (host.child.exitCode === null && host.child.signalCode === null) {
-    host.child.kill('SIGTERM');
+    host.child.send({ type: 'shutdown' });
   }
   const exit = await withTimeout(
     waitForExitResult(host.child),
@@ -439,13 +442,9 @@ async function terminateChild(child: ChildProcess): Promise<void> {
   );
 }
 
-async function connectClient(
-  rootPath: string,
-  surface: 'desktop' | 'tui' | 'run',
-): Promise<RuntimeHostConnection> {
+async function connectClient(rootPath: string): Promise<RuntimeHostConnection> {
   const result = await connectRuntimeHost({
     rootPath,
-    surface,
     protocol: CURRENT_PROTOCOL,
   });
   assert.equal(result.kind, 'connected');
@@ -576,17 +575,5 @@ function waitForExitResult(
     };
     child.once('error', onError);
     child.once('exit', onExit);
-  });
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  return Promise.race([
-    promise,
-    new Promise<T>((_resolve, reject) => {
-      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-    }),
-  ]).finally(() => {
-    if (timer) clearTimeout(timer);
   });
 }

@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 // Unit test for MakaCuService, the supervisor between the maka-cu backend and
 // the executor child. Drives it against a MOCK executor (a small CommonJS node
 // script written to a temp dir) that speaks `maka.cu/2` — the real `maka-cu`
@@ -9,7 +28,7 @@
 // that was written but never flushed. Every one of those was a live defect.
 //
 // Run (from repo root):
-//   npm --workspace @maka/computer-use run test
+//   npm run build && npm --workspace @maka/computer-use run test:dist
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -82,6 +101,9 @@ function handle(msg) {
     if (AFTER_HELLO) {
       setTimeout(function () {
         for (const line of AFTER_HELLO.split('|')) process.stdout.write(line + '\n');
+        // Observable marker: the stray lines are on stdout once this lands in
+        // the log, so a test can order its next round trip after them.
+        logRec({ kind: 'after-hello' });
       }, 30);
     }
     return;
@@ -110,6 +132,7 @@ process.stdin.on('data', function (chunk) {
 let workDir = '';
 let mockPath = '';
 const services: MakaCuService[] = [];
+const imageDirs: string[] = [];
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -124,6 +147,39 @@ async function readRecords(logPath: string): Promise<Array<Record<string, unknow
       .map((line) => JSON.parse(line) as Record<string, unknown>);
   } catch {
     return [];
+  }
+}
+
+// The mock appends to its log from another process, so a single read races its
+// scheduler: a caller settled by the host's grace timer can observe the log a
+// few milliseconds before the child's `appendFileSync` lands (even a SIGKILLed
+// child gets a last slice). Poll with a bounded deadline — a real regression
+// (no `$/cancel` ever written) still fails, just without depending on which
+// process the scheduler ran first.
+async function waitForRecord(
+  logPath: string,
+  predicate: (record: Record<string, unknown>) => boolean,
+  what: string,
+  deadlineMs = 2000,
+): Promise<void> {
+  const startedAt = Date.now();
+  for (;;) {
+    const records = await readRecords(logPath);
+    if (records.some(predicate)) return;
+    if (Date.now() - startedAt >= deadlineMs) {
+      assert.fail(`${what} (log after ${deadlineMs}ms: ${JSON.stringify(records)})`);
+    }
+    await delay(10);
+  }
+}
+
+async function waitForPathRemoval(path: string, deadlineMs = 2000): Promise<void> {
+  const startedAt = Date.now();
+  while (existsSync(path)) {
+    if (Date.now() - startedAt >= deadlineMs) {
+      assert.fail(`${path} still exists after ${deadlineMs}ms`);
+    }
+    await delay(10);
   }
 }
 
@@ -161,6 +217,7 @@ function makeService(
   };
   const service = new MakaCuService(options);
   services.push(service);
+  imageDirs.push(imageDir);
   return { service, logPath, imageDir };
 }
 
@@ -179,7 +236,24 @@ after(async () => {
       // A disposed service disposing again is not a test failure.
     }
   }
-  if (workDir) await rm(workDir, { recursive: true, force: true });
+  // `dispose()` is deliberately fire-and-forget: it SIGTERMs the child and
+  // schedules an asynchronous image-directory purge on child exit (or on the
+  // shutdown-grace SIGKILL, at most `shutdownGraceMs` = 3s later). Deleting
+  // `workDir` while those purges — and a child still flushing its ndjson log —
+  // are in flight races `rm` against concurrent writers and fails with
+  // ENOTEMPTY (issue #3290). Every `makeService` image directory is purged by
+  // its `dispose()`, so waiting for them to vanish is a "children exited and
+  // purges finished" barrier. The wait is tolerant rather than asserting —
+  // purge failures are permitted by contract ("the next spawn purges it
+  // again") and are not what this teardown tests — and the retrying `rm`
+  // backstop then only absorbs stragglers, not an unbounded race.
+  const purgeDeadline = Date.now() + 10_000;
+  while (imageDirs.some((imageDir) => existsSync(imageDir)) && Date.now() < purgeDeadline) {
+    await delay(25);
+  }
+  if (workDir) {
+    await rm(workDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
 });
 
 describe('maka-cu supervisor: what the child may put on stdout', () => {
@@ -193,14 +267,23 @@ describe('maka-cu supervisor: what the child may put on stdout', () => {
       // no caller is on the stack, and took the host process down. A Rust
       // executor serialising `Option::None` on an error path emits those five
       // bytes.
-      const { service } = makeService({ afterHello: 'null' });
+      const { service, logPath } = makeService({ afterHello: 'null' });
       const handshake = await service.ensureStarted();
       assert.equal(handshake.executor.name, 'maka-cu-mock');
-      await delay(200);
-      assert.deepEqual(uncaught, [], 'a null stdout line must not reach uncaughtException');
+      // The mock emits the stray line from a timer after the handshake, so
+      // first wait for its marker: once logged, `null` is on stdout ahead of
+      // the next response. The round trip below is then a true causal anchor —
+      // the stray line was processed (and would have thrown in the data
+      // listener) before the call returned.
+      await waitForRecord(
+        logPath,
+        (record) => record.kind === 'after-hello',
+        'the mock never emitted its post-hello stray line',
+      );
       // Still usable: one stray line is not a dead executor.
       const envelope = await service.call('window.list', {});
       assert.equal(envelope.ok, true);
+      assert.deepEqual(uncaught, [], 'a null stdout line must not reach uncaughtException');
     } finally {
       process.off('uncaughtException', onUncaught);
     }
@@ -209,7 +292,10 @@ describe('maka-cu supervisor: what the child may put on stdout', () => {
   it('tears the child down after three lines that are not protocol messages', async () => {
     const { service } = makeService({ afterHello: 'null|4|"not a message"' });
     await service.ensureStarted();
-    await delay(200);
+    // The junk lines stream in after the handshake settles; poll the teardown
+    // fact with a bounded deadline instead of guessing scheduler timing.
+    const deadline = Date.now() + 2_000;
+    while (service.snapshot().state !== 'idle' && Date.now() < deadline) await delay(10);
     assert.equal(service.snapshot().state, 'idle', 'three non-messages end the generation');
   });
 
@@ -291,7 +377,15 @@ describe('maka-cu supervisor: cancelling a delivered request (§7.2/§7.3)', () 
     const controller = new AbortController();
     const started = Date.now();
     const call = service.call('observe', {}, controller.signal);
-    await delay(120);
+    // Settled later by assert.rejects; without this, a barrier failure below
+    // would leave it an unhandled rejection.
+    void call.catch(() => {});
+    // The ordering claim holds because ensureStarted has already settled: both
+    // calls then take the same synchronous write path onto one ordered pipe,
+    // and the mock processes stdin lines in order. The same invariant carries
+    // every barrier in this suite.
+    const barrier = await service.call('window.list', {});
+    assert.equal(barrier.ok, true, 'the later round trip proves observe reached the executor');
     controller.abort();
     await assert.rejects(call, (error: unknown) => {
       assert.ok(isMakaCuLifecycleError(error), 'a cancelled dispatch is a lifecycle error');
@@ -299,9 +393,9 @@ describe('maka-cu supervisor: cancelling a delivered request (§7.2/§7.3)', () 
     });
     const elapsed = Date.now() - started;
     assert.ok(elapsed < 4000, `settled in ${elapsed}ms, which must be the grace not the deadline`);
-    const records = await readRecords(logPath);
-    assert.ok(
-      records.some((record) => record.kind === 'cancel'),
+    await waitForRecord(
+      logPath,
+      (record) => record.kind === 'cancel',
       'the executor must be asked to cancel',
     );
   });
@@ -318,7 +412,9 @@ describe('maka-cu supervisor: cancelling a delivered request (§7.2/§7.3)', () 
     await service.ensureStarted();
     const controller = new AbortController();
     const call = service.call('observe', {}, controller.signal);
-    await delay(80);
+    void call.catch(() => {});
+    const barrier = await service.call('window.list', {});
+    assert.equal(barrier.ok, true, 'the later round trip proves observe reached the executor');
     controller.abort();
     const envelope = await call;
     assert.equal(envelope.ok, false);
@@ -336,9 +432,9 @@ describe('maka-cu supervisor: cancelling a delivered request (§7.2/§7.3)', () 
     const { service, logPath } = makeService({ silent: ['observe'], timeoutMs: 300 });
     await service.ensureStarted();
     await assert.rejects(service.call('observe', {}));
-    const records = await readRecords(logPath);
-    assert.ok(
-      records.some((record) => record.kind === 'cancel'),
+    await waitForRecord(
+      logPath,
+      (record) => record.kind === 'cancel',
       'the deadline must ask the executor to cancel before tearing it down',
     );
   });
@@ -346,14 +442,21 @@ describe('maka-cu supervisor: cancelling a delivered request (§7.2/§7.3)', () 
   it('clears one session without ending the others', async () => {
     // Before: any session with a delivered request in flight SIGKILLed the
     // child, which invalidated every other session's observations too.
-    const { service, logPath } = makeService({ silent: ['observe'], timeoutMs: 8000 });
+    const { service, logPath } = makeService({
+      silent: ['observe'],
+      answerCancel: true,
+      timeoutMs: 8000,
+    });
     await service.ensureStarted();
     const generation = service.snapshot().generation;
     const call = service.withSession('session-a', () => service.call('observe', {}));
     void call.catch(() => {});
-    await delay(80);
+    const barrier = await service.call('window.list', {});
+    assert.equal(barrier.ok, true, 'the later round trip proves observe reached the executor');
     service.clearSession('session-a');
-    await delay(80);
+    const cancelled = await call;
+    assert.equal(cancelled.ok, false);
+    assert.equal(cancelled.ok === false && cancelled.error.code, 'aborted');
     assert.equal(service.snapshot().state, 'ready');
     assert.equal(service.snapshot().generation, generation, 'the generation must survive');
     const records = await readRecords(logPath);
@@ -439,7 +542,6 @@ describe('maka-cu supervisor: shutdown', () => {
     void starting.catch(() => {});
     service.dispose();
     await starting.catch(() => {});
-    await delay(150);
-    assert.equal(existsSync(imageDir), false, `${imageDir} must not survive dispose()`);
+    await waitForPathRemoval(imageDir);
   });
 });

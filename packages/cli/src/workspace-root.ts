@@ -1,33 +1,27 @@
-import { homedir } from 'node:os';
-import { posix, win32 } from 'node:path';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
-export interface ResolveMakaWorkspaceRootInput {
-  platform?: NodeJS.Platform;
-  env?: NodeJS.ProcessEnv;
-  homeDir?: string;
-  workspaceName?: string;
-}
-
-export function resolveMakaWorkspaceRoot(input: ResolveMakaWorkspaceRootInput = {}): string {
-  const platform = input.platform ?? process.platform;
-  const env = input.env ?? process.env;
-  const home = input.homeDir ?? homedir();
-  const workspaceName = input.workspaceName ?? 'default';
-  const userDataRoot = resolveElectronUserDataRoot(platform, env, home);
-  const pathApi = platform === 'win32' ? win32 : posix;
-  return pathApi.join(userDataRoot, 'workspaces', workspaceName);
-}
-
-function resolveElectronUserDataRoot(
-  platform: NodeJS.Platform,
-  env: NodeJS.ProcessEnv,
-  home: string,
-): string {
-  if (platform === 'darwin') {
-    return posix.join(home, 'Library', 'Application Support', 'Maka');
-  }
-  if (platform === 'win32') {
-    return win32.join(env.APPDATA || win32.join(home, 'AppData', 'Roaming'), 'Maka');
-  }
-  return posix.join(env.XDG_CONFIG_HOME || posix.join(home, '.config'), 'Maka');
-}
+// Workspace-root resolution now lives in @maka/storage. This file remains
+// as a re-export so existing relative CLI importers keep working.
+export {
+  deriveMakaDataRoots,
+  resolveMakaClientDataRoot,
+  resolveMakaDataRoots,
+  resolveMakaWorkspaceRoot,
+} from '@maka/storage/workspace-root';

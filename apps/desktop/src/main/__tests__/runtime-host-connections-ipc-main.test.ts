@@ -1,11 +1,400 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { ConnectionCatalogSnapshot } from '@maka/core/runtime-policy';
+import { defaultEnabledModelIdsWhenOmitted } from '@maka/core/llm-connections';
+import type {
+  RuntimeHostConnectionCatalogEntry as ConnectionCatalogEntry,
+  RuntimeHostConnectionCatalogSnapshot as ConnectionCatalogSnapshot,
+} from '@maka/runtime-host/client';
+import {
+  RuntimeHostOperationError,
+  RuntimeHostRequestInterruptedError,
+} from '@maka/runtime-host/client';
 import {
   projectHostConnections,
   projectHostConnectionTest,
   registerRuntimeHostConnectionsIpc,
 } from '../runtime-host-connections-ipc-main.js';
+import { normalizeCreateConnectionInputForIpc } from '../connections-ipc-validation.js';
+
+const OPENCODE_FREE_ENABLED_MODEL_IDS: readonly string[] =
+  defaultEnabledModelIdsWhenOmitted('opencode-free') ?? [];
+
+// `providerType in PROVIDER_REGISTRY` traverses the prototype chain, so an
+// inherited member named a provider the build does not register. The renderer
+// reaches this boundary, and what it admits is persisted.
+test('refuses a prototype member posing as a provider type', () => {
+  for (const providerType of ['__proto__', 'toString', 'constructor', 'hasOwnProperty']) {
+    assert.throws(
+      () =>
+        normalizeCreateConnectionInputForIpc({
+          name: 'Injected',
+          slug: 'injected',
+          providerType,
+          enabled: true,
+        }),
+      /Invalid Connection input/,
+      providerType,
+    );
+  }
+});
+
+test('registers pure Connection reads for replacement-Host retry', () => {
+  const reads = new Set<string>();
+  const effects = new Set<string>();
+  registerRuntimeHostConnectionsIpc({
+    ipcMain: {
+      handle: (channel) => {
+        effects.add(channel);
+      },
+      handleReconnectableRead: (channel) => {
+        reads.add(channel);
+      },
+    },
+    client: {} as never,
+    emitConnectionListChanged() {},
+  });
+
+  assert.deepEqual([...reads].sort(), [
+    'connections:getRequestHeaders',
+    'connections:getSnapshot',
+    'connections:hasSecret',
+  ]);
+  assert.ok(effects.has('connections:create'));
+  assert.ok(effects.has('connections:onboardingVerify'));
+  assert.ok(effects.has('connections:onboardingSave'));
+  assert.ok(effects.has('connections:test'));
+});
+
+test('forwards managed onboarding and emits only after a canonical save', async () => {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  const calls: unknown[] = [];
+  let changed = 0;
+  registerRuntimeHostConnectionsIpc({
+    ipcMain: {
+      handle: (channel, handler) => {
+        handlers.set(channel, handler as (...args: unknown[]) => unknown);
+      },
+    },
+    client: {
+      verifyConnectionOnboarding: async (input: unknown) => {
+        calls.push(['verify', input]);
+        return { kind: 'verified', models: [{ id: 'gpt-5' }] };
+      },
+      saveConnectionOnboarding: async (input: unknown) => {
+        calls.push(['save', input]);
+        return {
+          kind: 'saved',
+          connection: {
+            connectionId: 'connection-openai-2',
+            revision: 1,
+            slug: 'openai-2',
+            providerType: 'openai',
+          },
+        };
+      },
+    } as never,
+    emitConnectionListChanged() {
+      changed += 1;
+    },
+  });
+
+  const base = {
+    target: { kind: 'create', providerType: 'openai' },
+    apiKey: 'test-key',
+    baseUrl: null,
+  } as const;
+  assert.deepEqual(await handlers.get('connections:onboardingVerify')?.({}, base), {
+    kind: 'verified',
+    models: [{ id: 'gpt-5' }],
+  });
+  assert.deepEqual(
+    await handlers.get('connections:onboardingSave')?.({}, {
+      ...base,
+      enabledModelIds: ['gpt-5'],
+    }),
+    {
+      kind: 'result',
+      result: {
+        kind: 'saved',
+        connection: {
+          connectionId: 'connection-openai-2',
+          revision: 1,
+          slug: 'openai-2',
+          providerType: 'openai',
+        },
+      },
+    },
+  );
+  assert.equal(changed, 1);
+  assert.equal(calls.length, 2);
+});
+
+test('keeps a dispatched onboarding save interruption outcome unknown', async () => {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  registerRuntimeHostConnectionsIpc({
+    ipcMain: {
+      handle: (channel, handler) => {
+        handlers.set(channel, handler as (...args: unknown[]) => unknown);
+      },
+    },
+    client: {
+      saveConnectionOnboarding: async () => {
+        throw new RuntimeHostRequestInterruptedError(
+          'connection.onboarding.save',
+          'command',
+          'dispatched',
+          'connection_lost',
+        );
+      },
+    } as never,
+    emitConnectionListChanged() {},
+  });
+
+  assert.deepEqual(
+    await handlers.get('connections:onboardingSave')?.({}, {
+      target: { kind: 'create', providerType: 'openai' },
+      apiKey: 'test-key',
+      baseUrl: null,
+      enabledModelIds: ['gpt-5'],
+    }),
+    { kind: 'outcome_unknown' },
+  );
+});
+
+test('keeps Host commit_outcome_unknown distinct from a safe non-save', async () => {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  let attempt = 0;
+  registerRuntimeHostConnectionsIpc({
+    ipcMain: {
+      handle: (channel, handler) => {
+        handlers.set(channel, handler as (...args: unknown[]) => unknown);
+      },
+    },
+    client: {
+      saveConnectionOnboarding: async () => {
+        attempt += 1;
+        if (attempt === 1) {
+          throw new RuntimeHostOperationError(
+            'connection.onboarding.save',
+            'commit_outcome_unknown',
+            'unknown',
+          );
+        }
+        throw new RuntimeHostRequestInterruptedError(
+          'connection.onboarding.save',
+          'command',
+          'not_dispatched',
+          'connection_lost',
+        );
+      },
+    } as never,
+    emitConnectionListChanged() {},
+  });
+  const input = {
+    target: { kind: 'create', providerType: 'openai' },
+    apiKey: 'test-key',
+    baseUrl: null,
+    enabledModelIds: ['gpt-5'],
+  };
+
+  assert.deepEqual(await handlers.get('connections:onboardingSave')?.({}, input), {
+    kind: 'outcome_unknown',
+  });
+  assert.deepEqual(await handlers.get('connections:onboardingSave')?.({}, input), {
+    kind: 'not_saved',
+  });
+});
+
+test('fails closed when a dispatched onboarding response cannot be decoded', async () => {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  let attempt = 0;
+  registerRuntimeHostConnectionsIpc({
+    ipcMain: {
+      handle: (channel, handler) => {
+        handlers.set(channel, handler as (...args: unknown[]) => unknown);
+      },
+    },
+    client: {
+      saveConnectionOnboarding: async () => {
+        attempt += 1;
+        if (attempt === 1) {
+          // RuntimeHostConnection surfaces a malformed command response as
+          // an ordinary protocol error after the frame was dispatched.
+          throw new Error('Invalid connection onboarding save result');
+        }
+        throw new RuntimeHostOperationError(
+          'connection.onboarding.save',
+          'invalid_request',
+          'The Host definitively rejected the save',
+        );
+      },
+    } as never,
+    emitConnectionListChanged() {},
+  });
+  const input = {
+    target: { kind: 'create', providerType: 'openai' },
+    apiKey: 'test-key',
+    baseUrl: null,
+    enabledModelIds: ['gpt-5'],
+  };
+
+  assert.deepEqual(await handlers.get('connections:onboardingSave')?.({}, input), {
+    kind: 'outcome_unknown',
+  });
+  assert.deepEqual(await handlers.get('connections:onboardingSave')?.({}, input), {
+    kind: 'not_saved',
+  });
+});
+
+test('retries connection delete after a stale revision instead of failing permanently', async () => {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  let revision = 1;
+  let removals = 0;
+  registerRuntimeHostConnectionsIpc({
+    ipcMain: {
+      handle: (channel, handler) => {
+        handlers.set(channel, handler as (...args: unknown[]) => unknown);
+      },
+    },
+    client: {
+      loadConnectionCatalog: async (): Promise<ConnectionCatalogSnapshot> => ({
+        revision,
+        defaultTarget: null,
+        connections: [
+          {
+            connectionId: 'connection-1',
+            revision,
+            slug: 'openrouter',
+            name: 'OpenRouter',
+            providerType: 'openai-compatible',
+            baseUrl: 'https://openrouter.ai/api/v1',
+            enabled: true,
+            catalogEntries: [],
+            enabledModelIds: ['model-1'],
+            models: [{ id: 'model-1' }],
+          },
+        ],
+      }),
+      removeConnection: async (expected: { connectionId: string; revision: number }) => {
+        removals += 1;
+        if (expected.revision === 1) {
+          revision = 2;
+          return { kind: 'connection_stale' };
+        }
+        assert.equal(expected.revision, 2);
+        return { kind: 'committed', catalogRevision: 3 };
+      },
+    } as never,
+    emitConnectionListChanged() {},
+  });
+
+  await handlers.get('connections:delete')?.({}, connectionIdentity());
+  assert.equal(removals, 2);
+});
+
+test('treats a missing connection as a successful delete without calling remove', async () => {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  let removals = 0;
+  let listChanged = 0;
+  registerRuntimeHostConnectionsIpc({
+    ipcMain: {
+      handle: (channel, handler) => {
+        handlers.set(channel, handler as (...args: unknown[]) => unknown);
+      },
+    },
+    client: {
+      loadConnectionCatalog: async (): Promise<ConnectionCatalogSnapshot> => ({
+        revision: 1,
+        defaultTarget: null,
+        connections: [],
+      }),
+      removeConnection: async () => {
+        removals += 1;
+        return { kind: 'committed', catalogRevision: 2 };
+      },
+    } as never,
+    emitConnectionListChanged() {
+      listChanged += 1;
+    },
+  });
+
+  await handlers.get('connections:delete')?.({}, {
+    connectionId: 'already-gone',
+    slug: 'already-gone',
+  });
+  assert.equal(removals, 0);
+  assert.equal(listChanged, 1);
+});
+
+test('does not delete a replacement Connection that reused the stale detail slug', async () => {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  let removals = 0;
+  registerRuntimeHostConnectionsIpc({
+    ipcMain: {
+      handle: (channel, handler) => {
+        handlers.set(channel, handler as (...args: unknown[]) => unknown);
+      },
+    },
+    client: {
+      loadConnectionCatalog: async (): Promise<ConnectionCatalogSnapshot> => ({
+        ...catalog(),
+        connections: [{ ...catalog().connections[0]!, connectionId: 'connection-2' }],
+      }),
+      removeConnection: async () => {
+        removals += 1;
+        return { kind: 'committed', catalogRevision: 8 };
+      },
+    } as never,
+    emitConnectionListChanged() {},
+  });
+
+  await handlers.get('connections:delete')?.({}, connectionIdentity());
+  assert.equal(removals, 0);
+});
+
+test('rejects invalid connection identity input instead of treating it as already deleted', async () => {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  registerRuntimeHostConnectionsIpc({
+    ipcMain: {
+      handle: (channel, handler) => {
+        handlers.set(channel, handler as (...args: unknown[]) => unknown);
+      },
+    },
+    client: {
+      loadConnectionCatalog: async (): Promise<ConnectionCatalogSnapshot> => ({
+        revision: 1,
+        defaultTarget: null,
+        connections: [],
+      }),
+      removeConnection: async () => ({ kind: 'committed', catalogRevision: 2 }),
+    } as never,
+    emitConnectionListChanged() {},
+  });
+
+  await assert.rejects(
+    async () => handlers.get('connections:delete')?.({}, 42),
+    /Invalid Connection identity/i,
+  );
+});
 
 test('reports an existing but unconfigured credential as missing', async () => {
   const handlers = new Map<string, (...args: unknown[]) => unknown>();
@@ -30,9 +419,114 @@ test('reports an existing but unconfigured credential as missing', async () => {
   });
 
   assert.equal(
-    await handlers.get('connections:hasSecret')?.({}, 'openrouter'),
+    await handlers.get('connections:hasSecret')?.({}, connectionIdentity()),
     false,
   );
+});
+
+test('keeps saved custom header values out of the renderer and preserves them by name', async () => {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  let replacedHeaders: unknown;
+  registerRuntimeHostConnectionsIpc({
+    ipcMain: {
+      handle: (channel, handler) => {
+        handlers.set(channel, handler as (...args: unknown[]) => unknown);
+      },
+    },
+    client: {
+      loadConnectionCatalog: async () => catalog(),
+      getConnectionRequestHeaders: async () => ({
+        kind: 'found',
+        names: ['HTTP-Referer'],
+      }),
+      replaceConnectionRequestHeaders: async (_connectionId: string, headers: unknown) => {
+        replacedHeaders = headers;
+        return { kind: 'committed', names: ['HTTP-Referer', 'X-Title'] };
+      },
+    } as never,
+    emitConnectionListChanged() {},
+  });
+
+  assert.deepEqual(
+    await handlers.get('connections:getRequestHeaders')?.({}, connectionIdentity()),
+    { names: ['HTTP-Referer'] },
+  );
+  assert.equal(
+    JSON.stringify(await handlers.get('connections:getRequestHeaders')?.({}, connectionIdentity())).includes('private.example'),
+    false,
+  );
+
+  assert.deepEqual(
+    await handlers.get('connections:setRequestHeaders')?.({}, connectionIdentity(), [
+      { name: 'HTTP-Referer' },
+      { name: 'X-Title', value: 'Maka' },
+    ]),
+    { names: ['HTTP-Referer', 'X-Title'] },
+  );
+  assert.deepEqual(replacedHeaders, [
+    { name: 'HTTP-Referer' },
+    { name: 'X-Title', value: 'Maka' },
+  ]);
+});
+
+test('preserves the provider default inventory beside the recommended model', async () => {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  let createdModels: readonly string[] = [];
+  const emptyCatalog: ConnectionCatalogSnapshot = {
+    revision: 0,
+    defaultTarget: null,
+    connections: [],
+  };
+  registerRuntimeHostConnectionsIpc({
+    ipcMain: {
+      handle: (channel, handler) => {
+        handlers.set(channel, handler as (...args: unknown[]) => unknown);
+      },
+    },
+    client: {
+      loadConnectionCatalog: async () =>
+        createdModels.length === 0
+          ? emptyCatalog
+          : {
+              revision: 1,
+              defaultTarget: null,
+              connections: [
+                {
+                  connectionId: 'connection-free',
+                  revision: 1,
+                  slug: 'opencode-free',
+                  name: 'OpenCode Free',
+                  providerType: 'opencode-free',
+                  enabled: true,
+                  enabledModelIds: createdModels,
+                  catalogEntries: [],
+                  models: [],
+                },
+              ],
+            },
+      createConnection: async (
+        _revision: number,
+        draft: { readonly enabledModelIds: readonly string[] },
+      ) => {
+        createdModels = draft.enabledModelIds;
+        return {
+          kind: 'committed',
+          connection: { connectionId: 'connection-free', revision: 1 },
+        };
+      },
+    } as never,
+    emitConnectionListChanged() {},
+  });
+
+  await handlers.get('connections:create')?.({}, {
+    slug: 'opencode-free',
+    name: 'OpenCode Free',
+    providerType: 'opencode-free',
+    defaultModel: 'nemotron-3-ultra-free',
+  });
+
+  // Snapshot-derived set; assert the contract, not today's ids.
+  assert.deepEqual(createdModels, [...OPENCODE_FREE_ENABLED_MODEL_IDS]);
 });
 
 test('projects the Host default target without inventing a second Connection authority', () => {
@@ -40,6 +534,7 @@ test('projects the Host default target without inventing a second Connection aut
 
   assert.deepEqual(connections, [
     {
+      connectionId: 'connection-1',
       slug: 'openrouter',
       name: 'OpenRouter',
       providerType: 'openai-compatible',
@@ -48,10 +543,20 @@ test('projects the Host default target without inventing a second Connection aut
       defaultModel: 'model-1',
       enabledModelIds: ['model-1', 'model-2'],
       models: [{ id: 'model-1' }, { id: 'model-2' }],
+      // Carried through from the Host projection, not rebuilt here.
+      catalogEntries: [],
       createdAt: 0,
       updatedAt: 4,
     },
   ]);
+});
+
+test('does not invent a per-Connection default when the Host target is unset', () => {
+  const snapshot = catalog();
+  const connections = projectHostConnections({ ...snapshot, defaultTarget: null });
+
+  assert.equal(connections[0]?.defaultModel, '');
+  assert.deepEqual(connections[0]?.enabledModelIds, ['model-1', 'model-2']);
 });
 
 test('preserves the Host-tested model and diagnostics for the existing Desktop UI', () => {
@@ -107,8 +612,13 @@ function catalog(): ConnectionCatalogSnapshot {
         baseUrl: 'https://openrouter.ai/api/v1',
         enabled: true,
         enabledModelIds: ['model-1', 'model-2'],
+        catalogEntries: [],
         models: [{ id: 'model-1' }, { id: 'model-2' }],
       },
     ],
   };
+}
+
+function connectionIdentity() {
+  return { connectionId: 'connection-1', slug: 'openrouter' } as const;
 }

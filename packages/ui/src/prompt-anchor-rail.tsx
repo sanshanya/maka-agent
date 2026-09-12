@@ -1,149 +1,236 @@
-import { memo, useEffect, useRef, useState, type CSSProperties, type RefObject } from 'react';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import {
+  createContext,
+  useContext,
+  memo,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type CSSProperties,
+  type RefObject,
+} from 'react';
+import { createPortal } from 'react-dom';
+import { Button } from '@astryxdesign/core/Button';
 import { HoverCard } from '@astryxdesign/core/HoverCard';
 import { useUiLocale } from './locale-context.js';
 import { getConversationCopy } from './conversation-copy.js';
+import { useTranscriptScrollAuthority } from './transcript-scroll-authority.js';
 
-/**
- * Chromium keeps sub-pixel scroll offsets, so a scroller flush with its own
- * end can report a distance of 1 rather than 0 (`scroll-geometry.spec.ts`
- * documents the same reading). Astryx's own scroll-spy allows 2; match it.
- */
-const SCROLL_END_EPSILON_PX = 2;
-
-/**
- * How far the dock-style hover falloff reaches, in ticks. The hovered tick is
- * at 0 and grows most; each neighbour out to this distance grows less. Ticks
- * beyond it — and every tick while the pointer is away — sit at rest width,
- * which is why this doubles as the resting proximity.
- */
+/** Hover falloff radius in ticks (0 = hovered). */
 const HOVER_FALLOFF_TICKS = 3;
+/**
+ * Astryx's HoverCard waits 300ms before opening, which guards against a
+ * pointer crossing a wide row on its way somewhere else. A tick is 22px of
+ * rail that nothing else is on the way to, and the wait is the one part of
+ * this hover with no motion in it — 300ms of nothing reads as lag rather than
+ * as restraint.
+ */
+const PREVIEW_DELAY_MS = 120;
+const MAX_PROMPT_RAIL_TICKS = 64;
+
+interface PromptRailResizeObserver {
+  observe(target: Element): void;
+  disconnect(): void;
+}
+
+type PromptRailResizeObserverFactory = (
+  onResize: () => void,
+) => PromptRailResizeObserver;
+
+const createPromptRailResizeObserver: PromptRailResizeObserverFactory = (onResize) =>
+  new ResizeObserver(onResize);
+
+/** Keep the active tick reachable without scrolling the transcript ancestor. */
+export function keepActivePromptRailTickVisible(rail: HTMLElement): void {
+  const tick = rail.querySelector<HTMLElement>('.maka-prompt-rail-tick[data-active="true"]');
+  if (!tick) return;
+  const railBox = rail.getBoundingClientRect();
+  const tickBox = tick.getBoundingClientRect();
+  if (tickBox.top < railBox.top) rail.scrollTop -= railBox.top - tickBox.top;
+  else if (tickBox.bottom > railBox.bottom)
+    rail.scrollTop += tickBox.bottom - railBox.bottom;
+}
+
+export function observeActivePromptRailVisibility(
+  rail: HTMLElement,
+  createObserver: PromptRailResizeObserverFactory = createPromptRailResizeObserver,
+): () => void {
+  const observer = createObserver(() => keepActivePromptRailTickVisible(rail));
+  observer.observe(rail);
+  keepActivePromptRailTickVisible(rail);
+  return () => observer.disconnect();
+}
 
 export interface PromptAnchorRailTurn {
+  /** Optional host identity color; ordinary Session ticks remain neutral. */
+  accentColor?: string;
+  highlighted?: boolean;
   turnId: string;
-  /** The user prompt text for this turn; used as the hover preview + a11y label. */
   label: string;
-  /** The start of the assistant reply, shown under the prompt in the preview. */
   reply?: string;
+  sequence?: number;
+}
+
+export function mergePromptAnchorRailTurns(
+  loadedTurns: ReadonlyArray<{ turnId: string; label: string; reply: string }>,
+  index?: ReadonlyArray<{ turnId: string; sequence: number; label: string }>,
+): PromptAnchorRailTurn[] {
+  if (!index || index.length === 0) {
+    return loadedTurns.map((turn) => ({ ...turn }));
+  }
+  const loadedByTurnId = new Map(loadedTurns.map((turn) => [turn.turnId, turn]));
+  return index.map((landmark) => {
+    const loaded = loadedByTurnId.get(landmark.turnId);
+    return {
+      ...(loaded ?? {
+        turnId: landmark.turnId,
+        label: landmark.label,
+        reply: '',
+      }),
+      sequence: landmark.sequence,
+    };
+  });
 }
 
 export interface PromptAnchorRailProps {
+  /** Presentation-only hover/focus linkage; never navigates the transcript. */
+  onHighlightTurn?: (turn: PromptAnchorRailTurn | undefined) => void;
   turns: readonly PromptAnchorRailTurn[];
-  /** The scroll container that holds the `[data-turn-id]` turn sections. */
   scrollRef: RefObject<HTMLElement | null>;
+  /** When the indexed Turn is outside the Host's active transcript range. */
+  onNavigateFallback?: (turn: PromptAnchorRailTurn) => void;
   /**
-   * #2052: called when a clicked turn has no `[data-turn-id]` element yet.
-   * The progressive mount keeps early turns out of the DOM until the idle
-   * fill reaches them, so the owner mounts the turn and finishes the scroll.
+   * Stop following the tail, before a jump scrolls.
+   *
+   * A tick is the reader choosing where to look, which outranks the tail. It
+   * has to be said before the scroll, not after: released afterwards, the
+   * release lands on a viewport the pin has already written back to the bottom.
    */
-  onNavigateFallback?: (turnId: string) => void;
-  /**
-   * #2052: bumped whenever turn DOM membership changes without `turns`
-   * changing, i.e. each idle fill step. The observer effect below re-snapshots
-   * on it so newly mounted turns are observed too.
-   */
-  mountedTurnsRevision?: number;
+  onNavigateStart?: (() => void) | undefined;
 }
 
 /**
- * A slim right-edge rail with one tick per user prompt — jump between your
- * questions in a long conversation (Codex / ChatGPT style). Reuses the
- * `[data-turn-id]` anchors the chat view already renders, so a click just
- * scrolls the target turn into view; an IntersectionObserver highlights the
- * tick whose turn is currently at the top of the viewport.
- *
- * The rail is pinned to the scrollport by the zero-height sticky anchor it
- * renders into, not by `position: absolute` against the chat shell. Astryx's
- * ChatLayout owns the scroll container and the whole transcript — chat shell
- * included — now lives *inside* it, so an absolutely positioned rail resolves
- * against a box as tall as the conversation and scrolls away with it. See
- * `styles/prompt-rail.css` for the geometry the anchor establishes.
+ * The tick for a reading position the rail may not have sampled. Past its cap
+ * the rail shows one tick per few Turns, so it projects the reader's Turn onto
+ * the sampled positions the same way the sampling picked them.
  */
-export const PromptAnchorRail = memo(function PromptAnchorRail({ turns, scrollRef, onNavigateFallback, mountedTurnsRevision }: PromptAnchorRailProps): React.ReactElement | null {
+export function selectPromptRailTick(input: {
+  readingTurnId: string | undefined;
+  orderedTurnIds: readonly string[];
+  railTurnIds: readonly string[];
+  previousRailTurnId: string | null;
+}): string | null {
+  const { readingTurnId, orderedTurnIds, railTurnIds } = input;
+  if (readingTurnId !== undefined) {
+    if (railTurnIds.includes(readingTurnId)) return readingTurnId;
+    const readingIndex = orderedTurnIds.indexOf(readingTurnId);
+    if (readingIndex !== -1 && orderedTurnIds.length > 1 && railTurnIds.length > 1) {
+      return railTurnIds[Math.round(
+        readingIndex * (railTurnIds.length - 1) / (orderedTurnIds.length - 1),
+      )] ?? null;
+    }
+  }
+  // An unknown reading position — a Turn the rail has no landmark for, or none
+  // reported yet — leaves the current tick alone rather than jumping it home.
+  return input.previousRailTurnId !== null && railTurnIds.includes(input.previousRailTurnId)
+    ? input.previousRailTurnId
+    : null;
+}
+
+/** The scroll layout owns the rail's full-width sticky anchor. */
+export const PromptAnchorRailHostContext = createContext<HTMLElement | null>(null);
+
+/** Right-edge rail: bounded prompt landmarks that scroll to `[data-turn-id]`. */
+export const PromptAnchorRail = memo(function PromptAnchorRail({ turns, scrollRef, onNavigateFallback, onNavigateStart, onHighlightTurn }: PromptAnchorRailProps): React.ReactElement | null {
+  const host = useContext(PromptAnchorRailHostContext);
   const copy = getConversationCopy(useUiLocale()).sessions;
-  const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
-  // The scrollport height and the height of Astryx's sticky composer dock.
-  // Centring on the bare scrollport ran the lower ticks under the dock — up to
-  // 122px of overlap at an 860x617 window — so the rail centres on, and is
-  // capped to, what is left above it. Neither number is knowable in CSS and
-  // neither is a constant: the dock grows with the composer's draft and with
-  // the panels docked above it.
+  const authority = useTranscriptScrollAuthority();
+  const snapshot = useSyncExternalStore(
+    authority.subscribe,
+    authority.getSnapshot,
+    authority.getSnapshot,
+  );
   const [safeArea, setSafeArea] = useState<{ scrollport: number; dock: number } | null>(null);
   const railRef = useRef<HTMLElement | null>(null);
-  // Which tick the pointer is on, so its neighbours can grow with it. Sibling
-  // selectors cannot express this: Astryx's HoverCard wraps each tick in its
-  // own `display: contents` element, so the ticks are not DOM siblings.
+  const previousActiveRailTurnIdRef = useRef<string | null>(null);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
-  // Rebuilding this observer costs one querySelector + observe per turn over
-  // the whole transcript, so it must not run per streamed token (#2030). What
-  // keeps it from running is the caller: ChatView hands back the same array
-  // while no rail-visible field moved. Keying the effect on that array is
-  // therefore both the cheap check and the thing that fails loudly if the
-  // caller ever stops reusing it. The progressive mount (#2052) changes turn
-  // DOM membership WITHOUT changing the array, so the caller also bumps
-  // `mountedTurnsRevision` per fill step; a bounded handful of re-snapshots
-  // per session switch, never per token.
-  useEffect(() => {
-    const root = scrollRef.current;
-    if (!root || turns.length === 0) return;
-
-    const idByElement = new Map<Element, string>();
-    for (const turn of turns) {
-      const el = root.querySelector(`[data-turn-id="${CSS.escape(turn.turnId)}"]`);
-      if (el) idByElement.set(el, turn.turnId);
+  const activeVisibilityFrame = useRef(0);
+  // Prompt/reply text changes while an answer streams, but the tick layout only
+  // depends on Turn identity and order. Keep that structural value stable so a
+  // text delta does not rebuild the sampling.
+  const orderedTurnIdsRef = useRef<readonly string[]>([]);
+  const nextOrderedTurnIds = turns.map((turn) => turn.turnId);
+  if (
+    orderedTurnIdsRef.current.length !== nextOrderedTurnIds.length
+    || nextOrderedTurnIds.some((turnId, index) => orderedTurnIdsRef.current[index] !== turnId)
+  ) {
+    orderedTurnIdsRef.current = nextOrderedTurnIds;
+  }
+  const orderedTurnIds = orderedTurnIdsRef.current;
+  const railTurnIndexes = useMemo(() => {
+    if (orderedTurnIds.length <= MAX_PROMPT_RAIL_TICKS) {
+      return orderedTurnIds.map((_, index) => index);
     }
-    if (idByElement.size === 0) return;
-
-    const visible = new Set<string>();
-    const resolveActive = (): void => {
-      // At the end of the scroller there is nothing left to read past, so the
-      // final prompt is the current one — even when its turn is too short to
-      // ever cross the activation band below. Without this, a one-line last
-      // answer leaves `aria-current` stranded on the previous prompt with the
-      // reader already at the bottom. Astryx's own scroll-spy resolves the end
-      // of a scroller the same way.
-      if (root.scrollHeight - root.scrollTop - root.clientHeight <= SCROLL_END_EPSILON_PX) {
-        setActiveTurnId(turns[turns.length - 1]!.turnId);
-        return;
-      }
-      // Otherwise the topmost prompt still in view is the "current" one.
-      const firstVisible = turns.find((turn) => visible.has(turn.turnId));
-      if (firstVisible) setActiveTurnId(firstVisible.turnId);
-    };
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          const id = idByElement.get(entry.target);
-          if (!id) continue;
-          if (entry.isIntersecting) visible.add(id);
-          else visible.delete(id);
-        }
-        resolveActive();
-      },
-      // Only count a turn as active once it reaches the top third of the
-      // viewport, so the highlight tracks reading position, not mere presence.
-      { root, rootMargin: '0px 0px -66% 0px', threshold: 0 },
+    return Array.from({ length: MAX_PROMPT_RAIL_TICKS }, (_, index) =>
+      Math.round(index * (orderedTurnIds.length - 1) / (MAX_PROMPT_RAIL_TICKS - 1)),
     );
-    for (const el of idByElement.keys()) observer.observe(el);
+  }, [orderedTurnIds]);
+  const railTurnIds = useMemo(
+    () => railTurnIndexes.map((turnIndex) => orderedTurnIds[turnIndex]!),
+    [orderedTurnIds, railTurnIndexes],
+  );
+  const railTurns = railTurnIndexes.map((turnIndex) => turns[turnIndex]!);
+  const activeRailTurnId = selectPromptRailTick({
+    // Pinned to the tail, the reader is on the newest Turn, whichever one
+    // happens to cross the top of the scrollport.
+    readingTurnId: snapshot.pinned ? orderedTurnIds.at(-1) : snapshot.readingTurnId,
+    orderedTurnIds,
+    railTurnIds,
+    previousRailTurnId: previousActiveRailTurnIdRef.current,
+  });
+  useEffect(() => {
+    if (activeRailTurnId !== null) previousActiveRailTurnIdRef.current = activeRailTurnId;
+  }, [activeRailTurnId]);
 
-    // Reaching the bottom crosses no intersection boundary once the last turns
-    // are already on screen, so the observer alone never hears about it.
-    let frame = 0;
-    const onScroll = (): void => {
-      if (frame !== 0) return;
-      frame = requestAnimationFrame(() => {
-        frame = 0;
-        resolveActive();
+  // React is the only writer of the active attributes. Once that render has
+  // committed, bring the current tick into the rail's own bounded viewport.
+  useEffect(() => {
+    const rail = railRef.current;
+    if (!rail || activeRailTurnId === null) return;
+    if (activeVisibilityFrame.current !== 0) cancelAnimationFrame(activeVisibilityFrame.current);
+    activeVisibilityFrame.current = requestAnimationFrame(() => {
+      activeVisibilityFrame.current = requestAnimationFrame(() => {
+        activeVisibilityFrame.current = 0;
+        keepActivePromptRailTickVisible(rail);
       });
-    };
-    root.addEventListener('scroll', onScroll, { passive: true });
-
+    });
     return () => {
-      observer.disconnect();
-      root.removeEventListener('scroll', onScroll);
-      if (frame !== 0) cancelAnimationFrame(frame);
+      if (activeVisibilityFrame.current !== 0) {
+        cancelAnimationFrame(activeVisibilityFrame.current);
+        activeVisibilityFrame.current = 0;
+      }
     };
-  }, [scrollRef, turns, mountedTurnsRevision]);
+  }, [activeRailTurnId, host]);
 
   useEffect(() => {
     const root = scrollRef.current;
@@ -181,29 +268,34 @@ export const PromptAnchorRail = memo(function PromptAnchorRail({ turns, scrollRe
   // reader is scrolling.
   useEffect(() => {
     const rail = railRef.current;
-    if (!rail || activeTurnId === null) return;
-    const tick = rail.querySelector<HTMLElement>('.maka-prompt-rail-tick[data-active="true"]');
-    if (!tick) return;
-    const railBox = rail.getBoundingClientRect();
-    const tickBox = tick.getBoundingClientRect();
-    if (tickBox.top < railBox.top) rail.scrollTop -= railBox.top - tickBox.top;
-    else if (tickBox.bottom > railBox.bottom) rail.scrollTop += tickBox.bottom - railBox.bottom;
-  }, [activeTurnId]);
+    if (!rail) return;
+    return observeActivePromptRailVisibility(rail);
+  }, [orderedTurnIds, host]);
 
-  function jumpTo(turnId: string): void {
-    const el = scrollRef.current?.querySelector(`[data-turn-id="${CSS.escape(turnId)}"]`);
+  function jumpTo(turn: PromptAnchorRailTurn): void {
+    const root = scrollRef.current;
+    const el = root?.querySelector(`[data-turn-id="${CSS.escape(turn.turnId)}"]`);
+    // Before the scroll, not after: the tail has to be released while the
+    // transcript is still where the reader left it, or the release lands after
+    // the next growth has already written the view back to the bottom.
+    onNavigateStart?.();
     if (el && 'scrollIntoView' in el) {
-      (el as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'start' });
+      // Instant, whatever the app's scroll-motion policy says. A jump is a
+      // teleport the reader asked for, not a journey — and an animated one
+      // does not survive this surface: traced against a 30-prompt session, the
+      // smooth scroll was cancelled by concurrent content growth and stalled
+      // two pixels from where it started. Landing reliably beats animating
+      // unreliably.
+      (el as HTMLElement).scrollIntoView({ behavior: 'auto', block: 'start' });
     } else if (!el) {
-      onNavigateFallback?.(turnId);
+      onNavigateFallback?.(turn);
     }
-    setActiveTurnId(turnId);
   }
 
   // A rail is only useful once there are a few prompts to jump between.
-  if (turns.length < 3) return null;
+  if (railTurns.length < 3 || !host) return null;
 
-  return (
+  const rail = (
     <div
       className="maka-prompt-rail-anchor"
       style={
@@ -219,25 +311,22 @@ export const PromptAnchorRail = memo(function PromptAnchorRail({ turns, scrollRe
         className="maka-prompt-rail"
         aria-label={copy.promptRailAriaLabel}
         ref={railRef}
-        onPointerLeave={() => setHoveredIndex(null)}
+        onPointerLeave={() => { setHoveredIndex(null); onHighlightTurn?.(undefined); }}
       >
-        {turns.map((turn, index) => {
-          const isActive = turn.turnId === activeTurnId;
+        {railTurns.map((turn, index) => {
+          const isActive = turn.turnId === activeRailTurnId;
           const preview = turn.label.trim() || copy.emptyPrompt;
           const replyPreview = (turn.reply ?? '').replace(/\s+/g, ' ').trim().slice(0, 140);
           const proximity =
             hoveredIndex === null
               ? HOVER_FALLOFF_TICKS
               : Math.min(Math.abs(index - hoveredIndex), HOVER_FALLOFF_TICKS);
+          const scale = (14 + ((HOVER_FALLOFF_TICKS - proximity) * 3)) / 26;
           return (
-            // HoverCard, not a hand-positioned popover: it is portalled, so the
-            // topmost and bottommost ticks no longer push their preview off the
-            // window edge, and the card arrives with the theme's own surface.
-            // (Tooltip portals too, but its palette is deliberately inverted
-            // for short strings; this is a prompt plus a slice of its reply.)
             <HoverCard
               key={turn.turnId}
               placement="start"
+              delay={PREVIEW_DELAY_MS}
               content={
                 <span className="maka-prompt-rail-preview">
                   <span className="maka-prompt-rail-preview-prompt">{preview}</span>
@@ -247,37 +336,35 @@ export const PromptAnchorRail = memo(function PromptAnchorRail({ turns, scrollRe
                 </span>
               }
             >
-              <button
+              <Button
                 type="button"
+                variant="ghost"
+                size="sm"
+                label={copy.jumpToPrompt(preview)}
                 className="maka-prompt-rail-tick"
+                data-prompt-turn-id={turn.turnId}
+                data-highlighted={turn.highlighted || undefined}
                 data-active={isActive ? 'true' : undefined}
                 aria-current={isActive ? 'true' : undefined}
-                aria-label={copy.jumpToPrompt(preview)}
-                onClick={() => jumpTo(turn.turnId)}
-                onPointerEnter={() => setHoveredIndex(index)}
+                onClick={() => jumpTo(turn)}
+                onPointerEnter={() => { setHoveredIndex(index); onHighlightTurn?.(turn); }}
+                onFocus={() => onHighlightTurn?.(turn)}
+                onBlur={() => onHighlightTurn?.(undefined)}
                 style={
                   {
+                    color: turn.accentColor,
                     '--maka-prompt-rail-index': index,
-                    '--maka-prompt-rail-proximity': proximity,
+                    '--maka-prompt-rail-scale': scale,
                   } as CSSProperties
                 }
               >
-                {/* The bar is its own element, not a `::after`, because the
-                    travelling highlight anchors to it — and a pseudo-element
-                    cannot be an anchor. It cannot anchor to the button either:
-                    the HoverCard puts its own `anchor-name` there, inline,
-                    which wins over any rule of ours. */}
                 <span className="maka-prompt-rail-tick-bar" />
-              </button>
+              </Button>
             </HoverCard>
           );
         })}
-        {/* The travelling highlight. It is one element anchored to whichever
-            tick is active rather than a state on the tick itself, so changing
-            the active prompt moves a bar the reader can follow instead of
-            swapping two static ones. */}
-        <span className="maka-prompt-rail-indicator" aria-hidden="true" />
       </nav>
     </div>
   );
+  return createPortal(rail, host);
 });

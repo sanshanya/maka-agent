@@ -1,5 +1,23 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { strict as assert } from 'node:assert';
-import { createRequire } from 'node:module';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { it } from 'node:test';
@@ -10,14 +28,10 @@ import {
   MAX_AUTOMATIC_MERMAID_SOURCE_LENGTH,
   MAX_AUTOMATIC_MERMAID_TOTAL_SOURCE_LENGTH,
 } from '../markdown-body.js';
+import { AstryxLocaleProvider } from '../astryx-i18n.js';
 import { MakaUriContext, Markdown } from '../markdown.js';
-import {
-  AstryxLocaleProvider,
-  astryxMessageOverrides,
-} from '../astryx-i18n.js';
 import { LocaleProvider } from '../locale-context.js';
 import {
-  calculateMermaidFitScale,
   createMermaidConfig,
   MAX_MERMAID_EDGES,
   MAX_MERMAID_SOURCE_LENGTH,
@@ -32,6 +46,259 @@ it('keeps raw HTML inert instead of expanding the Markdown trust surface', () =>
   assert.doesNotMatch(markup, /<details/);
 });
 
+it('renders Markdown emphasis and LaTeX without exposing their source delimiters', () => {
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: '**Calculating CRT Solution**\n\nSet \\( n \\equiv 3 \\pmod 7 \\) and \\( a = 5 \\).',
+    density: 'compact',
+  }));
+
+  assert.match(markup, /<strong[^>]*>Calculating CRT Solution<\/strong>/);
+  assert.match(markup, /class="maka-math maka-math-inline"/);
+  assert.match(markup, /class="katex"/);
+  assert.doesNotMatch(markup, /\*\*Calculating/);
+  assert.doesNotMatch(markup, /\\\\\\\(/);
+});
+
+it('keeps URL, email, and Markdown markers atomic inside math', () => {
+  const markup = renderToStaticMarkup(createElement(LocaleProvider, {
+    locale: 'en',
+    children: createElement(MarkdownBody, {
+      text: [
+        'URL \\( \\texttt{https://example.com} \\)',
+        'Email \\( \\text{person@example.com} \\)',
+        'Markers \\( x \\left[y\\right] * z \\)',
+      ].join('\n\n'),
+      streaming: true,
+      settledText: [
+        'URL \\( \\texttt{https://example.com} \\)',
+        'Email \\( \\text{person@example.com} \\)',
+        'Markers \\( x \\left[y\\right] * z \\)',
+      ].join('\n\n'),
+    }),
+  }));
+
+  assert.equal((markup.match(/class="maka-math maka-math-inline"/g) ?? []).length, 3);
+  assert.equal((markup.match(/class="katex"/g) ?? []).length, 3);
+  assert.doesNotMatch(markup, /<a\b|mailto:/);
+  assert.doesNotMatch(markup, /\\\(|\\\)/);
+});
+
+it('falls back to ordinary Markdown for an empty formula', () => {
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: 'Empty \\( \\) end',
+  }));
+
+  assert.doesNotMatch(markup, /class="maka-math/);
+  assert.doesNotMatch(markup, /\\\(|\\\)/);
+  assert.match(markup, /Empty \( \) end/);
+});
+
+it('keeps literal math transport syntax as prose', () => {
+  const literalToken = '\uE000MAKA_MATH:0:78\uE001';
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: `Literal ${literalToken} end`,
+  }));
+
+  assert.doesNotMatch(markup, /class="maka-math/);
+  assert.match(markup, new RegExp(literalToken));
+});
+
+it('leaves LaTeX delimiters untouched inside inline and fenced code', () => {
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: ['Use `\\( x + 1 \\)` literally.', '', '```tex', '\\( y + 2 \\)', '```'].join('\n'),
+  }));
+
+  assert.doesNotMatch(markup, /class="maka-math/);
+  assert.match(markup, /\\\( x \+ 1 \\\)/);
+  assert.match(markup, /\\\( y \+ 2 \\\)/);
+});
+
+it('does not let an unmatched inline backtick hide later math', () => {
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: 'Unmatched ` prose.\n\nMath \\(x + 1\\)',
+  }));
+
+  assert.match(markup, /class="maka-math maka-math-inline"/);
+  assert.match(markup, /class="katex"/);
+});
+
+it('does not let an unmatched math delimiter hide a later formula', () => {
+  for (const text of [
+    'bad \\( then \\[x\\]',
+    'bad $$ then \\(x\\)',
+    'bad \\[ then \\(x\\)',
+  ]) {
+    const markup = renderToStaticMarkup(createElement(MarkdownBody, { text }));
+    assert.match(markup, /class="maka-math/);
+    assert.match(markup, /class="katex/);
+  }
+});
+
+it('lets a formula own backticks that occur inside its delimiters', () => {
+  for (const formula of ['\\(x ` y\\)', '\\(x \\text{`foo`}\\)']) {
+    const markup = renderToStaticMarkup(createElement(MarkdownBody, { text: formula }));
+    assert.match(markup, /class="maka-math maka-math-inline"/);
+    assert.match(markup, /class="katex"/);
+  }
+});
+
+it('keeps scanning after a malformed math transport prefix', () => {
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: `bad \uE000MAKA_MATH:bad then \\(x\\)`,
+  }));
+
+  assert.match(markup, /MAKA_MATH:bad/);
+  assert.match(markup, /class="maka-math maka-math-inline"/);
+});
+
+it('renders display math while leaving ordinary currency alone', () => {
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: 'Budget: $5 and $10. Range: $5–$10.\n\n\\[ x^2 + y^2 = z^2 \\]',
+  }));
+
+  assert.match(markup, /Budget: \$5 and \$10\. Range: \$5–\$10/);
+  assert.match(markup, /class="maka-math maka-math-display"/);
+  assert.match(markup, /class="katex-display"/);
+  assert.doesNotMatch(markup, /class="maka-math maka-math-inline"/);
+});
+
+it('does not treat shell variables, currency, or inline code as dollar-delimited math', () => {
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: [
+      'Home: $HOME/$USER',
+      'Path: $PATH:$HOME',
+      'Prices: $5 and $10; range $5–$10; paired $5 and $10.',
+      'Literal: `$x$`',
+      'Explicit: \\( x + 1 \\)',
+    ].join('\n\n'),
+  }));
+
+  assert.match(markup, /\$HOME\/\$USER/);
+  assert.match(markup, /\$PATH:\$HOME/);
+  assert.match(markup, /\$5 and \$10; range \$5–\$10; paired \$5 and \$10/);
+  assert.match(markup, /<code[^>]*>\$x\$<\/code>/);
+  assert.equal((markup.match(/class="maka-math maka-math-inline"/g) ?? []).length, 1);
+  assert.match(markup, /class="katex"/);
+});
+
+it('renders multiline display math outside code for both supported delimiters', () => {
+  for (const [text, mathNode] of [
+    [['Before', '', '$$', 'E = mc^2', '$$', '', 'After'].join('\n'), '<msup>'],
+    [['Before', '', '\\[', 'x_1 + x_2 = y', '\\]', '', 'After'].join('\n'), '<msub>'],
+  ]) {
+    const markup = renderToStaticMarkup(createElement(MarkdownBody, { text }));
+
+    assert.match(markup, /Before/);
+    assert.match(markup, /After/);
+    assert.match(markup, /class="maka-math maka-math-display"/);
+    assert.match(markup, /class="katex-display"/);
+    assert.doesNotMatch(markup, /\$\$/);
+    assert.doesNotMatch(markup, /\\\[/);
+    assert.match(markup, new RegExp(mathNode));
+    assert.doesNotMatch(markup, /<em[^>]*>1<\/em>/);
+  }
+});
+
+it('keeps display math intact across Markdown-looking block boundaries', () => {
+  const bodies = [
+    ['x + 1', '', 'y + 2'],
+    ['x + 1', '# heading-shaped'],
+    ['x + 1', '- list-shaped'],
+    ['x + 1', '| table | shaped |', '| --- | --- |'],
+  ];
+
+  for (const [open, close] of [['$$', '$$'], ['\\[', '\\]']]) {
+    for (const body of bodies) {
+      const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+        text: ['Before', '', open, ...body, close, '', 'After'].join('\n'),
+      }));
+
+      assert.match(markup, /class="maka-math maka-math-display"/);
+      assert.doesNotMatch(markup, /<h1\b|<ul\b|<table\b/);
+    }
+  }
+});
+
+it('does not let multiline display math cross a fenced code block', () => {
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: ['$$', 'outside', '```tex', 'inside', '```', '$$'].join('\n'),
+  }));
+
+  assert.doesNotMatch(markup, /class="maka-math/);
+  assert.match(markup, /\$\$/);
+  assert.match(markup, /inside/);
+});
+
+it('keeps the copy control in a toolbar above a one-line code scroll viewport', () => {
+  const markup = renderToStaticMarkup(createElement(LocaleProvider, {
+    locale: 'en',
+    children: createElement(MarkdownBody, {
+      text: ['```', `ssh-ed25519 ${'A'.repeat(200)}`, '```'].join('\n'),
+    }),
+  }));
+
+  const toolbarIndex = markup.indexOf('astryx-codeblock-header');
+  const copyButtonIndex = markup.indexOf('astryx-codeblock-copy-button');
+  const scrollViewportIndex = markup.indexOf('role="group"');
+
+  assert.match(markup, /data-maka-code-layout="single-line"/);
+  assert.ok(toolbarIndex >= 0);
+  assert.ok(copyButtonIndex > toolbarIndex);
+  assert.ok(scrollViewportIndex > copyButtonIndex);
+});
+
+it('does not force the single-line scrollbar layout on multiline code', () => {
+  const markup = renderToStaticMarkup(createElement(LocaleProvider, {
+    locale: 'en',
+    children: createElement(MarkdownBody, {
+      text: ['```ts', 'const first = 1;', 'const second = 2;', '```'].join('\n'),
+    }),
+  }));
+
+  assert.match(markup, /data-maka-code-layout="multi-line"/);
+  assert.match(markup, /astryx-codeblock-header/);
+  assert.match(markup, /astryx-codeblock-copy-button/);
+});
+
+it('gives collapsible plaintext code a localized accessible name', () => {
+  const code = Array.from({ length: 10 }, (_, index) => `line ${index + 1}`);
+
+  for (const [locale, label] of [['en', 'Code'], ['zh-CN', '代码']] as const) {
+    const markup = renderToStaticMarkup(createElement(LocaleProvider, {
+      locale,
+      children: createElement(AstryxLocaleProvider, {
+        children: createElement(MarkdownBody, {
+          text: ['```', ...code, '```'].join('\n'),
+        }),
+      }),
+    }));
+
+    assert.match(markup, /role="button"/);
+    assert.match(markup, /aria-expanded="true"/);
+    assert.match(markup, new RegExp(`>${label}</span>`));
+  }
+});
+
+it('keeps standalone MarkdownBody compatible for collapsible plaintext code', () => {
+  const code = Array.from({ length: 10 }, (_, index) => `line ${index + 1}`);
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: ['```', ...code, '```'].join('\n'),
+  }));
+
+  assert.match(markup, /role="button"/);
+  assert.match(markup, /aria-expanded="true"/);
+  assert.match(markup, />Code<\/span>/);
+});
+
+it('keeps a lazy live stream behind the display cursor', () => {
+  const markup = renderToStaticMarkup(createElement(Markdown, {
+    text: 'live output that has not reached the display cursor',
+    streaming: true,
+  }));
+
+  assert.doesNotMatch(markup, /live output/);
+});
+
 it('redacts secrets before even the lazy Markdown fallback reaches the rendered tree', () => {
   const markup = renderToStaticMarkup(createElement(Markdown, {
     text: 'Authorization: Bearer sk-live-1234567890abcdef',
@@ -41,23 +308,7 @@ it('redacts secrets before even the lazy Markdown fallback reaches the rendered 
   assert.match(markup, /&lt;redacted&gt;/);
 });
 
-it('renders Markdown through the Astryx document surface', () => {
-  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
-    text: '# Heading\n\nparagraph',
-  }));
 
-  assert.match(markup, /<div[^>]*role="document"/);
-  assert.match(markup, /<h1[^>]*>Heading<\/h1>/);
-});
-
-it('declares one stable migration scope around Astryx Markdown', () => {
-  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
-    text: 'paragraph',
-  }));
-
-  assert.match(markup, /^<div data-maka-contract="markdown"/);
-  assert.match(markup, /<div[^>]*role="document"/);
-});
 
 it('preserves allowlisted Maka navigation links through sanitization', () => {
   const markup = renderToStaticMarkup(
@@ -79,29 +330,6 @@ it('preserves allowlisted Maka navigation links through sanitization', () => {
   assert.match(markup, /<button\b/);
   assert.match(markup, /data-maka-uri-kind="settings"/);
   assert.doesNotMatch(markup, /Blocked URL/);
-});
-
-it('uses the localized Astryx external-link affordance for safe URLs', () => {
-  const markup = renderToStaticMarkup(
-    createElement(
-      LocaleProvider,
-      {
-        locale: 'zh',
-        children: createElement(
-          AstryxLocaleProvider,
-          null,
-          createElement(MarkdownBody, {
-            text: '[项目仓库](https://github.com/maka-agent/maka-agent)',
-          }),
-        ),
-      },
-    ),
-  );
-
-  assert.match(markup, /<a\b/);
-  assert.match(markup, /target="_blank"/);
-  assert.match(markup, /rel="noopener noreferrer"/);
-  assert.match(markup, />（在新标签页中打开）</);
 });
 
 it('keeps non-allowlisted external schemes inert', () => {
@@ -142,6 +370,8 @@ it('never loads non-allowlisted Markdown image sources', () => {
       '',
       'caption ![inline](custom://private-resource)',
       '',
+      '![data](data:image/png;base64,aW1n)',
+      '',
       '![reference][avatar]',
       '',
       '[avatar]: file:///Users/example/private.png',
@@ -158,6 +388,8 @@ it('does not treat navigation and communication schemes as image resources', () 
     'MAKA://auth/login',
     'maka://settings/models',
     'maka://compose?text=hello',
+    'maka://runtime/attachments/attachment-123?session=other',
+    'maka://runtime/attachments/not-an-artifact',
     'mailto:user@example.com',
   ]) {
     const markup = renderToStaticMarkup(createElement(MarkdownBody, {
@@ -169,185 +401,14 @@ it('does not treat navigation and communication schemes as image resources', () 
   }
 });
 
-it('keeps allowlisted images and image-like code intact', () => {
+it('shows an attachment placeholder when no session reader is installed', () => {
   const markup = renderToStaticMarkup(createElement(MarkdownBody, {
-    text: [
-      '![safe](https://example.com/image.png)',
-      '',
-      'badge ![inline-safe](https://example.com/badge.png) stays inline',
-      '',
-      '`![literal](file:///Users/example/private.png)`',
-    ].join('\n'),
+    text: '![preview](maka://runtime/attachments/attachment-123)',
   }));
 
-  assert.equal(markup.match(/<img\b/g)?.length, 2);
-  assert.match(markup, /src="https:\/\/example\.com\/image\.png"/);
-  assert.match(markup, /src="https:\/\/example\.com\/badge\.png" alt="inline-safe" style="display:inline-block"/);
-  assert.match(markup, /!\[literal\]\(file:\/\/\/Users\/example\/private\.png\)/);
-});
-
-it('renders GFM task lists as read-only Astryx checkboxes', () => {
-  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
-    text: '- [x] done\n- [ ] todo',
-  }));
-
-  assert.match(markup, /<input[^>]*type="checkbox"[^>]*aria-readonly="true"[^>]*checked=""/);
-  assert.match(markup, /<input[^>]*type="checkbox"[^>]*aria-readonly="true"(?![^>]*checked)/);
-  assert.match(markup, />done</);
-  assert.match(markup, />todo</);
-});
-
-it('localizes Astryx Markdown accessibility copy in Chinese', () => {
-  const markup = renderToStaticMarkup(
-    createElement(
-      LocaleProvider,
-      {
-        locale: 'zh',
-        children: createElement(
-          AstryxLocaleProvider,
-          null,
-          createElement(MarkdownBody, {
-            text: '- [x] 完成',
-          }),
-        ),
-      },
-    ),
-  );
-
-  assert.match(markup, />任务列表</);
-  assert.match(markup, />复选框</);
-  assert.doesNotMatch(markup, />Task list</);
-  assert.doesNotMatch(markup, />Checkbox</);
-});
-
-// A dead-config guard used to sit here, banning override keys for Astryx
-// surfaces Maka supposedly never rendered. Both of its entries rotted the
-// same way: `chat` stopped being true at #1795 (ChatLayout took over the
-// transcript, and the guard then blocked the fix for the English
-// scroll-to-bottom pill), and `lightbox` was never true — chat-turn.tsx
-// reaches Lightbox through useLightbox, which a JSX-tag scan misses. A ban
-// list keyed to "what we render today" goes stale silently, so it is gone;
-// the tests below pin the surfaces we know are live instead.
-function assertChineseAstryxOverrides(keys: readonly string[]) {
-  const messages = astryxMessageOverrides('zh')?.zh ?? {};
-  for (const key of keys) {
-    // Assert presence first: this reads the override map directly (no catalog
-    // resolution), so a deleted entry yields undefined → '' — which holds no
-    // Latin letters and would satisfy the translation check on its own. (At
-    // runtime the same missing entry falls back to Astryx's shipped en
-    // catalog, i.e. English in the UI.)
-    const value = messages[key];
-    assert.ok(value, `missing override: ${key}`);
-    assert.doesNotMatch(
-      value.replace(/\{[^}]*\}/g, ''),
-      /[A-Za-z]/,
-      `untranslated: ${key}`,
-    );
-  }
-}
-
-it('localizes the Astryx chat chrome adopted in #1795', () => {
-  const messages = astryxMessageOverrides('zh')?.zh ?? {};
-  assert.equal(messages['@astryx.chatLayout.newMessages'], '跳到最新消息');
-  assert.equal(messages['@astryx.chatLayoutScrollButton.scrollToBottom'], '滚动到底部');
-  assertChineseAstryxOverrides(['@astryx.chatToolCalls.error', '@astryx.chat.status.sent']);
-});
-
-// Whole-map sweep: every override must target a key Astryx actually ships,
-// carry the same ICU arguments as the en default (a renamed placeholder
-// throws at format time), and hold no Latin outside {…} segments. The pinned
-// tests above cover specific regressions; this keeps the other ~70 entries
-// honest without naming them one by one.
-it('every zh override is a real Astryx key, translated, with matching ICU args', () => {
-  const require = createRequire(import.meta.url);
-  const catalog: Record<string, { defaultMessage: string }> = require(
-    '@astryxdesign/core/locales/en.json',
-  );
-  // Top-level ICU argument names only: inside `{count, plural, one {result}}`
-  // the `{result}` is branch text, not an argument — a naive regex would
-  // report it and flag every zh string that drops an inapplicable plural.
-  const icuArgs = (message: string) => {
-    const args = new Set<string>();
-    let depth = 0;
-    for (let i = 0; i < message.length; i++) {
-      if (message[i] === '{') {
-        if (depth === 0) {
-          const m = /^\{\s*([a-zA-Z0-9_]+)/.exec(message.slice(i));
-          if (m?.[1]) args.add(m[1]);
-        }
-        depth++;
-      } else if (message[i] === '}') {
-        depth = Math.max(0, depth - 1);
-      }
-    }
-    return args;
-  };
-  const messages = astryxMessageOverrides('zh')?.zh ?? {};
-  assert.ok(Object.keys(messages).length > 0);
-  for (const [key, value] of Object.entries(messages)) {
-    const shipped = catalog[key];
-    assert.ok(shipped, `override targets a key Astryx does not ship: ${key}`);
-    assert.ok(value, `empty override: ${key}`);
-    assert.doesNotMatch(
-      value.replace(/\{[^}]*\}/g, ''),
-      /[A-Za-z]/,
-      `untranslated: ${key} = ${value}`,
-    );
-    assert.deepEqual(
-      icuArgs(value),
-      icuArgs(shipped.defaultMessage),
-      `ICU argument mismatch for ${key}: zh "${value}" vs en "${shipped.defaultMessage}"`,
-    );
-  }
-});
-
-it('localizes the Lightbox reached via useLightbox in chat-turn', () => {
-  assertChineseAstryxOverrides([
-    '@astryx.lightbox.mediaViewer',
-    '@astryx.lightbox.close',
-    '@astryx.lightbox.previous',
-    '@astryx.lightbox.next',
-  ]);
-});
-
-it('uses the localized Astryx code block and syntax tokenizer', () => {
-  const markup = renderToStaticMarkup(
-    createElement(
-      LocaleProvider,
-      {
-        locale: 'zh',
-        children: createElement(
-          AstryxLocaleProvider,
-          null,
-          createElement(MarkdownBody, {
-            text: ['```typescript', 'const answer = 42;', '```'].join('\n'),
-          }),
-        ),
-      },
-    ),
-  );
-
-  assert.match(markup, /aria-label="复制代码"/);
-  assert.match(markup.replace(/<[^>]*>/g, ''), /const answer = 42;/);
-});
-
-it('routes settled Mermaid fences to the lazy diagram surface', () => {
-  const markup = renderToStaticMarkup(
-    createElement(
-      LocaleProvider,
-      {
-        locale: 'en',
-        children: createElement(MarkdownBody, {
-          text: ['```mermaid', 'flowchart LR', 'A --> B', '```'].join('\n'),
-        }),
-      },
-    ),
-  );
-
-  assert.match(markup, /data-maka-contract="mermaid"/);
-  assert.match(markup, /data-maka-mermaid-state="loading"/);
-  assert.match(markup, /Rendering Mermaid diagram/);
-  assert.match(markup, /flowchart LR/);
+  assert.match(markup, />\[preview\]</);
+  assert.doesNotMatch(markup, /maka:\/\/runtime\/attachments/);
+  assert.doesNotMatch(markup, /<img\b/);
 });
 
 it('defers Mermaid fences beyond the per-Markdown automatic diagram budget', () => {
@@ -415,105 +476,56 @@ it('pins Mermaid security and complexity limits for untrusted assistant output',
   assert.equal(config.theme, 'dark');
 });
 
-it('lets fullscreen Mermaid diagrams grow beyond their inline natural size', () => {
-  const viewport = {
-    availableWidth: 1200,
-    availableHeight: 900,
-    naturalWidth: 600,
-    naturalHeight: 300,
-  };
-
-  assert.equal(calculateMermaidFitScale({ ...viewport, expanded: false }), 1);
-  assert.equal(calculateMermaidFitScale({ ...viewport, expanded: true }), 2);
-});
-
-it('keeps a single newline as a CommonMark soft break', () => {
+it('keeps a new stream behind the display cursor on its first render', () => {
   const markup = renderToStaticMarkup(createElement(MarkdownBody, {
-    text: '**小节标题**\n正文内容',
-  }));
-
-  assert.doesNotMatch(markup, /<br\s*\/?>/);
-  assert.match(markup, /<\/strong>\n正文内容/);
-});
-
-it('renders an explicit CommonMark hard break as a native break', () => {
-  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
-    text: '第一行  \n第二行',
-  }));
-
-  assert.match(markup, /第一行<br\s*\/?>第二行/);
-});
-
-it('keeps incomplete syntax literal after the stream settles', () => {
-  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
-    text: 'Hello **world',
-  }));
-
-  assert.match(markup, /Hello \*\*world/);
-});
-
-it('does not reveal the unreached tail on the first streaming render', () => {
-  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
-    text: 'visible start and unreached tail',
+    text: 'new output that has not been presented yet',
     streaming: true,
   }));
 
-  assert.doesNotMatch(markup, /unreached tail/);
+  assert.doesNotMatch(markup, /new output that has not been presented yet/);
 });
 
-it('keeps the lazy fallback behind the streaming display cursor', () => {
-  const markup = renderToStaticMarkup(createElement(Markdown, {
-    text: 'visible start and lazy unreached tail',
+it('shows only the restored prefix on its first streaming render', () => {
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: '**output restored** with a new delta',
     streaming: true,
+    settledText: '**output restored**',
   }));
 
-  assert.doesNotMatch(markup, /lazy unreached tail/);
+  assert.match(markup, /<strong[^>]*>output restored<\/strong>/);
+  assert.doesNotMatch(markup, /new delta/);
 });
 
-it('shows the complete stream immediately in deterministic fixtures', () => {
-  const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document');
-  Object.defineProperty(globalThis, 'document', {
-    configurable: true,
-    value: {
-      documentElement: {
-        dataset: { makaE2eFixture: 'true' },
-      },
-    },
-  });
+it('renders settled math while keeping the live tail behind the display cursor', () => {
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: 'Stable \\( x + 1 \\) with a new delta',
+    streaming: true,
+    settledText: 'Stable \\( x + 1 \\)',
+  }));
 
-  try {
-    const markup = renderToStaticMarkup(createElement(Markdown, {
-      text: 'deterministic fixture answer',
-      streaming: true,
-    }));
-
-    assert.match(markup, /deterministic fixture answer/);
-  } finally {
-    if (documentDescriptor) {
-      Object.defineProperty(globalThis, 'document', documentDescriptor);
-    } else {
-      Reflect.deleteProperty(globalThis, 'document');
-    }
-  }
+  assert.match(markup, /class="maka-math maka-math-inline"/);
+  assert.match(markup, /class="katex"/);
+  assert.doesNotMatch(markup, /new delta/);
 });
 
-it('leaves block rhythm to the caller and defaults to document spacing', () => {
-  // The transcript wants compact block spacing; the Daily Review panel, which
-  // renders through the same component, wants document spacing. Hardcoding
-  // `density="compact"` here gave the review transcript rhythm with document
-  // heading sizes — the one combination the scoping rule in
-  // styles/chat-message.css argues against.
-  //
-  // Asserting the SHAPE of the choice rather than Astryx's hashed atoms:
-  // omitting the prop must render exactly as asking for `default`, and
-  // `compact` must render differently. That survives an Astryx restyle and
-  // still fails the moment the default flips back.
-  const render = (density?: 'default' | 'compact') =>
-    renderToStaticMarkup(createElement(MarkdownBody, {
-      text: '# Title\n\nBody\n\n## Second\n\nMore',
-      density,
-    }));
+it('settles only the verified prefix when restored content was rewritten', () => {
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: 'prefix <redacted> NEW',
+    streaming: true,
+    settledText: 'prefix sk-123456789012345',
+  }));
 
-  assert.equal(render(), render('default'));
-  assert.notEqual(render(), render('compact'));
+  assert.match(markup, />prefix </);
+  assert.doesNotMatch(markup, /redacted|NEW/);
+});
+
+it('never settles half of a rewritten Unicode code point', () => {
+  const markup = renderToStaticMarkup(createElement(MarkdownBody, {
+    text: 'same 😃 NEW',
+    streaming: true,
+    settledText: 'same 😀 old',
+  }));
+
+  assert.match(markup, />same </);
+  assert.doesNotMatch(markup, /😃|NEW|�/u);
 });

@@ -1,22 +1,48 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { deferred } from '@maka/core/test-only/async-primitives';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { AgentRunHeader } from '@maka/core';
 import {
-  BackendRegistry,
-  FakeBackend,
-  GOAL_SET_TOOL_NAME,
-  goalCheckpoint,
-  SessionManager,
-  type RuntimeHostedRootAuthority,
-} from '@maka/runtime';
+  runtimeInvocationOutcome,
+  type RuntimeInvocationRecord,
+} from '@maka/core/runtime-invocation';
+import { runtimeInvocationFailureClass } from '@maka/runtime/runtime-event-read-model';
+import { seedInvocation } from '@maka/runtime/test-only/invocation-fixture';
+import { BackendRegistry, SessionManager } from '@maka/runtime/session-manager';
+import { FakeBackend } from '@maka/runtime/test-only/fake-backend';
+import { GOAL_SET_TOOL_NAME } from '@maka/runtime/goal-tools';
+import { goalCheckpoint } from '@maka/runtime/goal-state';
+import { type RuntimeHostedRootAuthority } from '@maka/runtime/message-authority';
 import {
   openInteractiveExecutionStoresForWrite,
   type InteractiveExecutionStoresWriter,
 } from '@maka/storage/execution-stores';
+import {
+  openInteractiveGoalAuthorityForWrite,
+  type InteractiveGoalAuthorityWriter,
+} from '@maka/storage/goal-authority';
 import {
   resolveStorageRoot,
   tryAcquireInteractiveRootOwner,
@@ -27,11 +53,14 @@ import { CanonicalSessionProjectionReader } from '../server/canonical-session-pr
 import type { RuntimeHostResidency } from '../server/host-kernel.js';
 import { HostInteractionCoordinator } from '../server/interaction-coordinator.js';
 import { HostGoalCoordinator } from '../server/goal-coordinator.js';
+import { HostGoalExecutionCoordinator } from '../server/goal-execution-coordinator.js';
+import { executeHostedExecutionToSettlement } from '../server/hosted-execution-wait.js';
 import { type HostMessageRootPort, HostMessageCoordinator } from '../server/message-coordinator.js';
 import { RootAdmissionOwner } from '../server/root-admission-owner.js';
 import { RootTurnCoordinator } from '../server/root-turn-coordinator.js';
 import { SessionAdmissionGate } from '../server/session-admission-gate.js';
 import { SessionContinuityCoordinator } from '../server/session-continuity-coordinator.js';
+import { readLedgerMessages } from './fixtures/ledger-transcript.js';
 
 test('Goal continuation uses the canonical root admission and durable origin', {
   timeout: 10_000,
@@ -42,11 +71,11 @@ test('Goal continuation uses the canonical root admission and durable origin', {
     const controlLease = fixture.goal.manager.getControlLease(fixture.sessionId);
     assert.ok(controlLease);
     if (!controlLease) return;
-    const admission = fixture.coordinator.admitGoalTurn(
+    const admission = fixture.goalExecutions.admitTurn(
       fixture.sessionId,
+      'Continue the Goal',
       goalCheckpoint(created),
       controlLease,
-      'Continue the Goal',
     );
     assert.equal(admission.kind, 'prepared');
     if (admission.kind !== 'prepared') return;
@@ -75,14 +104,11 @@ test('Goal continuation uses the canonical root admission and durable origin', {
     assert.deepEqual(durableAdmission?.execution, { kind: 'goal', goalId: created.id });
     assert.ok(durableAdmission);
     if (!durableAdmission) return;
-    const run = await fixture.stores.agentRunStore.readRun(
-      fixture.sessionId,
-      durableAdmission.runId,
-    );
-    assert.equal(run.goalId, created.id);
-    const user = (await fixture.stores.sessionStore.readMessages(fixture.sessionId)).find(
-      (message) => message.type === 'user' && message.turnId === admission.turnId,
-    );
+    const run = await readInvocation(fixture, durableAdmission.runId);
+    assert.deepEqual(run?.opening.root, { kind: 'goal', goalId: created.id });
+    const user = (
+      await readLedgerMessages(fixture.stores.runtimeEventStore, fixture.sessionId)
+    ).find((message) => message.type === 'user' && message.turnId === admission.turnId);
     assert.deepEqual(user?.type === 'user' ? user.origin : undefined, {
       kind: 'goal',
       goalId: created.id,
@@ -100,11 +126,11 @@ test('queued Goal control revokes a prepared root before durable admission', asy
     const controlLease = fixture.goal.manager.getControlLease(fixture.sessionId);
     assert.ok(controlLease);
     if (!controlLease) return;
-    const admission = fixture.coordinator.admitGoalTurn(
+    const admission = fixture.goalExecutions.admitTurn(
       fixture.sessionId,
+      'This stale continuation must never run',
       goalCheckpoint(created),
       controlLease,
-      'This stale continuation must never run',
     );
     assert.equal(admission.kind, 'prepared');
     if (admission.kind !== 'prepared') return;
@@ -141,13 +167,13 @@ test('queued Goal control revokes a prepared root before durable admission', asy
       undefined,
     );
     assert.equal(
-      (await fixture.stores.agentRunStore.listSessionRuns(fixture.sessionId)).some(
-        (run) => run.goalId === created.id,
+      (await fixture.stores.runtimeEventStore.listSessionInvocations(fixture.sessionId)).some(
+        (run) => run.opening.root.kind === 'goal' && run.opening.root.goalId === created.id,
       ),
       false,
     );
     assert.equal(
-      (await fixture.stores.sessionStore.readMessages(fixture.sessionId)).some(
+      (await readLedgerMessages(fixture.stores.runtimeEventStore, fixture.sessionId)).some(
         (message) => message.type === 'user' && message.turnId === admission.turnId,
       ),
       false,
@@ -157,20 +183,20 @@ test('queued Goal control revokes a prepared root before durable admission', asy
   }
 });
 
-test('Goal continuation cannot overtake a pending Automation admission', async () => {
+test('Goal continuation cannot overtake a pending ScheduledTask admission', async () => {
   const fixture = await createFixture();
   const admissionEntered = deferred();
   const releaseAdmission = deferred();
   try {
-    const automationTurnId = randomUUID();
-    const automationRunId = randomUUID();
-    const automationId = 'automation-reservation';
-    const automation = fixture.coordinator.executeRoot({
+    const scheduledTaskTurnId = randomUUID();
+    const scheduledTaskRunId = randomUUID();
+    const scheduledTaskId = 'scheduled-task-reservation';
+    const scheduledTask = executeHostedExecutionToSettlement(fixture.coordinator, {
       sessionId: fixture.sessionId,
-      turnId: automationTurnId,
-      runId: automationRunId,
+      turnId: scheduledTaskTurnId,
+      runId: scheduledTaskRunId,
       userMessageId: randomUUID(),
-      execution: { kind: 'automation', automationId },
+      execution: { kind: 'scheduled_task', scheduledTaskId },
       content: { text: 'Hold the shared root reservation.' },
       admitExecution: async () => {
         admissionEntered.resolve();
@@ -181,9 +207,9 @@ test('Goal continuation cannot overtake a pending Automation admission', async (
         fixture.manager.sendMessage(
           fixture.sessionId,
           {
-            turnId: automationTurnId,
+            turnId: scheduledTaskTurnId,
             text: 'Hold the shared root reservation.',
-            origin: { kind: 'automation', automationId },
+            origin: { kind: 'scheduled_task', scheduledTaskId },
           },
           {
             runId,
@@ -195,28 +221,28 @@ test('Goal continuation cannot overtake a pending Automation admission', async (
     });
     await admissionEntered.promise;
 
-    const overtakingGoal = fixture.coordinator.admitGoalTurn(
+    const overtakingGoal = fixture.goalExecutions.admitTurn(
       fixture.sessionId,
+      'Do not overtake the ScheduledTask admission.',
       { goalId: 'goal-pending', revision: 1 },
-      { goalId: 'goal-pending' },
-      'Do not overtake the Automation admission.',
+      { goalId: 'goal-pending', generation: 0 },
     );
     assert.equal(overtakingGoal.kind, 'busy');
     assert.deepEqual(fixture.coordinator.readRootState(fixture.sessionId), { kind: 'reserved' });
 
     releaseAdmission.resolve();
-    await automation;
+    await scheduledTask;
     if (overtakingGoal.kind === 'busy') await overtakingGoal.whenIdle;
 
-    const goal = fixture.goal.manager.create(fixture.sessionId, 'Run after Automation').goal;
+    const goal = fixture.goal.manager.create(fixture.sessionId, 'Run after ScheduledTask').goal;
     const controlLease = fixture.goal.manager.getControlLease(fixture.sessionId);
     assert.ok(controlLease);
     if (!controlLease) return;
-    const goalAdmission = fixture.coordinator.admitGoalTurn(
+    const goalAdmission = fixture.goalExecutions.admitTurn(
       fixture.sessionId,
+      'Continue after ScheduledTask.',
       goalCheckpoint(goal),
       controlLease,
-      'Continue after Automation.',
     );
     assert.equal(goalAdmission.kind, 'prepared');
     if (goalAdmission.kind !== 'prepared') return;
@@ -229,7 +255,7 @@ test('Goal continuation cannot overtake a pending Automation admission', async (
       fixture.sessionId,
       goalAdmission.turnId,
     );
-    assert.equal(durableGoal?.previousRootTurnId, automationTurnId);
+    assert.equal(durableGoal?.previousRootTurnId, scheduledTaskTurnId);
     assert.equal(fixture.drainRequested(), false);
   } finally {
     releaseAdmission.resolve();
@@ -237,19 +263,19 @@ test('Goal continuation cannot overtake a pending Automation admission', async (
   }
 });
 
-test('drain revokes pending Automation before durable root admission', async () => {
+test('drain revokes pending ScheduledTask before durable root admission', async () => {
   const fixture = await createFixture();
   const admissionEntered = deferred();
   const releaseAdmission = deferred();
   const turnId = randomUUID();
   const runId = randomUUID();
   try {
-    const automation = fixture.coordinator.executeRoot({
+    const scheduledTask = executeHostedExecutionToSettlement(fixture.coordinator, {
       sessionId: fixture.sessionId,
       turnId,
       runId,
       userMessageId: randomUUID(),
-      execution: { kind: 'automation', automationId: 'draining-automation' },
+      execution: { kind: 'scheduled_task', scheduledTaskId: 'draining-scheduled-task' },
       content: { text: 'Do not admit after drain.' },
       admitExecution: async () => {
         admissionEntered.resolve();
@@ -262,7 +288,7 @@ test('drain revokes pending Automation before durable root admission', async () 
           {
             turnId,
             text: 'Do not admit after drain.',
-            origin: { kind: 'automation', automationId: 'draining-automation' },
+            origin: { kind: 'scheduled_task', scheduledTaskId: 'draining-scheduled-task' },
           },
           {
             runId: admittedRunId,
@@ -277,13 +303,13 @@ test('drain revokes pending Automation before durable root admission', async () 
     fixture.coordinator.beginDrain();
     releaseAdmission.resolve();
 
-    await assert.rejects(automation, /lost its pending reservation/);
+    await assert.rejects(scheduledTask, /lost its pending reservation/);
     assert.equal(
       await fixture.stores.agentRunStore.readRootTurnAdmission(fixture.sessionId, turnId),
       undefined,
     );
     assert.equal(
-      (await fixture.stores.agentRunStore.listSessionRuns(fixture.sessionId)).some(
+      (await fixture.stores.runtimeEventStore.listSessionInvocations(fixture.sessionId)).some(
         (run) => run.runId === runId,
       ),
       false,
@@ -294,57 +320,58 @@ test('drain revokes pending Automation before durable root admission', async () 
   }
 });
 
-test('Automation turns can use Goal tools and contribute evaluation evidence', async () => {
+test('ScheduledTask turns can use Goal tools and contribute evaluation evidence', async () => {
   const fixture = await createFixture();
   try {
-    const automationId = 'automation-goal-tool';
+    const scheduledTaskId = 'scheduled-task-goal-tool';
     const turnId = randomUUID();
     const runId = randomUUID();
     const goalSet = fixture.goal.tools.find((tool) => tool.name === GOAL_SET_TOOL_NAME);
     assert.ok(goalSet);
     if (!goalSet) return;
 
-    await fixture.coordinator.executeRoot({
+    await executeHostedExecutionToSettlement(fixture.coordinator, {
       sessionId: fixture.sessionId,
       turnId,
       runId,
       userMessageId: randomUUID(),
-      execution: { kind: 'automation', automationId },
+      execution: { kind: 'scheduled_task', scheduledTaskId },
       content: { text: 'Set and verify a Goal.' },
-      start: ({ runId: admittedRunId, userMessageId, onRunStarted }) => {
-        const result = goalSet.impl(
-          { condition: 'Automation Goal completes' },
-          {
-            sessionId: fixture.sessionId,
-            runId: admittedRunId,
-            turnId,
-            cwd: fixture.base,
-            toolCallId: 'goal-set-from-automation',
-            abortSignal: new AbortController().signal,
-            emitOutput: () => {},
-          },
-        );
-        assert.equal(typeof result, 'string');
-        assert.match(result as string, /Goal set/);
-        return fixture.manager.sendMessage(
-          fixture.sessionId,
-          {
-            turnId,
-            text: 'Set and verify a Goal.',
-            origin: { kind: 'automation', automationId },
-          },
-          {
-            runId: admittedRunId,
-            userMessageId: userMessageId ?? undefined,
-            durability: 'required',
-            onRunStarted,
-          },
-        );
-      },
+      start: ({ runId: admittedRunId, userMessageId, onRunStarted }) =>
+        (async function* () {
+          const result = await goalSet.impl(
+            { condition: 'ScheduledTask Goal completes' },
+            {
+              sessionId: fixture.sessionId,
+              runId: admittedRunId,
+              turnId,
+              cwd: fixture.base,
+              toolCallId: 'goal-set-from-scheduled-task',
+              abortSignal: new AbortController().signal,
+              emitOutput: () => {},
+            },
+          );
+          assert.equal(typeof result, 'string');
+          assert.match(result as string, /Goal set/);
+          yield* fixture.manager.sendMessage(
+            fixture.sessionId,
+            {
+              turnId,
+              text: 'Set and verify a Goal.',
+              origin: { kind: 'scheduled_task', scheduledTaskId },
+            },
+            {
+              runId: admittedRunId,
+              userMessageId: userMessageId ?? undefined,
+              durability: 'required',
+              onRunStarted,
+            },
+          );
+        })(),
     });
 
     const goal = await fixture.waitForGoalStatus('achieved');
-    assert.equal(goal.condition, 'Automation Goal completes');
+    assert.equal(goal.condition, 'ScheduledTask Goal completes');
     assert.equal(goal.lastReason, 'verified');
     assert.equal(fixture.drainRequested(), false);
   } finally {
@@ -369,7 +396,7 @@ test('Host Goal continuation bridges its exact generation into root authority', 
     if (!resumed) return;
 
     const run = await waitForGoalRun(fixture, resumed.id);
-    assert.equal(run.goalId, resumed.id);
+    assert.deepEqual(run.opening.root, { kind: 'goal', goalId: resumed.id });
     const admission = await fixture.stores.agentRunStore.readRootTurnAdmission(
       fixture.sessionId,
       run.turnId,
@@ -400,13 +427,13 @@ test('restart closes an admitted Goal without a Run instead of replaying it', as
     });
 
     await fixture.coordinator.prepareRecovery();
-    const run = await fixture.stores.agentRunStore.readRun(fixture.sessionId, runId);
-    assert.equal(run.goalId, 'goal-restart');
-    assert.equal(run.status, 'failed');
-    assert.equal(run.failureClass, 'app_restarted');
-    const user = (await fixture.stores.sessionStore.readMessages(fixture.sessionId)).find(
-      (message) => message.type === 'user' && message.turnId === turnId,
-    );
+    const run = await readInvocation(fixture, runId);
+    assert.deepEqual(run?.opening.root, { kind: 'goal', goalId: 'goal-restart' });
+    assert.equal(run && runtimeInvocationOutcome(run), 'failed');
+    assert.equal(run && runtimeInvocationFailureClass(run), 'app_restarted');
+    const user = (
+      await readLedgerMessages(fixture.stores.runtimeEventStore, fixture.sessionId)
+    ).find((message) => message.type === 'user' && message.turnId === turnId);
     assert.deepEqual(user?.type === 'user' ? user.origin : undefined, {
       kind: 'goal',
       goalId: 'goal-restart',
@@ -421,11 +448,12 @@ test('restart rejects an admitted Goal whose existing UserMessage lost its origi
   const fixture = await createFixture({ recoverAdmissions: false });
   try {
     const turnId = randomUUID();
+    const runId = randomUUID();
     const userMessageId = randomUUID();
     await fixture.stores.agentRunStore.admitRootTurn({
       sessionId: fixture.sessionId,
       turnId,
-      proposedRunId: randomUUID(),
+      proposedRunId: runId,
       proposedUserMessageId: userMessageId,
       execution: { kind: 'goal', goalId: 'goal-corrupt-origin' },
       previousRootTurnId: null,
@@ -433,12 +461,23 @@ test('restart rejects an admitted Goal whose existing UserMessage lost its origi
       sourceMessages: [],
       admittedAt: 1,
     });
-    await fixture.stores.sessionStore.appendMessage(fixture.sessionId, {
-      type: 'user',
+    const seeded = await seedInvocation(fixture.stores.runtimeEventStore, {
+      sessionId: fixture.sessionId,
+      turnId,
+      runId,
+      opening: { root: { kind: 'goal', goalId: 'goal-corrupt-origin' } },
+    });
+    await fixture.stores.runtimeEventStore.appendRuntimeEvent(fixture.sessionId, runId, {
       id: userMessageId,
+      sessionId: fixture.sessionId,
+      invocationId: seeded.invocationId,
+      runId,
       turnId,
       ts: 1,
-      text: 'Preserve durable Goal provenance',
+      partial: false,
+      role: 'user',
+      author: 'user',
+      content: { kind: 'text', text: 'Preserve durable Goal provenance' },
     });
 
     await assert.rejects(
@@ -467,15 +506,15 @@ test('restart rejects a Goal Run carrying delegated execution lineage', async ()
       sourceMessages: [],
       admittedAt: 1,
     });
-    await fixture.stores.agentRunStore.createRun(
-      runHeader({
-        sessionId: fixture.sessionId,
-        turnId,
-        runId,
-        goalId,
-        parentRunId: 'foreign-parent-run',
-      }),
-    );
+    await seedInvocation(fixture.stores.runtimeEventStore, {
+      sessionId: fixture.sessionId,
+      turnId,
+      runId,
+      opening: {
+        root: { kind: 'goal', goalId },
+        lineage: { parentRunId: 'foreign-parent-run' },
+      },
+    });
 
     await assert.rejects(
       () => fixture.coordinator.prepareRecovery(),
@@ -490,10 +529,12 @@ interface Fixture {
   readonly owner: InteractiveRootOwner;
   readonly base: string;
   readonly stores: InteractiveExecutionStoresWriter;
+  readonly goalStore: InteractiveGoalAuthorityWriter;
   readonly sessionId: string;
   readonly rootAdmissions: RootAdmissionOwner;
   readonly coordinator: RootTurnCoordinator;
   readonly goal: HostGoalCoordinator;
+  readonly goalExecutions: HostGoalExecutionCoordinator;
   readonly manager: SessionManager;
   readonly messages: HostMessageCoordinator;
   readonly sessionAdmission: SessionAdmissionGate;
@@ -512,9 +553,10 @@ async function createFixture(options: { recoverAdmissions?: boolean } = {}): Pro
   assert.ok(owner);
   if (!owner) throw new Error('Unable to acquire test root');
   const stores = await openInteractiveExecutionStoresForWrite(owner.lease);
+  const goalStore = await openInteractiveGoalAuthorityForWrite(owner.lease);
   const session = await stores.sessionStore.create({
     cwd: capability.canonicalPath,
-    backend: 'fake',
+    llmConnectionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
     llmConnectionSlug: 'fake',
     model: 'fake-model',
     permissionMode: 'ask',
@@ -530,28 +572,29 @@ async function createFixture(options: { recoverAdmissions?: boolean } = {}): Pro
   let requestedDrain = false;
   const goalChangeListeners = new Set<() => void>();
   const rootPort: HostMessageRootPort = {
+    readLatestRootTurnLineage: async (identity) => identity,
     readSessionHeader: (sessionId) => requireCoordinator(coordinator).readSessionHeader(sessionId),
     readRootState: (sessionId) => requireCoordinator(coordinator).readRootState(sessionId),
     claimStopFence: (input, commitQueueFence, lease) =>
       requireCoordinator(coordinator).claimStopFence(input, commitQueueFence, lease),
-    startFromMessage: (input, lease) =>
-      requireCoordinator(coordinator).startFromMessage(input, lease),
+    startFromMessage: (input, lease, commitAdmission) =>
+      requireCoordinator(coordinator).startFromMessage(input, lease, commitAdmission),
     prepareMessage: (input) => requireCoordinator(coordinator).prepareMessage(input),
     claimStop: (input, commitQueueFence, lease) =>
       requireCoordinator(coordinator).claimStop(input, commitQueueFence, lease),
   };
   const hostEpoch = 'goal-root-epoch';
-  await stores.messageReceiptStore.beginHostEpoch(hostEpoch);
   const messages = new HostMessageCoordinator({
     hostEpoch,
     root: rootPort,
     durableProof: {
+      readLogicalExecution: async () => undefined,
       readRootTurnSourceMessageReceipt: (sessionId, messageId) =>
         stores.agentRunStore.readRootTurnSourceMessageReceipt(sessionId, messageId),
       readImmutableSteeringMessageProof: (sessionId, messageId) =>
         stores.runtimeEventStore.readImmutableSteeringMessageProof(sessionId, messageId),
     },
-    receipts: stores.messageReceiptStore,
+    admissions: stores.sessionStore,
     sessionAdmission: admission,
     acquireResidency,
     requestDrain: () => {
@@ -592,10 +635,11 @@ async function createFixture(options: { recoverAdmissions?: boolean } = {}): Pro
     onSandboxBoundarySettled: async () => {},
   });
   const backends = new BackendRegistry();
-  backends.register('fake', (context) => new FakeBackend(context));
+  backends.register('ai-sdk', (context) => new FakeBackend(context));
   const authority: RuntimeHostedRootAuthority = {
     bindRun: (identity) => messages.bindRun(identity),
-    executeRoot: (input) => requireCoordinator(coordinator).executeRoot(input),
+    executeRoot: (input) =>
+      executeHostedExecutionToSettlement(requireCoordinator(coordinator), input),
     stopRoot: (identity, input) => requireCoordinator(coordinator).stopRoot(identity, input),
     stopSession: (sessionId, input) =>
       requireCoordinator(coordinator).stopSession(sessionId, input),
@@ -629,8 +673,18 @@ async function createFixture(options: { recoverAdmissions?: boolean } = {}): Pro
     () => requireGoal(goal),
   );
   const rootCoordinator = coordinator;
+  const goalExecutions = new HostGoalExecutionCoordinator({
+    executions: rootCoordinator,
+    runtime: manager,
+    matchesActive: (sessionId, checkpoint, controlLease) =>
+      requireGoal(goal).matchesActive(sessionId, checkpoint, controlLease),
+    newId: randomUUID,
+  });
   goal = new HostGoalCoordinator({
+    store: goalStore,
     stores,
+    readSessionMessages: (sessionId) => manager.getMessages(sessionId),
+    executions: rootCoordinator,
     sessionAdmission: admission,
     evaluator: {
       evaluate: async () =>
@@ -638,24 +692,29 @@ async function createFixture(options: { recoverAdmissions?: boolean } = {}): Pro
       close: async () => {},
     },
     admitTurn: (sessionId, text, checkpoint, controlLease) =>
-      rootCoordinator.admitGoalTurn(sessionId, checkpoint, controlLease, text),
-    listActionableTaskKeys: async () => [],
+      goalExecutions.admitTurn(sessionId, text, checkpoint, controlLease),
     acquireResidency,
     onProjectionChanged: (sessionId) => {
       requireContinuity(continuity).enqueueCanonicalRefresh(sessionId);
       for (const listener of goalChangeListeners) listener();
     },
+    requestDrain: () => {
+      requestedDrain = true;
+    },
   });
+  await goal.prepareRecovery();
   const goalCoordinator = goal;
 
   return {
     owner,
     base,
     stores,
+    goalStore,
     sessionId: session.id,
     rootAdmissions,
     coordinator: rootCoordinator,
     goal: goalCoordinator,
+    goalExecutions,
     manager,
     messages,
     sessionAdmission: admission,
@@ -678,6 +737,7 @@ async function createFixture(options: { recoverAdmissions?: boolean } = {}): Pro
         check();
       }),
     async close() {
+      goalExecutions.beginDrain();
       goalCoordinator.beginDrain();
       rootCoordinator.beginDrain();
       await goalCoordinator.close();
@@ -685,28 +745,29 @@ async function createFixture(options: { recoverAdmissions?: boolean } = {}): Pro
       await messages.close();
       await interactions.close();
       continuity?.close();
+      await goalStore.close();
       await stores.sessionStore.close?.();
       await owner.close();
       await rm(base, { recursive: true, force: true });
     },
   };
 }
-
-function deferred(): { promise: Promise<void>; resolve(): void } {
-  let resolve!: () => void;
-  const promise = new Promise<void>((next) => {
-    resolve = next;
-  });
-  return { promise, resolve };
+async function readInvocation(
+  fixture: Fixture,
+  runId: string,
+): Promise<RuntimeInvocationRecord | undefined> {
+  return (await fixture.stores.runtimeEventStore.listSessionInvocations(fixture.sessionId)).find(
+    (candidate) => candidate.runId === runId,
+  );
 }
 
-async function waitForGoalRun(
-  fixture: Fixture,
-  goalId: string,
-): Promise<Awaited<ReturnType<Fixture['stores']['agentRunStore']['readRun']>>> {
+async function waitForGoalRun(fixture: Fixture, goalId: string): Promise<RuntimeInvocationRecord> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const run = (await fixture.stores.agentRunStore.listSessionRuns(fixture.sessionId)).find(
-      (candidate) => candidate.goalId === goalId,
+    const run = (
+      await fixture.stores.runtimeEventStore.listSessionInvocations(fixture.sessionId)
+    ).find(
+      (candidate) =>
+        candidate.opening.root.kind === 'goal' && candidate.opening.root.goalId === goalId,
     );
     if (run) return run;
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -714,29 +775,10 @@ async function waitForGoalRun(
   throw new Error('Goal continuation did not reach the root authority');
 }
 
-function runHeader(overrides: Partial<AgentRunHeader>): AgentRunHeader {
-  return {
-    runId: 'run-1',
-    invocationId: 'run-1',
-    sessionId: 'session-1',
-    turnId: 'turn-1',
-    status: 'created',
-    backendKind: 'fake',
-    llmConnectionSlug: 'fake',
-    modelId: 'fake-model',
-    cwd: '/workspace',
-    permissionMode: 'ask',
-    createdAt: 1,
-    updatedAt: 1,
-    ...overrides,
-  };
-}
-
 function operationContext() {
   return {
     hostEpoch: 'goal-root-epoch',
     connectionId: 'connection-1',
-    surface: 'tui' as const,
     principal: 'local_os_user' as const,
     acquireResidency: () => ({ release() {} }),
   };

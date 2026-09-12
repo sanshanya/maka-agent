@@ -1,13 +1,32 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { createHash } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { join } from "node:path";
-import type { ipcMain as electronIpcMain } from "electron";
 import type {
   LocalMemoryBackupInfo,
   LocalMemoryEntryPreview,
+  LocalMemoryOperationCode,
   LocalMemoryState,
-} from "@maka/core";
-import { isPathInside } from "@maka/runtime";
+} from '@maka/core/local-memory';
+import { isPathInside } from '@maka/runtime/path-containment';
 import {
   MEMORY_DOCUMENT_CHUNK_MAX_BYTES,
   type MemoryBackupKind,
@@ -16,11 +35,30 @@ import {
   type MemoryEntriesView,
   type MemoryMutateInput,
   type MemoryMutateResult,
+  type MemoryMutationRejectionReason,
   type MemoryRevision,
   type MemoryStateProjection,
 } from "@maka/runtime-host/protocol";
-import type { LocalMemoryMutationResult } from "./local-memory-service.js";
 import type { DesktopRuntimeHostClient } from "./runtime-host-client.js";
+import {
+  handleReconnectableRead,
+  type ReconnectableReadIpcMain,
+} from "./ipc-reconnect-policy.js";
+
+type LocalMemoryResultCode = LocalMemoryOperationCode | MemoryMutationRejectionReason;
+
+type LocalMemoryMutationResult =
+  | {
+      readonly ok: true;
+      readonly state: LocalMemoryState;
+      readonly entry?: LocalMemoryEntryPreview;
+      readonly proposal?: LocalMemoryEntryPreview;
+    }
+  | {
+      readonly ok: false;
+      readonly state: LocalMemoryState;
+      readonly code: LocalMemoryResultCode;
+    };
 
 const MAX_REVISION_ATTEMPTS = 3;
 const MEMORY_DIRECTORY = "memory";
@@ -32,115 +70,18 @@ const BACKUP_FILES: Readonly<Record<MemoryBackupKind, string>> = {
 };
 
 interface RuntimeHostMemoryIpcDeps {
-  readonly ipcMain: Pick<typeof electronIpcMain, "handle">;
+  readonly ipcMain: ReconnectableReadIpcMain;
   readonly client: DesktopRuntimeHostClient;
   readonly workspaceRoot: string;
+  readonly allowLocalPaths?: boolean;
   readonly openPath: (path: string) => Promise<string>;
 }
 
 export function registerRuntimeHostMemoryIpc(
   deps: RuntimeHostMemoryIpcDeps,
 ): void {
-  deps.ipcMain.handle("memory:getState", () => getMemoryState(deps));
-  deps.ipcMain.handle("memory:listProposals", () =>
-    listMemoryEntries(deps.client, "proposals"),
-  );
-  deps.ipcMain.handle("memory:propose", async (_event, input: unknown) => {
-    const value = normalizeMemoryTextInput(input);
-    if (!value) return invalidMutation(deps, "Invalid Memory proposal input");
-    const result = await mutateMemory(deps, (expectedRevision) => ({
-      kind: "propose",
-      expectedRevision,
-      title: value.title,
-      content: value.content,
-      scope: memoryScope(value.scope, value.sessionId),
-    }));
-    if (!result.ok) return result;
-    const proposals = await listMemoryEntries(deps.client, "proposals");
-    return {
-      ...result,
-      proposal: newestMatchingEntry(proposals, value.title, value.content),
-    };
-  });
-  deps.ipcMain.handle("memory:remember", async (_event, input: unknown) => {
-    const value = normalizeMemoryTextInput(input);
-    if (!value) return invalidMutation(deps, "Invalid Memory input");
-    const result = await mutateMemory(deps, (expectedRevision) => ({
-      kind: "remember",
-      expectedRevision,
-      title: value.title,
-      content: value.content,
-      scope: memoryScope(value.scope, value.sessionId),
-    }));
-    if (!result.ok) return result;
-    return {
-      ...result,
-      entry: newestMatchingEntry(
-        result.state.activeEntries,
-        value.title,
-        value.content,
-      ),
-    };
-  });
-  deps.ipcMain.handle(
-    "memory:approveProposal",
-    async (_event, proposalId: unknown) => {
-      if (!isEntityId(proposalId))
-        return invalidMutation(deps, "Invalid Memory proposal id");
-      const result = await mutateMemory(deps, (expectedRevision) => ({
-        kind: "approve",
-        expectedRevision,
-        proposalId,
-      }));
-      if (!result.ok) return result;
-      return {
-        ...result,
-        entry: result.state.activeEntries.find(
-          (entry) => entry.proposalId === proposalId,
-        ),
-      };
-    },
-  );
-  deps.ipcMain.handle(
-    "memory:rejectProposal",
-    async (_event, proposalId: unknown) => {
-      if (!isEntityId(proposalId))
-        return invalidMutation(deps, "Invalid Memory proposal id");
-      return mutateMemory(deps, (expectedRevision) => ({
-        kind: "reject",
-        expectedRevision,
-        proposalId,
-      }));
-    },
-  );
-  deps.ipcMain.handle(
-    "memory:archiveEntry",
-    async (_event, entryId: unknown, reason: unknown) => {
-      if (!isEntityId(entryId))
-        return invalidMutation(deps, "Invalid Memory entry id");
-      return mutateMemory(deps, (expectedRevision) => ({
-        kind: "set_status",
-        expectedRevision,
-        entryId,
-        status: "archived",
-        ...(typeof reason === "string" && reason.length > 0
-          ? { archiveReason: reason }
-          : {}),
-      }));
-    },
-  );
-  deps.ipcMain.handle(
-    "memory:restoreEntry",
-    async (_event, entryId: unknown) => {
-      if (!isEntityId(entryId))
-        return invalidMutation(deps, "Invalid Memory entry id");
-      return mutateMemory(deps, (expectedRevision) => ({
-        kind: "set_status",
-        expectedRevision,
-        entryId,
-        status: "active",
-      }));
-    },
+  handleReconnectableRead(deps.ipcMain, "memory:getState", () =>
+    getMemoryState(deps),
   );
   deps.ipcMain.handle("memory:save", async (_event, content: unknown) => {
     if (typeof content !== "string") return getMemoryState(deps);
@@ -161,7 +102,7 @@ export function registerRuntimeHostMemoryIpc(
       return {
         ok: false as const,
         state,
-        message: "No Memory backup is available",
+        code: "no_backup",
       };
     return restoreBackup(deps, backup.kind);
   });
@@ -170,7 +111,7 @@ export function registerRuntimeHostMemoryIpc(
       return {
         ok: false as const,
         state: await getMemoryState(deps),
-        message: "Invalid Memory backup kind",
+        code: "invalid_backup_kind",
       };
     }
     return restoreBackup(deps, kind);
@@ -202,12 +143,18 @@ export function registerRuntimeHostMemoryIpc(
           deps,
           BACKUP_FILES[state.latestBackup.kind],
         )
-      : { ok: false as const, message: "No Memory backup is available" };
+      : {
+          ok: false as const,
+          code: "no_backup",
+        };
   });
   deps.ipcMain.handle("memory:openBackup", async (_event, kind: unknown) => {
     return isBackupKind(kind)
       ? openMemoryPath(deps, BACKUP_FILES[kind])
-      : { ok: false as const, message: "Invalid Memory backup kind" };
+      : {
+          ok: false as const,
+          code: "invalid_backup_kind",
+        };
   });
 }
 
@@ -215,7 +162,9 @@ async function getMemoryState(
   deps: RuntimeHostMemoryIpcDeps,
 ): Promise<LocalMemoryState> {
   const policy = await deps.client.queryRuntimePolicy();
-  const path = join(deps.workspaceRoot, MEMORY_DIRECTORY, MEMORY_FILE);
+  const path = deps.allowLocalPaths !== false
+    ? join(deps.workspaceRoot, MEMORY_DIRECTORY, MEMORY_FILE)
+    : "";
   for (let attempt = 0; attempt < MAX_REVISION_ATTEMPTS; attempt += 1) {
     const result = await deps.client.queryMemory({ kind: "state" });
     if (result.kind === "blocked") {
@@ -238,7 +187,7 @@ async function getMemoryState(
       });
     }
     const backups = result.backups
-      .map((backup) => projectBackup(deps.workspaceRoot, backup))
+      .map((backup) => projectBackup(deps, backup))
       .sort((left, right) => right.updatedAt - left.updatedAt);
     if (result.status === "missing") {
       return {
@@ -323,13 +272,6 @@ function emptyMemoryState(
     archivedEntries: [],
     backups: [],
   };
-}
-
-async function listMemoryEntries(
-  client: DesktopRuntimeHostClient,
-  view: MemoryEntriesView,
-): Promise<LocalMemoryEntryPreview[]> {
-  return (await readMemoryEntriesSnapshot(client, view)).entries;
 }
 
 async function readMemoryEntriesSnapshot(
@@ -546,14 +488,14 @@ async function restoreBackup(
   kind: MemoryBackupKind,
 ): Promise<
   | { ok: true; state: LocalMemoryState }
-  | { ok: false; state: LocalMemoryState; message: string }
+  | { ok: false; state: LocalMemoryState; code: LocalMemoryResultCode }
 > {
   const state = await deps.client.queryMemory({ kind: "state" });
   if (state.kind !== "state") {
     return {
       ok: false,
       state: await getMemoryState(deps),
-      message: "Memory is unavailable",
+      code: "memory_unavailable",
     };
   }
   const backup = state.backups.find((candidate) => candidate.kind === kind);
@@ -561,7 +503,7 @@ async function restoreBackup(
     return {
       ok: false,
       state: await getMemoryState(deps),
-      message: "Memory backup not found",
+      code: "backup_not_found",
     };
   }
   const result = await mutateMemory(deps, (expectedRevision) => ({
@@ -572,13 +514,22 @@ async function restoreBackup(
   }));
   return result.ok
     ? { ok: true, state: result.state }
-    : { ok: false, state: result.state, message: result.message };
+    : { ok: false, state: result.state, code: result.code };
 }
 
 async function openMemoryPath(
-  deps: Pick<RuntimeHostMemoryIpcDeps, "workspaceRoot" | "openPath">,
+  deps: Pick<
+    RuntimeHostMemoryIpcDeps,
+    "workspaceRoot" | "allowLocalPaths" | "openPath"
+  >,
   fileName: string,
-): Promise<{ ok: true } | { ok: false; message: string }> {
+): Promise<{ ok: true } | { ok: false; code: LocalMemoryResultCode }> {
+  if (deps.allowLocalPaths === false) {
+    return {
+      ok: false,
+      code: "remote_host_owned",
+    };
+  }
   try {
     const directory = await realpath(
       join(deps.workspaceRoot, MEMORY_DIRECTORY),
@@ -587,15 +538,18 @@ async function openMemoryPath(
     if (!isPathInside(directory, path) || !(await lstat(path)).isFile()) {
       return {
         ok: false,
-        message: "Memory path is not an allowed regular file",
+        code: "not_regular_file",
       };
     }
     const error = await deps.openPath(path);
     return error
-      ? { ok: false, message: "The system could not open the Memory file" }
+      ? {
+          ok: false,
+          code: "open_failed",
+        }
       : { ok: true };
   } catch {
-    return { ok: false, message: "Memory file not found" };
+    return { ok: false, code: "file_not_found" };
   }
 }
 
@@ -614,11 +568,17 @@ function projectMemoryEntry(
 }
 
 function projectBackup(
-  workspaceRoot: string,
+  deps: Pick<RuntimeHostMemoryIpcDeps, "workspaceRoot" | "allowLocalPaths">,
   backup: MemoryStateProjection["backups"][number],
 ): LocalMemoryBackupInfo {
   return {
-    path: join(workspaceRoot, MEMORY_DIRECTORY, BACKUP_FILES[backup.kind]),
+    path: deps.allowLocalPaths !== false
+      ? join(
+          deps.workspaceRoot,
+          MEMORY_DIRECTORY,
+          BACKUP_FILES[backup.kind],
+        )
+      : "",
     kind: backup.kind,
     updatedAt: backup.updatedAt,
     sizeBytes: backup.sizeBytes,
@@ -640,72 +600,18 @@ function compareMemoryEntries(
   );
 }
 
-function newestMatchingEntry(
-  entries: readonly LocalMemoryEntryPreview[],
-  title: string,
-  content: string,
-): LocalMemoryEntryPreview | undefined {
-  return entries.find(
-    (entry) => entry.title === title.trim() && entry.content === content.trim(),
-  );
-}
-
-function normalizeMemoryTextInput(input: unknown): {
-  readonly title: string;
-  readonly content: string;
-  readonly scope: "workspace" | "session";
-  readonly sessionId?: string;
-} | null {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
-  const record = input as Record<string, unknown>;
-  if (typeof record.title !== "string" || typeof record.content !== "string")
-    return null;
-  const scope = record.scope === "session" ? "session" : "workspace";
-  const sessionId = isEntityId(record.sessionId) ? record.sessionId : undefined;
-  if (scope === "session" && !sessionId) return null;
-  return {
-    title: record.title,
-    content: record.content,
-    scope,
-    ...(sessionId ? { sessionId } : {}),
-  };
-}
-
-function memoryScope(scope: "workspace" | "session", sessionId?: string) {
-  return scope === "session" && sessionId
-    ? ({ kind: "session", sessionId } as const)
-    : ({ kind: "workspace" } as const);
-}
-
-function isEntityId(value: unknown): value is string {
-  return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
-}
-
 function isBackupKind(value: unknown): value is MemoryBackupKind {
   return value === "save" || value === "reset" || value === "restore";
 }
 
-async function invalidMutation(
-  deps: RuntimeHostMemoryIpcDeps,
-  message: string,
-): Promise<LocalMemoryMutationResult> {
-  return {
-    ok: false,
-    state: await getMemoryState(deps),
-    reason: "invalid_input",
-    message,
-  };
-}
-
 async function mutationFailure(
   deps: RuntimeHostMemoryIpcDeps,
-  reason: string,
+  reason: LocalMemoryResultCode,
 ): Promise<LocalMemoryMutationResult> {
   return {
     ok: false,
     state: await getMemoryState(deps),
-    reason,
-    message: memoryReasonMessage(reason),
+    code: reason,
   };
 }
 

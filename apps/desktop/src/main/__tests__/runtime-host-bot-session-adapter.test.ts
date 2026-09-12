@@ -1,22 +1,42 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { RuntimeHostOperationError } from '@maka/runtime-host/client';
-import type {
-  SessionCatalogProjection,
-  SessionContinuitySnapshot,
-  SubscriptionFrame,
-  TurnSnapshot,
+import {
+  SESSION_CONTINUITY_SCHEMA_VERSION,
+  type SessionCatalogProjection,
+  type SessionContinuitySnapshot,
+  type SubscriptionFrame,
+  type TurnSnapshot,
 } from '@maka/runtime-host/protocol';
 import { BotSessionUnavailableError } from '../bot-session-adapter.js';
 import {
   createRuntimeHostBotSessionAdapter,
   type RuntimeHostBotSessionAdapterDeps,
 } from '../runtime-host-bot-session-adapter.js';
-import type { DesktopRuntimeHostSession } from '../runtime-host-client.js';
+import { runtimeHostSessionFixture } from './runtime-host-session-test-fixture.js';
 
 type BotClient = RuntimeHostBotSessionAdapterDeps['client'];
 
-test('creates an explore Session through the Host-owned default model route', async () => {
+test('creates a bot-mode Session through the Host-owned default model route', async () => {
   const creates: unknown[] = [];
   const changes: unknown[] = [];
   const client = botClient({
@@ -27,7 +47,9 @@ test('creates an explore Session through the Host-owned default model route', as
   });
   const adapter = createRuntimeHostBotSessionAdapter({
     client,
-    resolveCreateTarget: async () => ({ cwd: '/workspace', projectId: 'project-1' }),
+    resolveCreateTarget: async () => ({
+      workspace: { kind: 'project', projectId: 'project-1' },
+    }),
     emitSessionsChanged: (reason, sessionId, extra) =>
       changes.push({ reason, sessionId, extra }),
     newId: () => 'bot-session-1',
@@ -42,12 +64,11 @@ test('creates an explore Session through the Host-owned default model route', as
   assert.deepEqual(creates, [
     {
       sessionId: 'bot-session-1',
-      cwd: '/workspace',
-      projectId: 'project-1',
+      workspace: { kind: 'project', projectId: 'project-1' },
       name: 'Telegram conversation',
       labels: ['bot', 'telegram'],
       modelTarget: { kind: 'default' },
-      permissionMode: 'explore',
+      mode: 'bot',
     },
   ]);
   assert.deepEqual(changes, [
@@ -66,7 +87,7 @@ test('prepares a bound Session without exposing Host configuration revisions to 
   });
   const adapter = createRuntimeHostBotSessionAdapter({
     client,
-    resolveCreateTarget: async () => ({ cwd: '/workspace' }),
+    resolveCreateTarget: hostPathCreateTarget,
     emitSessionsChanged() {},
   });
 
@@ -77,11 +98,44 @@ test('prepares a bound Session without exposing Host configuration revisions to 
 
   const unavailable = createRuntimeHostBotSessionAdapter({
     client: botClient({ getSession: async () => null }),
-    resolveCreateTarget: async () => ({ cwd: '/workspace' }),
+    resolveCreateTarget: hostPathCreateTarget,
     emitSessionsChanged() {},
   });
   await assert.rejects(
     unavailable.prepareSession('removed-session'),
+    BotSessionUnavailableError,
+  );
+});
+
+test('rejects archived Sessions before and after a permission transition', async () => {
+  const initiallyArchived = createRuntimeHostBotSessionAdapter({
+    client: botClient({
+      getSession: async () =>
+        session('bot-session-1', { isArchived: true, status: 'active' }),
+    }),
+    resolveCreateTarget: hostPathCreateTarget,
+    emitSessionsChanged() {},
+  });
+  await assert.rejects(
+    initiallyArchived.prepareSession('bot-session-1'),
+    BotSessionUnavailableError,
+  );
+
+  const archivedDuringUpdate = createRuntimeHostBotSessionAdapter({
+    client: botClient({
+      getSession: async () => session('bot-session-1', { permissionMode: 'ask' }),
+      updateSessionConfiguration: async (sessionId) =>
+        session(sessionId, {
+          permissionMode: 'explore',
+          isArchived: true,
+          status: 'active',
+        }),
+    }),
+    resolveCreateTarget: hostPathCreateTarget,
+    emitSessionsChanged() {},
+  });
+  await assert.rejects(
+    archivedDuringUpdate.prepareSession('bot-session-1'),
     BotSessionUnavailableError,
   );
 });
@@ -98,7 +152,7 @@ test('reconciles an uncertain Host Session create with its stable Session identi
       },
       getSession: async (sessionId) => session(sessionId, { permissionMode: 'explore' }),
     }),
-    resolveCreateTarget: async () => ({ cwd: '/workspace' }),
+    resolveCreateTarget: hostPathCreateTarget,
     emitSessionsChanged() {},
     newId: () => 'stable-session-id',
   });
@@ -112,16 +166,18 @@ test('reconciles an uncertain Host Session create with its stable Session identi
 test('subscribes before Turn start and settles a fast Host reply without losing text', async () => {
   const events = new AsyncFrameQueue();
   const changes: unknown[] = [];
+  const replySnapshots: string[] = [];
   let closeCount = 0;
-  const handle: DesktopRuntimeHostSession = {
+  const handle = runtimeHostSessionFixture({
     snapshot: continuitySnapshot(null),
+    activeAssistantStreams: [],
     transcript: Promise.resolve([]),
     events,
     async close() {
       closeCount += 1;
       events.end();
     },
-  };
+  });
   const client = botClient({
     openSession: async () => handle,
     startTurn: async (input) => {
@@ -129,19 +185,21 @@ test('subscribes before Turn start and settles a fast Host reply without losing 
       events.push(projectionFrame(1, runningTurn(input.sessionId, input.turnId)));
       events.push(deltaFrame(2, input.sessionId, input.turnId, 0, 'Hello'));
       events.push(deltaFrame(3, input.sessionId, input.turnId, 3, 'lo world'));
+      events.push(deltaFrame(4, input.sessionId, input.turnId, 0, 'Hello world'));
+      events.push(deltaFrame(5, input.sessionId, input.turnId, 0, 'Corrected reply', true));
       events.push(
-        projectionFrame(4, {
+        projectionFrame(6, {
           ...runningTurn(input.sessionId, input.turnId),
           status: 'completed',
           terminalEventId: 'terminal-1',
         }),
       );
-      return runningTurn(input.sessionId, input.turnId);
+      return startedTurn(runningTurn(input.sessionId, input.turnId));
     },
   });
   const adapter = createRuntimeHostBotSessionAdapter({
     client,
-    resolveCreateTarget: async () => ({ cwd: '/workspace' }),
+    resolveCreateTarget: hostPathCreateTarget,
     emitSessionsChanged: (reason, sessionId, extra) =>
       changes.push({ reason, sessionId, extra }),
   });
@@ -150,9 +208,11 @@ test('subscribes before Turn start and settles a fast Host reply without losing 
     sessionId: 'bot-session-1',
     turnId: 'turn-1',
     text: 'hello',
+    onReplySnapshot: (text) => replySnapshots.push(text),
   });
 
-  assert.deepEqual(result, { kind: 'completed', text: 'Hello world' });
+  assert.deepEqual(result, { kind: 'completed', text: 'Corrected reply' });
+  assert.deepEqual(replySnapshots, ['Hello', 'Hello world', 'Corrected reply']);
   assert.equal(closeCount, 1);
   assert.deepEqual(changes, [
     {
@@ -161,6 +221,130 @@ test('subscribes before Turn start and settles a fast Host reply without losing 
       extra: { turnId: 'turn-1' },
     },
   ]);
+});
+
+test('accepts an empty reset delta as the authoritative Bot reply', async () => {
+  const events = new AsyncFrameQueue();
+  const replySnapshots: string[] = [];
+  const adapter = createRuntimeHostBotSessionAdapter({
+    client: botClient({
+      openSession: async () => runtimeHostSessionFixture({
+        snapshot: continuitySnapshot(null),
+        activeAssistantStreams: [],
+        transcript: Promise.resolve([]),
+        events,
+        async close() {
+          events.end();
+        },
+      }),
+      startTurn: async (input) => {
+        events.push(deltaFrame(1, input.sessionId, input.turnId, 0, 'Provisional reply'));
+        events.push(deltaFrame(2, input.sessionId, input.turnId, 0, '', true));
+        events.push(
+          projectionFrame(3, {
+            ...runningTurn(input.sessionId, input.turnId),
+            status: 'completed',
+            terminalEventId: 'terminal-1',
+          }),
+        );
+        return startedTurn(runningTurn(input.sessionId, input.turnId));
+      },
+    }),
+    resolveCreateTarget: hostPathCreateTarget,
+    emitSessionsChanged() {},
+  });
+
+  assert.deepEqual(
+    await adapter.runTurn({
+      sessionId: 'bot-session-1',
+      turnId: 'turn-1',
+      text: 'hello',
+      onReplySnapshot: (text) => replySnapshots.push(text),
+    }),
+    { kind: 'completed', text: '' },
+  );
+  assert.deepEqual(replySnapshots, ['Provisional reply', '']);
+});
+
+test('reply snapshot observers cannot interrupt the authoritative Host Turn', async () => {
+  const events = new AsyncFrameQueue();
+  const adapter = createRuntimeHostBotSessionAdapter({
+    client: botClient({
+      openSession: async () => runtimeHostSessionFixture({
+        snapshot: continuitySnapshot(null),
+        activeAssistantStreams: [],
+        transcript: Promise.resolve([]),
+        events,
+        async close() {
+          events.end();
+        },
+      }),
+      startTurn: async (input) => {
+        events.push(deltaFrame(1, input.sessionId, input.turnId, 0, 'Reply'));
+        events.push(
+          projectionFrame(2, {
+            ...runningTurn(input.sessionId, input.turnId),
+            status: 'completed',
+            terminalEventId: 'terminal-1',
+          }),
+        );
+        return startedTurn(runningTurn(input.sessionId, input.turnId));
+      },
+    }),
+    resolveCreateTarget: hostPathCreateTarget,
+    emitSessionsChanged() {},
+  });
+
+  assert.deepEqual(
+    await adapter.runTurn({
+      sessionId: 'bot-session-1',
+      turnId: 'turn-1',
+      text: 'hello',
+      onReplySnapshot() {
+        throw new Error('delivery failed');
+      },
+    }),
+    { kind: 'completed', text: 'Reply' },
+  );
+});
+
+test('returns blocked Skill feedback without waiting for a Turn that was not created', async () => {
+  const events = new AsyncFrameQueue();
+  let closeCount = 0;
+  const adapter = createRuntimeHostBotSessionAdapter({
+    client: botClient({
+      openSession: async () => runtimeHostSessionFixture({
+        snapshot: continuitySnapshot(null),
+        activeAssistantStreams: [],
+        transcript: Promise.resolve([]),
+        events,
+        async close() {
+          closeCount += 1;
+          events.end();
+        },
+      }),
+      startTurn: async () => ({
+        kind: 'blocked',
+        skillInvocation: {
+          loaded: [],
+          failed: [{ request: 'writer', reason: 'not_found' }],
+          receipts: [],
+        },
+      }),
+    }),
+    resolveCreateTarget: hostPathCreateTarget,
+    emitSessionsChanged() {},
+  });
+
+  assert.deepEqual(
+    await adapter.runTurn({
+      sessionId: 'bot-session-1',
+      turnId: 'turn-blocked',
+      text: '/skill:writer help',
+    }),
+    { kind: 'errored', reason: 'writer: not_found' },
+  );
+  assert.equal(closeCount, 1);
 });
 
 test('projects Host interaction and failure outcomes into the Bot reply contract', async () => {
@@ -183,8 +367,9 @@ async function runProjectedTurn(rootTurn: TurnSnapshot) {
   const events = new AsyncFrameQueue();
   const adapter = createRuntimeHostBotSessionAdapter({
     client: botClient({
-      openSession: async () => ({
+      openSession: async () => runtimeHostSessionFixture({
         snapshot: continuitySnapshot(null),
+        activeAssistantStreams: [],
         transcript: Promise.resolve([]),
         events,
         async close() {
@@ -193,10 +378,10 @@ async function runProjectedTurn(rootTurn: TurnSnapshot) {
       }),
       startTurn: async () => {
         events.push(projectionFrame(1, rootTurn));
-        return runningTurn(rootTurn.sessionId, rootTurn.turnId);
+        return startedTurn(runningTurn(rootTurn.sessionId, rootTurn.turnId));
       },
     }),
-    resolveCreateTarget: async () => ({ cwd: '/workspace' }),
+    resolveCreateTarget: hostPathCreateTarget,
     emitSessionsChanged() {},
   });
   return adapter.runTurn({
@@ -227,9 +412,12 @@ function session(
   return {
     id,
     revision: 1,
-    cwd: '/workspace',
+    workspace: {
+      target: { kind: 'host_path', path: '/workspace' },
+      hostCwd: '/workspace',
+    },
     createdAt: 1,
-    lastUsedAt: 1,
+    activityAt: 1,
     name: id,
     isFlagged: false,
     isArchived: false,
@@ -238,6 +426,7 @@ function session(
     hasUnread: false,
     status: 'active',
     backend: 'ai-sdk',
+    llmConnectionId: 'connection-1',
     llmConnectionSlug: 'test-connection',
     connectionLocked: false,
     model: 'test-model',
@@ -248,19 +437,30 @@ function session(
   };
 }
 
+async function hostPathCreateTarget() {
+  return { workspace: { kind: 'host_path' as const, path: '/workspace' } };
+}
+
 function runningTurn(sessionId: string, turnId: string): TurnSnapshot {
   return { sessionId, turnId, runId: 'run-1', status: 'running' };
 }
 
+function startedTurn(turn: TurnSnapshot) {
+  return {
+    kind: 'started' as const,
+    turn,
+    skillInvocation: { loaded: [], failed: [], receipts: [] },
+  };
+}
+
 function continuitySnapshot(rootTurn: TurnSnapshot | null): SessionContinuitySnapshot {
   return {
-    schemaVersion: 3,
+    schemaVersion: SESSION_CONTINUITY_SCHEMA_VERSION,
     session: {
       sessionId: 'bot-session-1',
       metadataRevision: 1,
       status: rootTurn ? 'running' : 'active',
       createdAt: 1,
-      lastUsedAt: 1,
       isArchived: false,
     },
     projectionRevision: 1,
@@ -287,6 +487,7 @@ function deltaFrame(
   turnId: string,
   startOffset: number,
   text: string,
+  reset = false,
 ): SubscriptionFrame {
   return {
     kind: 'subscription.session_delta',
@@ -301,6 +502,7 @@ function deltaFrame(
       messageId: 'message-1',
       startOffset,
       text,
+      ...(reset ? { reset: true } : {}),
     },
   };
 }

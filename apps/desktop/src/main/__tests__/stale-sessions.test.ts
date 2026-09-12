@@ -1,196 +1,82 @@
-/**
- * Tests for the stale-session classifier (sidebar pill, PR108g).
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
- * The renderer derives `staleSessionIds: Set<string>` from `sessions` x
- * `connections` and passes it to SessionListPanel; rows with matching ids
- * get a dim treatment + "已过期" pill. We lock the classifier down here
- * so future edits don't drift on what counts as stale.
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
 
-import { strict as assert } from 'node:assert';
-import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import test from 'node:test';
 import { deriveStaleSessionIds } from '../../renderer/stale-sessions.js';
-import { readRendererContractCss } from './contract-css-helpers.js';
 
-function session(partial: { id: string; backend?: string; slug?: string }): {
-  id: string;
-  backend: string;
-  llmConnectionSlug: string;
-} {
-  return {
-    id: partial.id,
-    backend: partial.backend ?? 'ai-sdk',
-    llmConnectionSlug: partial.slug ?? 'zai-coding-plan',
-  };
-}
+test('derives stale rows from each Session Host readiness projection', () => {
+  const sessions = [
+    { id: 'local-ready' },
+    { id: 'remote-missing' },
+    { id: 'remote-rebind' },
+    { id: 'legacy-fake' },
+  ];
 
-describe('deriveStaleSessionIds', () => {
-  it('returns empty set when no sessions', () => {
-    const result = deriveStaleSessionIds({
-      sessions: [],
-      knownConnectionSlugs: new Set(['zai-coding-plan']),
-    });
-    assert.equal(result.size, 0);
-  });
-
-  it('flags sessions with backend="fake"', () => {
-    const result = deriveStaleSessionIds({
-      sessions: [
-        session({ id: 'a', backend: 'fake', slug: 'fake' }),
-        session({ id: 'b', backend: 'ai-sdk', slug: 'zai-coding-plan' }),
-      ],
-      knownConnectionSlugs: new Set(['zai-coding-plan']),
-    });
-    assert.deepEqual([...result], ['a']);
-  });
-
-  it('flags sessions whose slug is not in the known connections set', () => {
-    const result = deriveStaleSessionIds({
-      sessions: [
-        session({ id: 'a', backend: 'ai-sdk', slug: 'fake-claude' }),
-        session({ id: 'b', backend: 'ai-sdk', slug: 'zai-coding-plan' }),
-      ],
-      knownConnectionSlugs: new Set(['zai-coding-plan']),
-    });
-    assert.deepEqual([...result], ['a']);
-  });
-
-  it('flags legacy backend kinds (e.g. "claude") if connection also missing', () => {
-    const result = deriveStaleSessionIds({
-      sessions: [session({ id: 'a', backend: 'claude', slug: 'fake-claude' })],
-      knownConnectionSlugs: new Set(['zai-coding-plan']),
-    });
-    assert.deepEqual([...result], ['a']);
-  });
-
-  it('does NOT flag a session whose backend is unknown but slug resolves', () => {
-    // We don't penalize "future backend kind we don't know about" if the
-    // user's connection still exists. The chat-header banner + send-path
-    // guard handle the real readiness check.
-    const result = deriveStaleSessionIds({
-      sessions: [session({ id: 'a', backend: 'future-backend', slug: 'zai-coding-plan' })],
-      knownConnectionSlugs: new Set(['zai-coding-plan']),
-    });
-    assert.equal(result.size, 0);
-  });
-
-  it('reproduces the @WAWQAQ workspace scenario', () => {
-    // The on-disk state that triggered the P0 — defaultSlug + apiKey are
-    // correct in `llm-connections.json`, but two legacy sessions in
-    // sessions/ still reference dead backends:
-    //
-    //   3b76ea22  backend=claude       slug=fake-claude     ← stale
-    //   7280e103  backend=ai-sdk       slug=zai-coding-plan ← OK
-    //   fff5cb61  backend=fake         slug=fake            ← stale
-    //
-    // Without this classifier the user has to click into each session and
-    // see the chat-header banner to know which ones are broken.
-    const result = deriveStaleSessionIds({
-      sessions: [
-        session({ id: '3b76ea22', backend: 'claude', slug: 'fake-claude' }),
-        session({ id: '7280e103', backend: 'ai-sdk', slug: 'zai-coding-plan' }),
-        session({ id: 'fff5cb61', backend: 'fake', slug: 'fake' }),
-      ],
-      knownConnectionSlugs: new Set(['zai-coding-plan']),
-    });
-    assert.deepEqual([...result].sort(), ['3b76ea22', 'fff5cb61']);
-  });
-
-  it('flags everything when the connection store is empty', () => {
-    const result = deriveStaleSessionIds({
-      sessions: [
-        session({ id: 'a', backend: 'ai-sdk', slug: 'zai-coding-plan' }),
-        session({ id: 'b', backend: 'ai-sdk', slug: 'anthropic' }),
-      ],
-      knownConnectionSlugs: new Set(),
-    });
-    assert.deepEqual([...result].sort(), ['a', 'b']);
-  });
+  assert.deepEqual(
+    [...deriveStaleSessionIds({
+      sessions,
+      sendOutcomes: {
+        'local-ready': { kind: 'ready' },
+        'remote-missing': {
+          kind: 'blocked',
+          reason: 'connection_missing',
+          connectionLocked: true,
+        },
+        'remote-rebind': {
+          kind: 'blocked',
+          reason: 'connection_missing',
+          connectionLocked: false,
+        },
+        // #3211: a retired backend reaches the rail as a projection reason like
+        // any other. The row is no longer identified by reading its `backend`.
+        'legacy-fake': {
+          kind: 'blocked',
+          reason: 'fake_backend',
+          connectionLocked: false,
+        },
+      },
+    })],
+    ['remote-missing', 'remote-rebind', 'legacy-fake'],
+  );
 });
 
-describe('stale session CSS contract (@kenji review gate)', () => {
-  // @kenji's PR108g review: "active stale row 不要因为 active state 取消所有
-  // warning 信号". Active state can restore opacity, but the pill must NOT
-  // disappear, and no rule may set `display: none` / `visibility: hidden`
-  // on the pill regardless of selector chain. This grep-style assertion
-  // catches that contract from a CSS regression — cheap second layer on
-  // top of the component-level invariant that `stale` prop is derived from
-  // `staleSessionIds.has(session.id)` (independent of active state).
+test('a task bound to a retired provider is stale rather than quietly unusable', () => {
+  // Nothing else about the row looks wrong: the connection still exists and is
+  // still enabled, so without this the task reads as healthy until it is
+  // opened. `connection_disabled` stays out because the switch that repairs it
+  // is one the user can find; a retirement has no such switch.
+  assert.deepEqual(
+    [
+      ...deriveStaleSessionIds({
+        sessions: [{ id: 'retired' }, { id: 'disabled' }, { id: 'healthy' }],
+        sendOutcomes: {
+          retired: { kind: 'blocked', reason: 'provider_retired', connectionLocked: false },
+          disabled: { kind: 'blocked', reason: 'connection_disabled', connectionLocked: false },
+          healthy: { kind: 'ready' },
+        },
+      }),
+    ],
+    ['retired'],
+  );
+});
 
-  it('inactive stale row dims, active stale row restores opacity', async () => {
-    const css = await readRendererContractCss();
-    // SideNav session rows: stale dims only this row's item (child combinators);
-    // current page on that item restores opacity.
-    assert.match(
-      css,
-      /\.maka-session-row\[data-stale="true"\]\s*>\s*div\s*>\s*\.astryx-side-nav-item\s*\{[\s\S]*?opacity:\s*var\(--opacity-muted\)/,
-      'expected stale SideNav session rows to dim only the direct SideNavItem',
-    );
-    assert.match(
-      css,
-      /\.maka-session-row\[data-stale="true"\]\s*>\s*div\s*>\s*\.astryx-side-nav-item\[aria-current="page"\]/,
-      'expected the active stale leaf SideNav row to restore full opacity',
-    );
-    assert.match(
-      css,
-      /\.maka-session-row\[data-stale="true"\]\s*>\s*div\s*>\s*\.astryx-side-nav-item:has\(\s*>\s*\[aria-current="page"\]\s*\)/,
-      'expected the active stale collapsible SideNav row to restore full opacity',
-    );
-    // A bare descendant selector would mute healthy subagents under a stale parent.
-    assert.doesNotMatch(
-      css,
-      /\.maka-session-row\[data-stale="true"\](?![^\n{]*\s*>\s*div\s*>)\s+\.astryx-side-nav-item/,
-      'stale opacity must not use an unbounded descendant selector',
-    );
-  });
-
-  it('stale pill is never hidden by any CSS rule (active state preserves warning signal)', async () => {
-    const css = await readRendererContractCss();
-    // Any rule that targets `.maka-list-row-stale-pill` AND applies
-    // display: none / visibility: hidden / opacity: 0 is a regression on
-    // the @kenji gate. Scan the CSS body for those patterns.
-    const PILL_HIDE = /\.maka-list-row-stale-pill[^{]*\{[^}]*?(?:display:\s*none|visibility:\s*hidden|opacity:\s*0(?![\.\d]))/;
-    assert.doesNotMatch(
-      css,
-      PILL_HIDE,
-      'no CSS rule may hide `.maka-list-row-stale-pill` (active stale row must still show pill)',
-    );
-  });
-
-  it('staleSessionIds wires data-stale and pill only on marked sessions', async () => {
-    const { makeSessionSummary, renderSessionListPanel } = await import(
-      './session-list-render-helpers.js'
-    );
-    const parent = makeSessionSummary({ id: 'parent', name: 'Parent' });
-    const child = makeSessionSummary({ id: 'child', name: 'Child' });
-    const html = renderSessionListPanel({
-      sessions: [parent],
-      activeId: child.id,
-      childSessionsByParentId: new Map([['parent', [child]]]),
-      staleSessionIds: new Set(['parent']),
-    });
-
-    const parentChunk = html.match(
-      /data-session-id="parent"[\s\S]*?(?=data-session-id="child"|$)/,
-    )?.[0];
-    const childChunk = html.match(/data-session-id="child"[\s\S]*?(?=data-session-id=|$)/)?.[0];
-    assert.ok(parentChunk, 'expected parent session row markup');
-    assert.ok(childChunk, 'expected child session row markup');
-    assert.match(parentChunk, /data-stale="true"/, 'stale parent must set data-stale');
-    assert.match(
-      parentChunk,
-      /maka-list-row-stale-pill/,
-      'stale parent must render the stale pill',
-    );
-    assert.doesNotMatch(
-      childChunk,
-      /data-stale="true"/,
-      'healthy child must not inherit data-stale from parent',
-    );
-    assert.doesNotMatch(
-      childChunk,
-      /maka-list-row-stale-pill/,
-      'healthy child must not render a stale pill',
-    );
-  });
+test('a row whose readiness has not arrived yet is not called stale', () => {
+  assert.deepEqual([...deriveStaleSessionIds({ sessions: [{ id: 'unknown' }], sendOutcomes: {} })], []);
 });

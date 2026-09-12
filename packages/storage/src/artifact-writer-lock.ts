@@ -1,10 +1,29 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /// <reference path="./fs-native-extensions.d.ts" />
 
 import { constants as fsConstants } from 'node:fs';
 import { lstat, mkdir, open, realpath, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { unlock, waitForLock } from 'fs-native-extensions';
-import { ARTIFACT_WRITER_LOCK_FILE } from './artifact-storage-layout.js';
+import { withArtifactWriterBootstrapLock } from './artifact-writer-bootstrap-lock.js';
 import {
   prepareArtifactWriterBootstrapAuthority,
   prepareArtifactWriterLockAuthorityForMarkedRoot,
@@ -21,7 +40,7 @@ export async function withArtifactWriterLock<T>(
   await mkdir(workspaceRoot, { recursive: true });
   const requestedCanonicalRoot = await realpath(workspaceRoot);
   const bootstrap = await prepareArtifactWriterBootstrapAuthority(requestedCanonicalRoot);
-  return withBootstrapArtifactWriterLock(bootstrap.lockPath, async () => {
+  return withArtifactWriterBootstrapLock(bootstrap.lockPath, async () => {
     await bootstrap.assertCurrentRoot();
     const authority = await prepareArtifactWriterLockAuthorityForMarkedRoot(
       bootstrap.canonicalPath,
@@ -38,16 +57,9 @@ export async function withLeaseBoundArtifactWriterLock<T>(
   authority: ArtifactWriterLockAuthority,
   operation: () => Promise<T>,
 ): Promise<T> {
-  return withBootstrapArtifactWriterLock(authority.bootstrapLockPath, () =>
+  return withArtifactWriterBootstrapLock(authority.bootstrapLockPath, () =>
     withAuthorityArtifactWriterLock(authority, operation),
   );
-}
-
-async function withBootstrapArtifactWriterLock<T>(
-  lockPath: string,
-  operation: () => Promise<T>,
-): Promise<T> {
-  return withArtifactWriterLockPath(lockPath, operation);
 }
 
 async function withAuthorityArtifactWriterLock<T>(
@@ -136,3 +148,4 @@ function releaseLock(handle: FileHandle): void {
     // Closing the handle is the final OS-level release path.
   }
 }
+export const ARTIFACT_WRITER_LOCK_FILE = '.maka-artifact-writer.lock';

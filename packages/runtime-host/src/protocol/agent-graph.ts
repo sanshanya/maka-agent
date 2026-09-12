@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import {
   requireCount,
   requireEncodedByteLimit,
@@ -15,6 +34,7 @@ export const AGENT_GRAPH_TERMINAL_CURSOR_MAX_BYTES = 2 * 1024;
 export const AGENT_GRAPH_MAX_OPERATORS = 32;
 export const AGENT_GRAPH_MAX_EDGES = 64;
 export const AGENT_GRAPH_MAX_WORK = 32;
+export const AGENT_GRAPH_MAX_RECONCILIATION_FAILURES = 32;
 export const AGENT_GRAPH_MAX_STOPPED_TARGETS = 16;
 export const AGENT_GRAPH_MAX_CLAIMS = 32;
 export const AGENT_GRAPH_MAX_CONTROL_DECISIONS = 16;
@@ -31,9 +51,11 @@ export const AGENT_GRAPH_MAX_INSPECTION_WORK = 32;
 export const AGENT_GRAPH_MAX_INSPECTION_CLAIMS = 32;
 export const AGENT_GRAPH_MAX_INSPECTION_ACTIVATIONS = 32;
 export const AGENT_GRAPH_MAX_INSPECTION_RECORDS = 32;
+export const AGENT_GRAPH_EPOCH_PAGE_SIZE = 32;
 
 const AGENT_GRAPH_INSTRUCTION_PREVIEW_MAX_BYTES = 2 * 1024;
 const AGENT_GRAPH_REASON_MAX_BYTES = 12 * 1024;
+const AGENT_GRAPH_RECONCILIATION_FAILURE_REASON_MAX_BYTES = 4 * 1024;
 
 const QUERY_ERRORS = [
   'host_not_ready',
@@ -90,6 +112,7 @@ export type AgentGraphRecordFacet =
   | 'permission_request'
   | 'permission_decision'
   | 'user_question_request'
+  | 'form_request'
   | 'transfer'
   | 'usage'
   | 'completed'
@@ -99,7 +122,10 @@ export type AgentGraphRecordFacet =
   | 'runtime_fact';
 
 export type AgentGraphSupervisorSignal =
-  | { readonly kind: 'attention'; readonly reason: 'permission_request' | 'user_question_request' }
+  | {
+      readonly kind: 'attention';
+      readonly reason: 'permission_request' | 'user_question_request' | 'form_request';
+    }
   | {
       readonly kind: 'terminal';
       readonly status: 'completed' | 'failed' | 'aborted' | 'cancelled';
@@ -131,7 +157,6 @@ export interface AgentGraphClientOperator {
   readonly scheduledWorkIds: readonly string[];
   readonly readiness: readonly {
     readonly readinessId: string;
-    readonly policyKind: 'map' | 'all_settled';
     readonly status: 'waiting' | 'runnable';
     readonly waitingFor: readonly AgentGraphReadinessWait[];
     readonly omittedWaitingFor: number;
@@ -164,14 +189,25 @@ export interface AgentGraphClientScheduledWork {
   readonly workId: string;
   readonly target:
     | { readonly kind: 'agent'; readonly agentId: string }
+    | { readonly kind: 'preset'; readonly presetId: string }
     | { readonly kind: 'operator'; readonly operatorId: string };
   readonly inputIds: readonly string[];
+  readonly selectedResultInputs?: readonly {
+    readonly sourceGraphId: string;
+    readonly resultId: string;
+  }[];
   readonly replaces?: string;
   readonly status: 'requested' | 'stopped' | 'superseded';
   readonly instructionPreview: string;
   readonly instructionTruncated: boolean;
   readonly revision: number;
   readonly committedAt: number;
+}
+
+export interface AgentGraphClientReconciliationFailure {
+  readonly workId: string;
+  readonly phase: 'schedule' | 'topology' | 'stop' | 'render' | 'dispatch';
+  readonly reason: string;
 }
 
 export interface AgentGraphClientStoppedTarget {
@@ -227,6 +263,7 @@ export interface AgentGraphClientSnapshot {
   readonly schemaVersion: typeof AGENT_GRAPH_CLIENT_SCHEMA_VERSION;
   readonly rootSessionId: string;
   readonly graphId: string;
+  readonly orchestrationMode: 'graph' | 'swarm';
   readonly snapshotVersion: `sha256:${string}`;
   readonly status: AgentGraphClientStatus;
   readonly scheduleRevision: number;
@@ -236,6 +273,7 @@ export interface AgentGraphClientSnapshot {
   readonly operators: readonly AgentGraphClientOperator[];
   readonly edges: readonly AgentGraphClientEdge[];
   readonly work: readonly AgentGraphClientScheduledWork[];
+  readonly reconciliationFailures: readonly AgentGraphClientReconciliationFailure[];
   readonly stoppedTargets: readonly AgentGraphClientStoppedTarget[];
   readonly finish?: AgentGraphClientFinish;
   readonly claims: readonly AgentGraphClientClaimRef[];
@@ -249,6 +287,7 @@ export interface AgentGraphClientSnapshot {
     readonly operators: number;
     readonly edges: number;
     readonly work: number;
+    readonly reconciliationFailures: number;
     readonly stoppedTargets: number;
     readonly claims: number;
     readonly controlDecisions: number;
@@ -289,16 +328,37 @@ export interface AgentGraphOperatorInspection {
 
 export interface AgentGraphQueryInput {
   readonly rootSessionId: string;
+  readonly graphId?: string;
   readonly terminalCursor?: string;
+}
+
+export interface AgentGraphEpochListInput {
+  readonly rootSessionId: string;
+  readonly beforeEpoch?: number;
+}
+
+export interface AgentGraphEpochSummary {
+  readonly epoch: number;
+  readonly graphId: string;
+  readonly createdAt: number;
+  readonly current: boolean;
+}
+
+export interface AgentGraphEpochListResult {
+  readonly rootSessionId: string;
+  readonly epochs: readonly AgentGraphEpochSummary[];
+  readonly nextBeforeEpoch: number | null;
 }
 
 export interface AgentGraphOperatorQueryInput {
   readonly rootSessionId: string;
+  readonly graphId?: string;
   readonly operatorId: string;
 }
 
 export interface AgentGraphStopInput {
   readonly rootSessionId: string;
+  readonly expectedGraphId?: string;
 }
 
 export interface AgentGraphStopResult {
@@ -307,6 +367,34 @@ export interface AgentGraphStopResult {
 }
 
 export const AGENT_GRAPH_OPERATION_SPECS = {
+  'agent.graph.epochs.query': defineOperation<
+    AgentGraphEpochListInput,
+    AgentGraphEpochListResult,
+    (typeof QUERY_ERRORS)[number]
+  >({
+    mode: 'query',
+    availability: 'ready',
+    errors: QUERY_ERRORS,
+    decodeInput: decodeAgentGraphEpochListInput,
+    decodeOutput: decodeAgentGraphEpochListResult,
+    assertOutputForInput: (input, output) => {
+      assertRootIdentity(input.rootSessionId, output);
+      if (input.beforeEpoch === undefined) {
+        if (output.epochs.filter((entry) => entry.current).length !== 1) {
+          throw invalidProtocolFrame(
+            'Agent graph first epoch page must identify the current epoch',
+          );
+        }
+      } else {
+        if (output.epochs.some((entry) => entry.current)) {
+          throw invalidProtocolFrame('Agent graph historical epoch pages cannot be current');
+        }
+        if (output.epochs.some((entry) => entry.epoch >= input.beforeEpoch!)) {
+          throw invalidProtocolFrame('Agent graph epoch page did not advance its cursor');
+        }
+      }
+    },
+  }),
   'agent.graph.query': defineOperation<
     AgentGraphQueryInput,
     AgentGraphClientSnapshot,
@@ -317,7 +405,12 @@ export const AGENT_GRAPH_OPERATION_SPECS = {
     errors: QUERY_ERRORS,
     decodeInput: decodeAgentGraphQueryInput,
     decodeOutput: decodeAgentGraphClientSnapshot,
-    assertOutputForInput: (input, output) => assertRootIdentity(input.rootSessionId, output),
+    assertOutputForInput: (input, output) => {
+      assertRootIdentity(input.rootSessionId, output);
+      if (input.graphId !== undefined && input.graphId !== output.graphId) {
+        throw invalidProtocolFrame('Agent graph result changed request graph identity');
+      }
+    },
   }),
   'agent.graph.operator.query': defineOperation<
     AgentGraphOperatorQueryInput,
@@ -331,6 +424,9 @@ export const AGENT_GRAPH_OPERATION_SPECS = {
     decodeOutput: decodeAgentGraphOperatorInspection,
     assertOutputForInput: (input, output) => {
       assertRootIdentity(input.rootSessionId, output);
+      if (input.graphId !== undefined && input.graphId !== output.graphId) {
+        throw invalidProtocolFrame('Agent graph operator result changed request graph identity');
+      }
       if (output.operator.operatorId !== input.operatorId) {
         throw invalidProtocolFrame('Agent graph operator result changed request identity');
       }
@@ -346,7 +442,12 @@ export const AGENT_GRAPH_OPERATION_SPECS = {
     errors: STOP_ERRORS,
     decodeInput: decodeAgentGraphStopInput,
     decodeOutput: decodeAgentGraphStopResult,
-    assertOutputForInput: (input, output) => assertRootIdentity(input.rootSessionId, output),
+    assertOutputForInput: (input, output) => {
+      assertRootIdentity(input.rootSessionId, output);
+      if (input.expectedGraphId !== undefined && output.graphId !== input.expectedGraphId) {
+        throw invalidProtocolFrame('Agent graph stop changed request graph identity');
+      }
+    },
   }),
 } as const;
 
@@ -355,10 +456,13 @@ export function decodeAgentGraphQueryInput(value: unknown): AgentGraphQueryInput
     value,
     'agent.graph.query input',
     ['rootSessionId'],
-    ['terminalCursor'],
+    ['graphId', 'terminalCursor'],
   );
   return {
     rootSessionId: requireEntityId(record.rootSessionId, 'rootSessionId'),
+    ...(record.graphId === undefined
+      ? {}
+      : { graphId: requireOpaqueIdentity(record.graphId, 'graphId') }),
     ...(record.terminalCursor === undefined
       ? {}
       : { terminalCursor: requireCursor(record.terminalCursor) }),
@@ -366,19 +470,108 @@ export function decodeAgentGraphQueryInput(value: unknown): AgentGraphQueryInput
 }
 
 export function decodeAgentGraphOperatorQueryInput(value: unknown): AgentGraphOperatorQueryInput {
-  const record = requireExactRecord(value, 'agent.graph.operator.query input', [
-    'rootSessionId',
-    'operatorId',
-  ]);
+  const record = requireShapedRecord(
+    value,
+    'agent.graph.operator.query input',
+    ['rootSessionId', 'operatorId'],
+    ['graphId'],
+  );
   return {
     rootSessionId: requireEntityId(record.rootSessionId, 'rootSessionId'),
+    ...(record.graphId === undefined
+      ? {}
+      : { graphId: requireOpaqueIdentity(record.graphId, 'graphId') }),
     operatorId: requireOpaqueIdentity(record.operatorId, 'operatorId'),
   };
 }
 
+export function decodeAgentGraphEpochListInput(value: unknown): AgentGraphEpochListInput {
+  const record = requireShapedRecord(
+    value,
+    'agent.graph.epochs.query input',
+    ['rootSessionId'],
+    ['beforeEpoch'],
+  );
+  const beforeEpoch =
+    record.beforeEpoch === undefined ? undefined : requireCount(record.beforeEpoch, 'beforeEpoch');
+  if (beforeEpoch === 0) throw invalidProtocolFrame('Invalid beforeEpoch');
+  return {
+    rootSessionId: requireEntityId(record.rootSessionId, 'rootSessionId'),
+    ...(beforeEpoch === undefined ? {} : { beforeEpoch }),
+  };
+}
+
+export function decodeAgentGraphEpochListResult(value: unknown): AgentGraphEpochListResult {
+  requireEncodedByteLimit(value, 'agent.graph.epochs.query result', AGENT_GRAPH_RESULT_MAX_BYTES);
+  const record = requireExactRecord(value, 'agent graph epoch list', [
+    'rootSessionId',
+    'epochs',
+    'nextBeforeEpoch',
+  ]);
+  const result = {
+    rootSessionId: requireEntityId(record.rootSessionId, 'rootSessionId'),
+    epochs: decodeArray(
+      record.epochs,
+      'agent graph epochs',
+      AGENT_GRAPH_EPOCH_PAGE_SIZE,
+      (entry) => {
+        const epoch = requireExactRecord(entry, 'agent graph epoch', [
+          'epoch',
+          'graphId',
+          'createdAt',
+          'current',
+        ]);
+        const epochNumber = requireCount(epoch.epoch, 'epoch');
+        if (epochNumber === 0) throw invalidProtocolFrame('Invalid epoch');
+        return {
+          epoch: epochNumber,
+          graphId: requireOpaqueIdentity(epoch.graphId, 'graphId'),
+          createdAt: requireCount(epoch.createdAt, 'createdAt'),
+          current: requireBoolean(epoch.current, 'current'),
+        };
+      },
+    ),
+    nextBeforeEpoch: decodeOptionalEpochCursor(record.nextBeforeEpoch),
+  };
+  assertUnique(result.epochs, (entry) => String(entry.epoch), 'agent graph epoch');
+  assertUnique(result.epochs, (entry) => entry.graphId, 'agent graph identity');
+  if (result.epochs.filter((entry) => entry.current).length > 1) {
+    throw invalidProtocolFrame('Agent graph epoch list identifies multiple current epochs');
+  }
+  for (let index = 1; index < result.epochs.length; index += 1) {
+    if (result.epochs[index - 1]!.epoch - 1 !== result.epochs[index]!.epoch) {
+      throw invalidProtocolFrame('Agent graph epoch page must be contiguous and newest-first');
+    }
+  }
+  if (result.epochs.some((entry) => entry.current) && !result.epochs[0]?.current) {
+    throw invalidProtocolFrame('Agent graph current epoch must be first');
+  }
+  if (result.nextBeforeEpoch !== null && result.nextBeforeEpoch !== result.epochs.at(-1)?.epoch) {
+    throw invalidProtocolFrame('Agent graph epoch cursor must continue after the oldest result');
+  }
+  return result;
+}
+
+function decodeOptionalEpochCursor(value: unknown): number | null {
+  if (value === null) return null;
+  const cursor = requireCount(value, 'nextBeforeEpoch');
+  if (cursor === 0) throw invalidProtocolFrame('Invalid nextBeforeEpoch');
+  return cursor;
+}
+
 export function decodeAgentGraphStopInput(value: unknown): AgentGraphStopInput {
-  const record = requireExactRecord(value, 'agent.graph.stop input', ['rootSessionId']);
-  return { rootSessionId: requireEntityId(record.rootSessionId, 'rootSessionId') };
+  const record = requireShapedRecord(
+    value,
+    'agent.graph.stop input',
+    ['rootSessionId'],
+    ['expectedGraphId'],
+  );
+  return {
+    rootSessionId: requireEntityId(record.rootSessionId, 'rootSessionId'),
+    ...(record.expectedGraphId === undefined
+      ? {}
+      : { expectedGraphId: requireOpaqueIdentity(record.expectedGraphId, 'expectedGraphId') }),
+  };
 }
 
 export function decodeAgentGraphStopResult(value: unknown): AgentGraphStopResult {
@@ -398,6 +591,7 @@ export function decodeAgentGraphClientSnapshot(value: unknown): AgentGraphClient
       'schemaVersion',
       'rootSessionId',
       'graphId',
+      'orchestrationMode',
       'snapshotVersion',
       'status',
       'scheduleRevision',
@@ -406,6 +600,7 @@ export function decodeAgentGraphClientSnapshot(value: unknown): AgentGraphClient
       'operators',
       'edges',
       'work',
+      'reconciliationFailures',
       'stoppedTargets',
       'claims',
       'recentControlDecisions',
@@ -420,6 +615,7 @@ export function decodeAgentGraphClientSnapshot(value: unknown): AgentGraphClient
     schemaVersion: AGENT_GRAPH_CLIENT_SCHEMA_VERSION,
     rootSessionId: requireEntityId(record.rootSessionId, 'rootSessionId'),
     graphId: requireOpaqueIdentity(record.graphId, 'graphId'),
+    orchestrationMode: requireGraphOrchestrationMode(record.orchestrationMode),
     snapshotVersion: requireFingerprint(record.snapshotVersion, 'snapshotVersion'),
     status: requireGraphStatus(record.status),
     scheduleRevision: requireCount(record.scheduleRevision, 'scheduleRevision'),
@@ -436,6 +632,12 @@ export function decodeAgentGraphClientSnapshot(value: unknown): AgentGraphClient
     ),
     edges: decodeArray(record.edges, 'agent graph edges', AGENT_GRAPH_MAX_EDGES, decodeEdge),
     work: decodeArray(record.work, 'agent graph work', AGENT_GRAPH_MAX_WORK, decodeWork),
+    reconciliationFailures: decodeArray(
+      record.reconciliationFailures,
+      'agent graph reconciliation failures',
+      AGENT_GRAPH_MAX_RECONCILIATION_FAILURES,
+      decodeReconciliationFailure,
+    ),
     stoppedTargets: decodeArray(
       record.stoppedTargets,
       'agent graph stopped targets',
@@ -462,6 +664,11 @@ export function decodeAgentGraphClientSnapshot(value: unknown): AgentGraphClient
   assertUnique(snapshot.operators, (item) => item.operatorId, 'agent graph operator');
   assertUnique(snapshot.edges, (item) => item.edgeId, 'agent graph edge');
   assertUnique(snapshot.work, (item) => item.workId, 'agent graph work');
+  assertUnique(
+    snapshot.reconciliationFailures,
+    (item) => item.workId,
+    'agent graph reconciliation failure',
+  );
   assertUnique(snapshot.claims, (item) => item.claimId, 'agent graph claim');
   return snapshot;
 }
@@ -592,20 +799,15 @@ function decodeOperator(value: unknown): AgentGraphClientOperator {
 function decodeReadiness(value: unknown): AgentGraphClientOperator['readiness'][number] {
   const record = requireExactRecord(value, 'agent graph readiness', [
     'readinessId',
-    'policyKind',
     'status',
     'waitingFor',
     'omittedWaitingFor',
   ]);
-  if (record.policyKind !== 'map' && record.policyKind !== 'all_settled') {
-    throw invalidProtocolFrame('Invalid agent graph readiness policy');
-  }
   if (record.status !== 'waiting' && record.status !== 'runnable') {
     throw invalidProtocolFrame('Invalid agent graph readiness status');
   }
   return {
     readinessId: requireOpaqueIdentity(record.readinessId, 'readinessId'),
-    policyKind: record.policyKind,
     status: record.status,
     waitingFor: decodeArray(
       record.waitingFor,
@@ -701,7 +903,7 @@ function decodeWork(value: unknown): AgentGraphClientScheduledWork {
       'revision',
       'committedAt',
     ],
-    ['replaces'],
+    ['replaces', 'selectedResultInputs'],
   );
   if (
     record.status !== 'requested' &&
@@ -710,10 +912,19 @@ function decodeWork(value: unknown): AgentGraphClientScheduledWork {
   ) {
     throw invalidProtocolFrame('Invalid agent graph work status');
   }
+  const inputIds = decodeIdentityArray(record.inputIds, 'inputIds', AGENT_GRAPH_MAX_WORK_INPUTS);
   return {
     workId: requireOpaqueIdentity(record.workId, 'workId'),
     target: decodeWorkTarget(record.target),
-    inputIds: decodeIdentityArray(record.inputIds, 'inputIds', AGENT_GRAPH_MAX_WORK_INPUTS),
+    inputIds,
+    ...(record.selectedResultInputs === undefined
+      ? {}
+      : {
+          selectedResultInputs: decodeSelectedResultInputs(
+            record.selectedResultInputs,
+            new Set(inputIds),
+          ),
+        }),
     ...(record.replaces === undefined
       ? {}
       : { replaces: requireOpaqueIdentity(record.replaces, 'replaces') }),
@@ -729,12 +940,68 @@ function decodeWork(value: unknown): AgentGraphClientScheduledWork {
   };
 }
 
+function decodeSelectedResultInputs(
+  value: unknown,
+  currentInputIds: ReadonlySet<string>,
+): Array<{ sourceGraphId: string; resultId: string }> {
+  if (!Array.isArray(value) || value.length === 0 || value.length > AGENT_GRAPH_MAX_WORK_INPUTS) {
+    throw invalidProtocolFrame('Invalid selected graph result inputs');
+  }
+  // The durable schedule contract caps current and selected historical inputs
+  // COMBINED at AGENT_GRAPH_MAX_WORK_INPUTS; the decoder must not admit a
+  // wider frame than the contract it projects.
+  if (currentInputIds.size + value.length > AGENT_GRAPH_MAX_WORK_INPUTS) {
+    throw invalidProtocolFrame('Graph input ids exceed the combined current and historical cap');
+  }
+  const selected = value.map((item) => {
+    const record = requireExactRecord(item, 'selected graph result input', [
+      'sourceGraphId',
+      'resultId',
+    ]);
+    return {
+      sourceGraphId: requireOpaqueIdentity(record.sourceGraphId, 'sourceGraphId'),
+      resultId: requireOpaqueIdentity(record.resultId, 'resultId'),
+    };
+  });
+  assertUnique(selected, (item) => item.resultId, 'selected graph result');
+  if (selected.some((item) => currentInputIds.has(item.resultId))) {
+    throw invalidProtocolFrame('Graph input ids are ambiguous across current and historical data');
+  }
+  return selected;
+}
+
+function decodeReconciliationFailure(value: unknown): AgentGraphClientReconciliationFailure {
+  const record = requireExactRecord(value, 'agent graph reconciliation failure', [
+    'workId',
+    'phase',
+    'reason',
+  ]);
+  if (
+    record.phase !== 'schedule' &&
+    record.phase !== 'topology' &&
+    record.phase !== 'stop' &&
+    record.phase !== 'render' &&
+    record.phase !== 'dispatch'
+  ) {
+    throw invalidProtocolFrame('Invalid agent graph reconciliation failure phase');
+  }
+  return {
+    workId: requireOpaqueIdentity(record.workId, 'workId'),
+    phase: record.phase,
+    reason: requireUtf8String(
+      record.reason,
+      'reason',
+      AGENT_GRAPH_RECONCILIATION_FAILURE_REASON_MAX_BYTES,
+    ),
+  };
+}
+
 function decodeWorkTarget(value: unknown): AgentGraphClientScheduledWork['target'] {
   const record = requireShapedRecord(
     value,
     'agent graph work target',
     ['kind'],
-    ['agentId', 'operatorId'],
+    ['agentId', 'presetId', 'operatorId'],
   );
   if (record.kind === 'agent') {
     requireExactRecord(record, 'agent graph agent target', ['kind', 'agentId']);
@@ -745,6 +1012,13 @@ function decodeWorkTarget(value: unknown): AgentGraphClientScheduledWork['target
     return {
       kind: record.kind,
       operatorId: requireOpaqueIdentity(record.operatorId, 'operatorId'),
+    };
+  }
+  if (record.kind === 'preset') {
+    requireExactRecord(record, 'agent graph preset target', ['kind', 'presetId']);
+    return {
+      kind: record.kind,
+      presetId: requireOpaqueIdentity(record.presetId, 'presetId'),
     };
   }
   throw invalidProtocolFrame('Invalid agent graph work target');
@@ -924,7 +1198,11 @@ function decodeSignal(value: unknown): AgentGraphSupervisorSignal {
   const record = requireShapedRecord(value, 'agent graph signal', ['kind'], ['reason', 'status']);
   if (record.kind === 'attention') {
     requireExactRecord(record, 'agent graph attention signal', ['kind', 'reason']);
-    if (record.reason !== 'permission_request' && record.reason !== 'user_question_request') {
+    if (
+      record.reason !== 'permission_request' &&
+      record.reason !== 'user_question_request' &&
+      record.reason !== 'form_request'
+    ) {
       throw invalidProtocolFrame('Invalid agent graph attention reason');
     }
     return { kind: record.kind, reason: record.reason };
@@ -984,6 +1262,7 @@ function decodeSnapshotOmitted(value: unknown): AgentGraphClientSnapshot['omitte
     'operators',
     'edges',
     'work',
+    'reconciliationFailures',
     'stoppedTargets',
     'claims',
     'controlDecisions',
@@ -993,6 +1272,10 @@ function decodeSnapshotOmitted(value: unknown): AgentGraphClientSnapshot['omitte
     operators: requireCount(record.operators, 'omitted operators'),
     edges: requireCount(record.edges, 'omitted edges'),
     work: requireCount(record.work, 'omitted work'),
+    reconciliationFailures: requireCount(
+      record.reconciliationFailures,
+      'omitted reconciliationFailures',
+    ),
     stoppedTargets: requireCount(record.stoppedTargets, 'omitted stoppedTargets'),
     claims: requireCount(record.claims, 'omitted claims'),
     controlDecisions: requireCount(record.controlDecisions, 'omitted controlDecisions'),
@@ -1137,6 +1420,11 @@ function requireGraphStatus(value: unknown): AgentGraphClientStatus {
   throw invalidProtocolFrame('Invalid agent graph status');
 }
 
+function requireGraphOrchestrationMode(value: unknown): 'graph' | 'swarm' {
+  if (value === 'graph' || value === 'swarm') return value;
+  throw invalidProtocolFrame('Invalid agent graph orchestration mode');
+}
+
 function requireFacet(value: unknown): AgentGraphRecordFacet {
   if (
     value === 'message' ||
@@ -1149,6 +1437,7 @@ function requireFacet(value: unknown): AgentGraphRecordFacet {
     value === 'permission_request' ||
     value === 'permission_decision' ||
     value === 'user_question_request' ||
+    value === 'form_request' ||
     value === 'transfer' ||
     value === 'usage' ||
     value === 'completed' ||

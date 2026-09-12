@@ -1,3 +1,22 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
 # Reference Layout — UI Atlas
 
 > Archived on 2026-07-13. This reverse-engineering snapshot is provenance, not current product design authority.
@@ -355,11 +374,11 @@ Maka mostly uses `[data-active="true"]` on list rows. There's no `[data-agents-v
 Goal: rewrite Maka's **Plan/Reminder** page and **Settings** surface to match
 reference's signature card chrome + heading hierarchy + tight 4-6px geometry.
 
-### 10.1 Plan/Reminder page (PlanReminderPanel)
+### 10.1 Plan/Reminder page (ScheduledTaskPanel)
 - Wrap content in a `.maka-page-card` matching the universal recipe (1px
   border-tertiary + 6px radius + 4% lift), with `--agents-content-area-gap`
   equivalent at 4-6px between internal sections.
-- Heading: change `.maka-plan-heading h2` from 24/650 to 30px / weight-600
+- Heading: change `.maka-scheduled-task-heading h2` from 24/650 to 30px / weight-600
   (reference uses `--text-3xl` for page headings).
 - Internal sections render as workbench-card-style sub-cards: 1px border, 6px
   radius, soft lift. Card-vs-card gap = 4-6px.
@@ -379,7 +398,7 @@ reference's signature card chrome + heading hierarchy + tight 4-6px geometry.
 ### 10.3 Shared primitives (CSS-only first)
 - Add `.maka-card-base` mixin via custom property: a single rule that defines
   the recipe (1px border-tertiary, 6px radius, 4% lift). Compose into
-  `.maka-skill-library`, `.maka-plan-shell`, future settings page.
+  `.maka-skill-library`, `.maka-scheduled-task-shell`, future settings page.
 - Add `.maka-page-heading` typography class (30px / 1.2 line / weight 600).
 - Optionally add `[data-maka-view=plan|skills|settings|...]` on a wrapper to
   match reference's `[data-agents-view]` pattern.
@@ -528,7 +547,7 @@ so the wrapping can happen later without another atlas pass.
 Indeterminate progress bar — needs a container with `overflow: hidden`
 and a child of `width: 40%; position: absolute; top: 0; bottom: 0;`
 applying the animation. Useful for: retry-load pending state, action
-in-flight in modal footers, plan reminder run-now in-flight.
+in-flight in modal footers, scheduled-task run-now in-flight.
 
 ### 12.5 Heading + lede typography (settings page)
 

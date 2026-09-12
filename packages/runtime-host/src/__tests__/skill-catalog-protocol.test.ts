@@ -1,3 +1,23 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { RuntimeHostProtocolError } from '../protocol/errors.js';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -10,19 +30,26 @@ import {
   SKILL_CATALOG_PAGE_MAX_BYTES,
   SKILL_CATALOG_PAGE_MAX_ITEMS,
   SKILL_CATALOG_PREVIEW_RESULT_MAX_BYTES,
+  WORKSPACE_HOST_PATH_MAX_BYTES,
   type SkillCatalogBundledItem,
   type SkillCatalogGovernanceItem,
   type SkillCatalogMutation,
   type SkillCatalogPreviewUpdateResult,
   type SkillCatalogRevision,
 } from '../protocol/index.js';
-import { RuntimeHostProtocolError } from '../protocol/errors.js';
 import { SkillCatalogRepository } from '../server/skill-catalog-repository.js';
 
 const REVISION = `sha256:${'a'.repeat(64)}` as SkillCatalogRevision;
 const NEXT_REVISION = `sha256:${'b'.repeat(64)}` as SkillCatalogRevision;
 const CONTEXT = {
-  projectRoot: process.platform === 'win32' ? 'C:\\workspace\\project' : '/workspace/project',
+  workspace: {
+    kind: 'host_path' as const,
+    path: process.platform === 'win32' ? 'C:\\workspace\\project' : '/workspace/project',
+  },
+};
+const RESOLVED_WORKSPACE = {
+  target: CONTEXT.workspace,
+  hostCwd: CONTEXT.workspace.path,
 };
 
 type IsAssignable<From, To> = [From] extends [To] ? true : false;
@@ -56,55 +83,135 @@ export type SkillCatalogManagedUpdateMutationTypeContract = [
 ];
 
 describe('Runtime Host Skill catalog protocol', () => {
-  test('declares only the three frozen ready operations and their error sets', () => {
-    assert.deepEqual(Object.keys(SKILL_CATALOG_OPERATION_SPECS).sort(), [
-      'skill.catalog.mutate',
-      'skill.catalog.preview-update',
-      'skill.catalog.query',
-    ]);
-    const queryErrors = [
-      'host_not_ready',
-      'host_draining',
-      'operation_unavailable',
-      'invalid_request',
-      'persistence_failed',
-      'internal_failure',
-    ];
-    assert.deepEqual(
-      {
-        mode: SKILL_CATALOG_OPERATION_SPECS['skill.catalog.query'].mode,
-        availability: SKILL_CATALOG_OPERATION_SPECS['skill.catalog.query'].availability,
-        errors: SKILL_CATALOG_OPERATION_SPECS['skill.catalog.query'].errors,
-      },
-      { mode: 'query', availability: 'ready', errors: queryErrors },
+  test('only treats explicit Host-path Skill workspaces as Host-path input', () => {
+    assert.equal(
+      SKILL_CATALOG_OPERATION_SPECS['skill.catalog.query'].usesHostPaths?.({
+        kind: 'start',
+        context: { workspace: { kind: 'project', projectId: 'project-1' } },
+        view: 'governance',
+      }),
+      false,
     );
-    assert.deepEqual(
-      {
-        mode: SKILL_CATALOG_OPERATION_SPECS['skill.catalog.preview-update'].mode,
-        availability: SKILL_CATALOG_OPERATION_SPECS['skill.catalog.preview-update'].availability,
-        errors: SKILL_CATALOG_OPERATION_SPECS['skill.catalog.preview-update'].errors,
-      },
-      { mode: 'query', availability: 'ready', errors: queryErrors },
+    assert.equal(
+      SKILL_CATALOG_OPERATION_SPECS['skill.catalog.query'].usesHostPaths?.({
+        kind: 'start',
+        context: CONTEXT,
+        view: 'governance',
+      }),
+      true,
     );
-    assert.deepEqual(
-      {
-        mode: SKILL_CATALOG_OPERATION_SPECS['skill.catalog.mutate'].mode,
-        availability: SKILL_CATALOG_OPERATION_SPECS['skill.catalog.mutate'].availability,
-        errors: SKILL_CATALOG_OPERATION_SPECS['skill.catalog.mutate'].errors,
-      },
-      {
-        mode: 'command',
-        availability: 'ready',
-        errors: [...queryErrors, 'commit_outcome_unknown'],
-      },
+    assert.equal(
+      SKILL_CATALOG_OPERATION_SPECS['skill.catalog.mutate'].usesHostPaths?.({
+        context: { workspace: { kind: 'project', projectId: 'project-1' } },
+        expectedRevision: REVISION,
+        mutation: { kind: 'create_starter' },
+      }),
+      false,
+    );
+    assert.equal(
+      SKILL_CATALOG_OPERATION_SPECS['skill.catalog.preview-update'].usesHostPaths?.({
+        context: CONTEXT,
+        expectedRevision: REVISION,
+        ref: 'workspace:legacy:research-brief',
+      }),
+      true,
     );
   });
 
-  test('decodes start and continuation queries with bounded typed local context', () => {
+  test('decodes bounded Session and new-Session invocable queries and pages', () => {
     for (const input of [
-      { kind: 'start', context: CONTEXT, view: 'governance' },
+      { kind: 'start', target: { kind: 'session', sessionId: 'session-1' } },
+      {
+        kind: 'start',
+        target: {
+          kind: 'new_session',
+          context: CONTEXT,
+          collaborationMode: 'plan',
+          permissionMode: 'bypass',
+        },
+      },
+      {
+        kind: 'continue',
+        target: { kind: 'session', sessionId: 'session-1' },
+        revision: REVISION,
+        cursor: 'next',
+      },
+    ]) {
+      assert.deepEqual(
+        decodeClientFrame({
+          requestId: 'request-1',
+          operation: 'skill.catalog.invocable.query',
+          input,
+        }),
+        {
+          requestId: 'request-1',
+          operation: 'skill.catalog.invocable.query',
+          input,
+        },
+      );
+    }
+    const result = {
+      kind: 'page',
+      revision: REVISION,
+      items: [
+        { ref: 'project:maka:review', id: 'review', name: 'Review', description: 'Review code' },
+      ],
+      nextCursor: null,
+    };
+    assert.deepEqual(
+      decodeHostFrame({
+        requestId: 'request-1',
+        operation: 'skill.catalog.invocable.query',
+        ok: true,
+        result,
+      }),
+      {
+        requestId: 'request-1',
+        operation: 'skill.catalog.invocable.query',
+        ok: true,
+        result,
+      },
+    );
+    for (const error of [
+      { code: 'not_found', message: 'Session does not exist' },
+      { code: 'session_archived', message: 'Session is archived' },
+    ] as const) {
+      const refusal = {
+        requestId: 'request-1',
+        operation: 'skill.catalog.invocable.query',
+        ok: false,
+        error,
+      };
+      assert.deepEqual(decodeHostFrame(refusal), refusal);
+    }
+    assertInvalidRequest('skill.catalog.invocable.query', {
+      kind: 'start',
+      target: { kind: 'new_session', context: CONTEXT, collaborationMode: 'plan' },
+    });
+    assertInvalidRequest('skill.catalog.invocable.query', {
+      kind: 'start',
+      target: {
+        kind: 'new_session',
+        context: CONTEXT,
+        collaborationMode: 'plan',
+        permissionMode: 'unrestricted',
+      },
+    });
+  });
+
+  test('decodes start and continuation queries with bounded workspace context', () => {
+    for (const input of [
+      {
+        kind: 'start',
+        context: CONTEXT,
+        view: 'governance',
+      },
       { kind: 'start', context: CONTEXT, view: 'bundled' },
-      { kind: 'start', context: CONTEXT, view: 'managed_sources' },
+      {
+        kind: 'start',
+        context: CONTEXT,
+        view: 'managed_sources',
+      },
       {
         kind: 'continue',
         context: CONTEXT,
@@ -124,39 +231,40 @@ describe('Runtime Host Skill catalog protocol', () => {
     });
     assertInvalidRequest('skill.catalog.query', {
       kind: 'start',
-      context: { projectRoot: '界'.repeat(1366) },
+      context: {
+        workspace: {
+          kind: 'host_path',
+          path: '界'.repeat(Math.floor(WORKSPACE_HOST_PATH_MAX_BYTES / 3) + 1),
+        },
+      },
       view: 'governance',
     });
     for (const projectRoot of ['.', 'project', 'workspace/project']) {
       assertInvalidRequest('skill.catalog.query', {
         kind: 'start',
-        context: { projectRoot },
+        context: { workspace: { kind: 'host_path', path: projectRoot } },
         view: 'governance',
       });
     }
-    for (const [projectRoot, acceptedPlatform] of [
-      ['/workspace/project', 'posix'],
-      ['C:\\workspace\\project', 'win32'],
-      ['\\\\server\\share\\project', 'win32'],
-    ] as const) {
-      const input = { kind: 'start', context: { projectRoot }, view: 'governance' };
-      if (
-        process.platform === 'win32' ? acceptedPlatform === 'win32' : acceptedPlatform === 'posix'
-      ) {
-        const frame = request('skill.catalog.query', input);
-        assert.deepEqual(decodeClientFrame(frame), frame);
-      } else {
-        assertInvalidRequest('skill.catalog.query', input);
-      }
+    for (const projectRoot of [
+      '/workspace/project',
+      'C:\\workspace\\project',
+      '\\\\server\\share\\project',
+    ]) {
+      const input = {
+        kind: 'start',
+        context: { workspace: { kind: 'host_path', path: projectRoot } },
+        view: 'governance',
+      };
+      const frame = request('skill.catalog.query', input);
+      assert.deepEqual(decodeClientFrame(frame), frame);
     }
-    if (process.platform === 'win32') {
-      for (const projectRoot of ['\\workspace\\project', 'C:workspace\\project']) {
-        assertInvalidRequest('skill.catalog.query', {
-          kind: 'start',
-          context: { projectRoot },
-          view: 'governance',
-        });
-      }
+    for (const projectRoot of ['\\workspace\\project', 'C:workspace\\project']) {
+      assertInvalidRequest('skill.catalog.query', {
+        kind: 'start',
+        context: { workspace: { kind: 'host_path', path: projectRoot } },
+        view: 'governance',
+      });
     }
     assertInvalidRequest('skill.catalog.query', {
       kind: 'continue',
@@ -274,25 +382,35 @@ describe('Runtime Host Skill catalog protocol', () => {
         homeDirectory,
         managedSourcesRoot,
       });
-      const result = await repository.query({
-        kind: 'start',
-        context: { projectRoot },
-        view: 'bundled',
-      });
+      const result = await repository.query(
+        {
+          kind: 'start',
+          view: 'bundled',
+        },
+        { projectRoot },
+      );
       assert.equal(result.kind, 'page');
       if (result.kind !== 'page') return;
 
       const bundledItems = result.items.filter(
         (item): item is SkillCatalogBundledItem => item.kind === 'bundled',
       );
-      assert.ok(bundledItems.length > 0);
-      assert.ok(bundledItems.some((item) => item.id === 'deep-research'));
+      assert.deepEqual(
+        bundledItems.map((item) => item.id),
+        ['computer-use'],
+      );
       assert.equal(
         bundledItems.every((item) => item.category.length > 0),
         true,
       );
 
-      const frame = response('skill.catalog.query', result);
+      const frame = response('skill.catalog.query', {
+        ...result,
+        resolvedWorkspace: {
+          target: { kind: 'host_path', path: projectRoot },
+          hostCwd: projectRoot,
+        },
+      });
       assert.deepEqual(decodeHostFrame(frame), frame);
     } finally {
       await rm(base, { recursive: true, force: true });
@@ -422,15 +540,26 @@ describe('Runtime Host Skill catalog protocol', () => {
 
   test('decodes mutation outcomes, revision conflicts, and typed rejections', () => {
     for (const result of [
-      { kind: 'committed', revision: NEXT_REVISION, entry: governanceItem() },
-      { kind: 'unchanged', revision: REVISION, entry: null },
+      {
+        kind: 'committed',
+        revision: NEXT_REVISION,
+        entry: governanceItem(),
+        resolvedWorkspace: RESOLVED_WORKSPACE,
+      },
+      {
+        kind: 'unchanged',
+        revision: REVISION,
+        entry: null,
+        resolvedWorkspace: RESOLVED_WORKSPACE,
+      },
       {
         kind: 'revision_conflict',
         expectedRevision: REVISION,
         actualRevision: NEXT_REVISION,
+        resolvedWorkspace: RESOLVED_WORKSPACE,
       },
-      { kind: 'rejected', reason: 'blocked_scope' },
-      { kind: 'rejected', reason: 'metadata_error' },
+      { kind: 'rejected', reason: 'blocked_scope', resolvedWorkspace: RESOLVED_WORKSPACE },
+      { kind: 'rejected', reason: 'metadata_error', resolvedWorkspace: RESOLVED_WORKSPACE },
     ]) {
       const frame = response('skill.catalog.mutate', result);
       assert.deepEqual(decodeHostFrame(frame), frame);
@@ -461,6 +590,7 @@ describe('Runtime Host Skill catalog protocol', () => {
       },
       expectedCurrentSha256: REVISION,
       expectedSourceSha256: NEXT_REVISION,
+      resolvedWorkspace: RESOLVED_WORKSPACE,
     };
     const requestFrame = request('skill.catalog.preview-update', {
       context: CONTEXT,
@@ -473,6 +603,7 @@ describe('Runtime Host Skill catalog protocol', () => {
     const metadataErrorFrame = response('skill.catalog.preview-update', {
       kind: 'rejected',
       reason: 'metadata_error',
+      resolvedWorkspace: RESOLVED_WORKSPACE,
     });
     assert.deepEqual(decodeHostFrame(metadataErrorFrame), metadataErrorFrame);
 
@@ -569,6 +700,7 @@ function page(view: 'governance' | 'bundled' | 'managed_sources', items: readonl
     revision: REVISION,
     items,
     nextCursor: null,
+    resolvedWorkspace: RESOLVED_WORKSPACE,
   };
 }
 

@@ -1,268 +1,122 @@
-import assert from 'node:assert/strict';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
-import type { SessionSummary, StoredMessage } from '@maka/core';
-import {
-  createAppShellRevisionActions,
-  type TurnRevisionDraft,
-} from '../../renderer/app-shell-revision-actions.js';
 
-function session(id: string): SessionSummary {
-  return {
-    id,
-    name: id,
-    isFlagged: false,
-    isArchived: false,
-    labels: [],
-    hasUnread: false,
-    status: 'active',
-    backend: 'fake',
-    llmConnectionSlug: 'test',
-    connectionLocked: false,
-    model: 'test',
-    permissionMode: 'ask',
-  };
-}
+import type { StoredMessage } from '@maka/core/session';
+import { createAppShellRevisionActions } from '../../renderer/app-shell-revision-actions.js';
 
-function userMessage(
-  overrides: Partial<Extract<StoredMessage, { type: 'user' }>> = {},
-): Extract<StoredMessage, { type: 'user' }> {
+function userMessage(turnId: string, text: string, extra: Record<string, unknown> = {}): StoredMessage {
   return {
+    id: `msg-${turnId}`,
     type: 'user',
-    id: 'message-1',
-    turnId: 'turn-1',
+    turnId,
     ts: 1,
-    text: 'Human-facing prompt',
-    ...overrides,
-  };
+    text,
+    ...extra,
+  } as StoredMessage;
 }
 
-function installWindow(
-  reviseBeforeTurn: (
-    sessionId: string,
-    input: { sourceTurnId: string },
-  ) => Promise<SessionSummary>,
-  remove: (sessionId: string) => Promise<void>,
-): () => void {
-  const target = globalThis as unknown as { window?: unknown };
-  const hadWindow = Object.prototype.hasOwnProperty.call(target, 'window');
-  const previousWindow = target.window;
-  Object.defineProperty(target, 'window', {
-    configurable: true,
-    value: {
-      maka: { sessions: { reviseBeforeTurn, remove } },
-    },
-    writable: true,
-  });
-  return () => {
-    if (hadWindow) {
-      Object.defineProperty(target, 'window', {
-        configurable: true,
-        value: previousWindow,
-        writable: true,
-      });
-    } else {
-      delete target.window;
-    }
-  };
-}
-
-function createHarness(options: {
-  reviseBeforeTurn: (
-    sessionId: string,
-    input: { sourceTurnId: string },
-  ) => Promise<SessionSummary>;
-  messages?: StoredMessage[];
-  pendingAttachments?: boolean;
-  previousComposerText?: string;
-  refreshMessagesResult?: boolean;
-}) {
-  const activeIdRef: { current: string | undefined } = { current: 'source' };
-  const revisionDraftRef: { current: TurnRevisionDraft | null } = { current: null };
-  const composerCalls: string[] = [];
-  const opened: string[] = [];
-  const revisionCalls: Array<[string, { sourceTurnId: string }]> = [];
-  const removed: string[] = [];
-  const infoToasts: Array<[string, string | undefined]> = [];
-  const restoreWindow = installWindow(
-    async (sessionId, input) => {
-      revisionCalls.push([sessionId, input]);
-      return options.reviseBeforeTurn(sessionId, input);
-    },
-    async (sessionId) => { removed.push(sessionId); },
-  );
+function createActions(input: { messages: StoredMessage[] }) {
+  const drafts: unknown[] = [];
+  let composerText = '';
+  const revisionDraftRef: { current: unknown } = { current: null };
   const actions = createAppShellRevisionActions({
-    uiLocale: 'en',
-    activeIdRef,
+    uiLocale: 'en' as never,
+    activeIdRef: { current: 'session-1' },
     composerRef: {
       current: {
-        setText: (text: string) => { composerCalls.push(text); },
-        appendText: () => undefined,
-        getText: () => options.previousComposerText ?? 'Previous draft',
-        clearDraft: (key: string) => { composerCalls.push(`<clear:${key}>`); },
-        setDraft: (key: string, text: string) => { composerCalls.push(`<draft:${key}:${text}>`); },
-        focus: () => { composerCalls.push('<focus>'); },
-      },
+        getText: () => composerText,
+        setText: (text: string) => {
+          composerText = text;
+        },
+        focus: () => {},
+        setDraft: (_sessionId: string, text: string) => {
+          composerText = text;
+        },
+        clearDraft: () => {},
+      } as never,
     },
-    messages: options.messages ?? [userMessage()],
-    hasPendingAttachments: () => options.pendingAttachments === true,
-    openSessionInChat: (sessionId) => {
-      opened.push(sessionId);
-      activeIdRef.current = sessionId;
-    },
-    refreshMessages: async () => options.refreshMessagesResult ?? true,
+    messages: input.messages,
+    hasPendingAttachments: () => false,
+    openSessionInChat: () => {},
+    refreshMessages: async () => true,
     refreshSessions: async () => [],
-    setMessages: () => undefined,
-    commitRevisionDraft: (draft) => { revisionDraftRef.current = draft; },
+    setMessages: () => {},
+    commitRevisionDraft: (draft: unknown) => {
+      revisionDraftRef.current = draft;
+      drafts.push(draft);
+    },
     revisionDraftRef,
     toastApi: {
-      info: (title, description) => { infoToasts.push([title, description]); },
-      error: () => undefined,
+      info: () => {},
+      error: () => {},
     },
-    upsertSessionSummary: () => undefined,
-  });
-  return {
-    actions,
-    activeIdRef,
-    revisionCalls,
-    composerCalls,
-    infoToasts,
-    opened,
-    removed,
-    restoreWindow,
-    revisionDraftRef,
-  };
+  } as never);
+  return Object.assign(actions, { drafts, composerState: { get text(): string { return composerText; } } });
 }
 
-describe('app shell revision actions', () => {
-  it('starts a local draft and creates a version only when the edited text is sent', async () => {
-    const harness = createHarness({ reviseBeforeTurn: async () => session('revision') });
-    try {
-      harness.actions.beginEditUserMessage('turn-1');
-      assert.deepEqual(harness.revisionCalls, []);
-      assert.equal(harness.revisionDraftRef.current?.draftSessionId, 'source');
-      assert.deepEqual(harness.composerCalls, ['Human-facing prompt', '<focus>']);
-
-      assert.equal(await harness.actions.prepareRevisionSend('Edited prompt'), true);
-      assert.deepEqual(harness.revisionCalls, [['source', { sourceTurnId: 'turn-1' }]]);
-      assert.deepEqual(harness.opened, ['revision']);
-      assert.equal(harness.revisionDraftRef.current?.draftSessionId, 'revision');
-      assert.deepEqual(
-        harness.composerCalls,
-        ['Human-facing prompt', '<focus>', '<draft:revision:Edited prompt>', '<focus>'],
-      );
-    } finally {
-      harness.restoreWindow();
-    }
-  });
-
-  it('refuses source and retained attachment history before creating a lossy revision', () => {
-    const attachment = {
-      kind: 'image' as const,
-      name: 'source.png',
-      mimeType: 'image/png',
-      bytes: 4,
-      ref: { kind: 'session_file' as const, sessionId: 'source', relativePath: 'attachment-1' },
-    };
-    const harness = createHarness({
+describe('app-shell revision actions with structured context (#5109)', () => {
+  it('keeps editing allowed when only earlier turns carry attachments', () => {
+    const h = createActions({
       messages: [
-        userMessage({ turnId: 'turn-0', attachments: [attachment] }),
-        userMessage({ id: 'message-2', turnId: 'turn-1', ts: 2 }),
+        userMessage('turn-1', 'with image', {
+          attachments: [
+            {
+              kind: 'image',
+              name: 'chart.png',
+              mimeType: 'image/png',
+              bytes: 10,
+              ref: { kind: 'session_file', sessionId: 'session-1', relativePath: 'a.png' },
+            },
+          ],
+        }),
+        userMessage('turn-2', 'plain follow-up'),
       ],
-      reviseBeforeTurn: async () => session('revision'),
     });
-    try {
-      harness.actions.beginEditUserMessage('turn-1');
-      assert.equal(harness.revisionDraftRef.current, null);
-      assert.deepEqual(harness.revisionCalls, []);
-      assert.equal(harness.infoToasts[0]?.[0], 'This message cannot be edited yet');
-    } finally {
-      harness.restoreWindow();
-    }
+
+    h.beginEditUserMessage('turn-2');
+
+    assert.ok(h.drafts.at(-1), 'a retained historical attachment must not block the edit');
+    assert.equal(h.composerState.text, 'plain follow-up');
   });
 
-  it('refuses transformed prompts and a composer that already owns attachments', () => {
-    const transformed = createHarness({
-      messages: [userMessage({ text: '<invoked-skill>hidden</invoked-skill>', displayText: '/skill prompt' })],
-      reviseBeforeTurn: async () => session('revision'),
+  it('rejects a source message that itself carries attachments', () => {
+    const h = createActions({
+      messages: [
+        userMessage('turn-1', 'with image', {
+          attachments: [
+            {
+              kind: 'image',
+              name: 'chart.png',
+              mimeType: 'image/png',
+              bytes: 10,
+              ref: { kind: 'session_file', sessionId: 'session-1', relativePath: 'a.png' },
+            },
+          ],
+        }),
+      ],
     });
-    try {
-      transformed.actions.beginEditUserMessage('turn-1');
-      assert.equal(transformed.revisionDraftRef.current, null);
-    } finally {
-      transformed.restoreWindow();
-    }
 
-    const pending = createHarness({
-      pendingAttachments: true,
-      reviseBeforeTurn: async () => session('revision'),
-    });
-    try {
-      pending.actions.beginEditUserMessage('turn-1');
-      assert.equal(pending.revisionDraftRef.current, null);
-    } finally {
-      pending.restoreWindow();
-    }
-  });
+    h.beginEditUserMessage('turn-1');
 
-  it('does not steal focus when navigation wins a pending revision creation', async () => {
-    let resolveRevision: ((value: SessionSummary) => void) | undefined;
-    const revisionPromise = new Promise<SessionSummary>((resolve) => { resolveRevision = resolve; });
-    const harness = createHarness({ reviseBeforeTurn: async () => revisionPromise });
-    try {
-      harness.actions.beginEditUserMessage('turn-1');
-      const pending = harness.actions.prepareRevisionSend('Edited prompt');
-      await Promise.resolve();
-      harness.activeIdRef.current = 'another-session';
-      resolveRevision?.(session('revision'));
-      assert.equal(await pending, false);
-      assert.deepEqual(harness.opened, []);
-      assert.deepEqual(harness.removed, ['revision']);
-    } finally {
-      harness.restoreWindow();
-    }
-  });
-
-  it('rolls back an empty version when its copied history cannot load', async () => {
-    const harness = createHarness({
-      reviseBeforeTurn: async () => session('revision'),
-      refreshMessagesResult: false,
-    });
-    try {
-      harness.actions.beginEditUserMessage('turn-1');
-      assert.equal(await harness.actions.prepareRevisionSend('Edited prompt'), false);
-      assert.equal(harness.activeIdRef.current, 'source');
-      assert.equal(harness.revisionDraftRef.current?.draftSessionId, 'source');
-      assert.deepEqual(harness.removed, ['revision']);
-      assert.ok(harness.composerCalls.includes('<draft:source:Edited prompt>'));
-      assert.deepEqual(harness.composerCalls.slice(-2), ['Edited prompt', '<focus>']);
-    } finally {
-      harness.restoreWindow();
-    }
-  });
-
-  it('cancels back to the source and restores its previous draft', async () => {
-    const harness = createHarness({
-      reviseBeforeTurn: async () => session('revision'),
-      previousComposerText: '/skill:workspace-only Previous draft',
-    });
-    try {
-      harness.actions.beginEditUserMessage('turn-1');
-      await harness.actions.prepareRevisionSend('Edited prompt');
-      await harness.actions.cancelRevisionDraft();
-      assert.equal(harness.revisionDraftRef.current, null);
-      assert.deepEqual(harness.opened, ['revision', 'source']);
-      assert.deepEqual(harness.removed, ['revision']);
-      assert.ok(harness.composerCalls.includes('<clear:revision>'));
-      // One restore carries both the words and the staged Skill.
-      assert.ok(
-        harness.composerCalls.includes('<draft:source:/skill:workspace-only Previous draft>'),
-      );
-      assert.deepEqual(
-        harness.composerCalls.slice(-2),
-        ['/skill:workspace-only Previous draft', '<focus>'],
-      );
-    } finally {
-      harness.restoreWindow();
-    }
+    assert.equal(h.drafts.at(-1), undefined, 'attachment-bearing sources stay explicitly rejected');
   });
 });

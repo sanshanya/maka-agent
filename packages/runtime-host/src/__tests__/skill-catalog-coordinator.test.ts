@@ -1,5 +1,24 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
@@ -8,8 +27,21 @@ import {
   SkillCatalogRepository,
   SkillCatalogRepositoryError,
 } from '../server/skill-catalog-repository.js';
+import type { ConnectionContext } from '../server/operation-dispatcher.js';
 
 const roots = new Set<string>();
+const workspaceResolver = {
+  async run<T>(
+    target: { readonly kind: 'host_path'; readonly path: string },
+    operation: (workspace: {
+      readonly target: typeof target;
+      readonly cwd: string;
+      readonly projectId: null;
+    }) => Promise<T>,
+  ) {
+    return operation({ target, cwd: target.path, projectId: null });
+  },
+};
 
 afterEach(async () => {
   await Promise.all([...roots].map((root) => rm(root, { recursive: true, force: true })));
@@ -58,10 +90,10 @@ test('multi-caller operations share one lane and drain waits for admitted work',
       }
     },
   });
-  const coordinator = new HostSkillCatalogCoordinator(repository);
+  const coordinator = new HostSkillCatalogCoordinator(repository, workspaceResolver);
   const input = {
     kind: 'start' as const,
-    context: { projectRoot: project },
+    context: { workspace: { kind: 'host_path' as const, path: project } },
     view: 'governance' as const,
   };
 
@@ -117,7 +149,7 @@ test('lifecycle recovery remains queued during drain and close waits for it', as
       return operation(root);
     },
   });
-  const coordinator = new HostSkillCatalogCoordinator(repository);
+  const coordinator = new HostSkillCatalogCoordinator(repository, workspaceResolver);
 
   coordinator.beginDrain();
   const recovery = coordinator.recover();
@@ -137,7 +169,7 @@ test('lifecycle recovery remains queued during drain and close waits for it', as
 
   const rejected = await coordinator.query({
     kind: 'start',
-    context: { projectRoot: project },
+    context: { workspace: { kind: 'host_path', path: project } },
     view: 'governance',
   });
   assert.deepEqual(rejected, {
@@ -165,21 +197,105 @@ test('canonical model inventory uses the same revision and is deeply immutable',
     managedSourcesRoot: join(home, '.maka', 'skill-sources'),
     runWithRoot: async (operation) => operation(root),
   });
-  const coordinator = new HostSkillCatalogCoordinator(repository);
+  const coordinator = new HostSkillCatalogCoordinator(repository, workspaceResolver);
 
   await coordinator.recover();
   const query = await coordinator.query({
     kind: 'start',
-    context: { projectRoot: project },
+    context: { workspace: { kind: 'host_path', path: project } },
     view: 'governance',
   });
   assert.equal(query.ok, true);
   if (!query.ok) return;
   assert.equal(query.result.kind, 'page');
   if (query.result.kind !== 'page') return;
+  assert.deepEqual(query.result.resolvedWorkspace, {
+    target: { kind: 'host_path', path: project },
+    hostCwd: project,
+  });
   const model = await coordinator.readCanonicalModelInventory({ projectRoot: project });
   assert.equal(model.revision, query.result.revision);
   assert.equal(Object.isFrozen(model), true);
   assert.equal(Object.isFrozen(model.inventory), true);
   assert.equal(Object.isFrozen(model.diagnostics), true);
+});
+
+test('invocable pages use the authoritative Host tool surface and invalidate on capability change', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'maka-skill-invocable-'));
+  roots.add(base);
+  const root = join(base, 'data');
+  const project = join(base, 'project');
+  const home = join(base, 'home');
+  const plain = join(project, '.agents', 'skills', 'plain');
+  const gated = join(project, '.agents', 'skills', 'gated');
+  await Promise.all([
+    mkdir(root, { recursive: true }),
+    mkdir(home, { recursive: true }),
+    mkdir(plain, { recursive: true }),
+    mkdir(gated, { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(
+      join(plain, 'SKILL.md'),
+      '---\nname: Plain\ndescription: Always available.\n---\n# Plain\n',
+    ),
+    writeFile(
+      join(gated, 'SKILL.md'),
+      '---\nname: Gated\ndescription: Needs a Host tool.\nrequired-tools: [ImaginaryTool]\n---\n# Gated\n',
+    ),
+  ]);
+  let toolNames = new Set(['Read']);
+  const coordinator = new HostSkillCatalogCoordinator(
+    new SkillCatalogRepository({
+      homeDirectory: home,
+      managedSourcesRoot: join(home, '.maka', 'skill-sources'),
+      runWithRoot: async (operation) => operation(root),
+    }),
+    workspaceResolver,
+    async () => ({ projectRoot: project, host: { toolNames } }),
+  );
+  const context: ConnectionContext = {
+    hostEpoch: 'epoch-1',
+    connectionId: 'desktop-1',
+    principal: 'local_os_user',
+    acquireResidency: () => ({ release() {} }),
+  };
+
+  const first = await coordinator.queryInvocable(
+    {
+      kind: 'start',
+      target: {
+        kind: 'new_session',
+        context: { workspace: { kind: 'host_path', path: project } },
+        collaborationMode: 'agent',
+        permissionMode: 'ask',
+      },
+    },
+    context,
+  );
+  assert.equal(first.ok, true);
+  if (!first.ok || first.result.kind !== 'page') throw new Error('Expected invocable page');
+  assert.deepEqual(
+    first.result.items.map((item) => item.id),
+    ['plain'],
+  );
+
+  toolNames = new Set(['Read', 'ImaginaryTool']);
+  const changed = await coordinator.queryInvocable(
+    {
+      kind: 'continue',
+      target: {
+        kind: 'new_session',
+        context: { workspace: { kind: 'host_path', path: project } },
+        collaborationMode: 'agent',
+        permissionMode: 'ask',
+      },
+      revision: first.result.revision,
+      cursor: 'stale-cursor',
+    },
+    context,
+  );
+  assert.equal(changed.ok, true);
+  if (!changed.ok) throw new Error('Expected invocable revision change');
+  assert.equal(changed.result.kind, 'revision_changed');
 });

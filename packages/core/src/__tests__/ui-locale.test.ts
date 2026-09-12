@@ -1,48 +1,110 @@
-import { strict as assert } from 'node:assert';
-import { it } from 'node:test';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
 import {
   UI_LOCALES,
-  UI_LOCALE_PREFERENCES,
+  defineUiMessageCatalog,
+  formatUiMessage,
   isUiLocale,
   isUiLocalePreference,
+  normalizeUiLocalePreference,
   resolveSystemUiLocale,
   resolveUiLocale,
+  resolveUiMessageCatalog,
   uiLocaleToIntlLocale,
-} from '../index.js';
+} from '../ui-locale.js';
 
-it('validates and resolves the complete UI locale contract', () => {
-  assert.deepEqual([...UI_LOCALES], ['zh', 'en']);
-  assert.deepEqual([...UI_LOCALE_PREFERENCES], ['auto', 'zh', 'en']);
-  for (const [value, expected] of [
-    ['zh', true],
-    ['en', true],
-    ['auto', false],
-    ['ja', false],
-    [null, false],
+describe('UI locale', () => {
+  it('accepts only the supported resolved locales and preferences', () => {
+    assert.equal(['zh-CN', 'zh-TW', 'en'].every(isUiLocale), true);
+    assert.equal(isUiLocale('zh'), false);
+    assert.equal(['auto', 'zh-CN', 'zh-TW', 'en'].every(isUiLocalePreference), true);
+  });
+
+  it('normalizes the legacy persisted preference without widening the locale contract', () => {
+    assert.equal(normalizeUiLocalePreference('zh'), 'zh-CN');
+    assert.equal(normalizeUiLocalePreference('zh-TW'), 'zh-TW');
+    assert.equal(normalizeUiLocalePreference('unsupported'), 'auto');
+  });
+
+  for (const [languages, expected] of [
+    [['zh-CN'], 'zh-CN'],
+    [['zh-SG'], 'zh-CN'],
+    [['zh-Hans'], 'zh-CN'],
+    [['zh-TW'], 'zh-TW'],
+    [['zh-Hant-TW'], 'zh-TW'],
+    [['zh-HK'], 'zh-TW'],
+    [['zh_MO'], 'zh-TW'],
+    [['zh_TW.UTF-8'], 'zh-TW'],
+    [['fr-FR', 'en-US'], 'en'],
+    [[], 'en'],
   ] as const) {
-    assert.equal(isUiLocale(value), expected);
+    it(`resolves system languages ${languages.join(',')} to ${expected}`, () => {
+      assert.equal(resolveSystemUiLocale(languages), expected);
+    });
   }
-  for (const [value, expected] of [
-    ['auto', true],
-    ['zh', true],
-    ['en', true],
-    ['ja', false],
-    [undefined, false],
-  ] as const) {
-    assert.equal(isUiLocalePreference(value), expected);
-  }
-  assert.equal(resolveSystemUiLocale(['zh-CN', 'en-US']), 'zh');
-  assert.equal(resolveSystemUiLocale(['ja-JP', 'en-GB']), 'en');
-  assert.equal(resolveSystemUiLocale(['fr-FR', 'de-DE']), 'en');
-  assert.equal(resolveSystemUiLocale([]), 'en');
-  assert.equal(resolveUiLocale('auto', 'zh'), 'zh');
-  assert.equal(resolveUiLocale('auto', 'en'), 'en');
-  assert.equal(resolveUiLocale('zh', 'en'), 'zh');
-  assert.equal(resolveUiLocale('en', 'zh'), 'en');
-  assert.equal(resolveUiLocale('auto', 'zh', 'en'), 'en');
-  assert.equal(resolveUiLocale('en', 'en', 'zh'), 'zh');
-  assert.equal(resolveUiLocale('zh', 'en', null), 'zh');
-  assert.equal(uiLocaleToIntlLocale('zh'), 'zh-CN');
-  assert.equal(uiLocaleToIntlLocale('en'), 'en');
+
+  it('resolves explicit preferences and overrides before the system locale', () => {
+    assert.equal(resolveUiLocale('auto', 'zh-TW'), 'zh-TW');
+    assert.equal(resolveUiLocale('zh-CN', 'zh-TW'), 'zh-CN');
+    assert.equal(resolveUiLocale('zh-CN', 'zh-CN', 'en'), 'en');
+  });
+
+  it('keeps every locale guard and formatter in step with UI_LOCALES', () => {
+    for (const locale of UI_LOCALES) {
+      assert.ok(isUiLocale(locale), locale);
+      assert.equal(resolveSystemUiLocale([locale]), locale);
+      assert.equal(uiLocaleToIntlLocale(locale), locale);
+    }
+    const intlLocales = UI_LOCALES.map(uiLocaleToIntlLocale);
+    assert.equal(new Set(intlLocales).size, UI_LOCALES.length);
+  });
+});
+
+describe('UI message catalogs', () => {
+  it('falls back to complete English copy for missing translations', () => {
+    const catalog = defineUiMessageCatalog<{
+      title: string;
+      detail: { ready: string; waiting: string };
+    }>()({
+      en: { title: 'Status', detail: { ready: 'Ready', waiting: 'Waiting' } },
+      'zh-CN': { title: '状态', detail: { ready: '就绪' } },
+    });
+
+    assert.deepEqual(resolveUiMessageCatalog(catalog), {
+      en: { title: 'Status', detail: { ready: 'Ready', waiting: 'Waiting' } },
+      'zh-CN': { title: '状态', detail: { ready: '就绪', waiting: 'Waiting' } },
+      'zh-TW': { title: 'Status', detail: { ready: 'Ready', waiting: 'Waiting' } },
+    });
+  });
+
+  it('uses locale-aware ICU plural rules', () => {
+    const template = '{count, plural, one {# tool} other {# tools}}';
+
+    assert.equal(formatUiMessage(template, { count: 1 }, 'en'), '1 tool');
+    assert.equal(formatUiMessage(template, { count: 3 }, 'en'), '3 tools');
+  });
+
+  it('fails soft for missing or inherited interpolation values', () => {
+    assert.equal(formatUiMessage('Hello {name}', {}, 'en'), 'Hello {name}');
+    assert.equal(formatUiMessage('{constructor}', {}, 'en'), '{constructor}');
+  });
 });

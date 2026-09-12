@@ -1,3 +1,23 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { defineInteractiveRuntimeHostComposition } from '../server/host-composition.js';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -20,9 +40,7 @@ const PROTOCOL = {
   max: RUNTIME_HOST_PROTOCOL_VERSION,
 } as const;
 
-test('two UDS Clients and a restarted production Host share one Deep Research projection', {
-  skip: process.platform === 'win32' ? 'POSIX UDS integration' : false,
-}, async () => {
+test('two Clients and a restarted production Host share one Deep Research projection', async () => {
   const base = await mkdtemp(join(tmpdir(), 'maka-host-deep-research-uds-'));
   const root = join(base, 'interactive');
   const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
@@ -37,7 +55,7 @@ test('two UDS Clients and a restarted production Host share one Deep Research pr
     const deepResearch = await openInteractiveDeepResearchStoreForWrite(owner.lease);
     const session = await setupStores.sessionStore.create({
       cwd: root,
-      backend: 'fake',
+      llmConnectionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
       llmConnectionSlug: 'fake',
       model: 'fake-model',
       permissionMode: 'explore',
@@ -65,14 +83,14 @@ test('two UDS Clients and a restarted production Host share one Deep Research pr
     host = await RuntimeHostKernel.start({
       owner,
       idleGraceMs: 30_000,
-      compositionFactory: createExecutionRuntimeHostComposition,
+      composition: defineInteractiveRuntimeHostComposition(createExecutionRuntimeHostComposition),
     });
     owner = undefined;
-    [desktop, tui] = await Promise.all([connect(root, 'desktop'), connect(root, 'tui')]);
+    [desktop, tui] = await Promise.all([connect(root), connect(root)]);
 
     const [desktopProjection, tuiProjection] = await Promise.all([
-      desktop.queryDeepResearch({ sessionId: session.id }),
-      tui.queryDeepResearch({ sessionId: session.id }),
+      desktop.request('deep-research.query', { sessionId: session.id }),
+      tui.request('deep-research.query', { sessionId: session.id }),
     ]);
     assert.deepEqual(tuiProjection, desktopProjection);
     assert.equal(desktopProjection.kind, 'snapshot');
@@ -106,12 +124,15 @@ test('two UDS Clients and a restarted production Host share one Deep Research pr
     host = await RuntimeHostKernel.start({
       owner,
       idleGraceMs: 30_000,
-      compositionFactory: createExecutionRuntimeHostComposition,
+      composition: defineInteractiveRuntimeHostComposition(createExecutionRuntimeHostComposition),
     });
     owner = undefined;
-    tui = await connect(root, 'tui');
+    tui = await connect(root);
 
-    assert.deepEqual(await tui.queryDeepResearch({ sessionId: session.id }), desktopProjection);
+    assert.deepEqual(
+      await tui.request('deep-research.query', { sessionId: session.id }),
+      desktopProjection,
+    );
   } finally {
     await Promise.allSettled([desktop?.close(), tui?.close()]);
     await host?.close().catch(() => undefined);
@@ -120,11 +141,8 @@ test('two UDS Clients and a restarted production Host share one Deep Research pr
   }
 });
 
-async function connect(
-  rootPath: string,
-  surface: 'desktop' | 'tui',
-): Promise<RuntimeHostConnection> {
-  const result = await connectRuntimeHost({ rootPath, surface, protocol: PROTOCOL });
+async function connect(rootPath: string): Promise<RuntimeHostConnection> {
+  const result = await connectRuntimeHost({ rootPath, protocol: PROTOCOL });
   assert.equal(result.kind, 'connected');
   if (result.kind !== 'connected') throw new Error('Unable to connect to Runtime Host');
   return result.connection;

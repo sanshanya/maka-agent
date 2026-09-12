@@ -1,3 +1,34 @@
+---
+doc_id: web-search-provider-capability
+title: "Provider-hosted web search capability"
+language: en
+source_language: en
+implementation_status: current
+document_status: current
+translation_status: source-only
+last_verified: 2026-09-04
+owners:
+  - maka-backend
+---
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
 # Provider-hosted web search capability
 
 Status: implemented for OpenAI Responses and Anthropic Messages
@@ -52,13 +83,19 @@ All production `AiSdkBackend` composition roots use the same
 | Desktop | persisted `webSearch.enabled/defaultProvider` settings | May add provider-native `WebSearch` |
 | CLI / TUI / `maka run` | the same persisted settings | May add provider-native `WebSearch` |
 | Runtime Host | runtime-policy web-search settings | May add provider-native `WebSearch` |
-| Headless Harbor | explicit `MAKA_WEB_SEARCH_ENABLED=true` | May add provider-native `WebSearch` |
 
-Headless remains opt-in because silently enabling network search would change
-benchmark semantics and historical baselines. Merely speaking Anthropic
-Messages is not enough to infer hosted-search support; Maka uses explicit model
-metadata or narrow model-id rules, including DeepSeek V4 Flash on an
-`anthropic-compatible` connection.
+The former Headless Harbor surface was retired by #2605 (2026-08-11, replaced
+by the minimal Eval kernel); its `MAKA_WEB_SEARCH_ENABLED=true` opt-in no
+longer exists. Its opt-in rationale — silently enabling network search would
+change benchmark semantics and historical baselines — now applies to eval
+subjects inverted: current benchmark subjects have no enablement path at all.
+Every subject removes `WebSearch`, `WebFetch`, and `FetchURL` from the
+provider-visible tool list, and the Eval metering proxy structurally strips
+named and provider-native web tools from external-harness requests, so
+results stay comparable across providers and baselines. Merely speaking
+Anthropic Messages is not enough to infer hosted-search support; Maka uses
+explicit model metadata or narrow model-id rules, including DeepSeek V4 Flash
+on an `anthropic-compatible` connection.
 
 An explicit `BackendFactoryContext.tools` list is a hard ceiling. Root surfaces
 may add native search, but scoped child agents do not gain it unless their
@@ -116,12 +153,14 @@ Full production-surface smoke verification on 2026-08-04 then ran:
 
 - `maka run` through a persisted DeepSeek Responses connection;
 - `maka run` through a persisted DeepSeek Anthropic-compatible connection;
-- Headless Harbor with Responses and `MAKA_WEB_SEARCH_ENABLED=true`;
-- Headless Harbor with Anthropic Messages and the same explicit opt-in.
+- the former Headless Harbor path with Responses and explicit WebSearch opt-in;
+- the former Headless Harbor path with Anthropic Messages and the same opt-in.
 
 All four runs completed with provider-executed WebSearch call/result pairs,
 final model text, no local ToolRuntime execution of `WebSearch`, and durable
-runtime events. Both headless runs also persisted token summaries. The
+runtime events. Both historical Headless runs also persisted token summaries;
+that deleted path is evidence for the provider capability, not evidence for the
+new Runtime Host Eval subject. The
 Responses CLI turn emitted search plus page-open actions; the Anthropic CLI
 turn returned ten structured source rows.
 
@@ -140,7 +179,7 @@ request. The selected connection wire is authoritative:
 - an Anthropic Messages session receives `anthropic.web_search_20250305`.
 
 For a provider that supports both, an explicit connection/model `apiProtocol`
-wins. An ambiguous standard DeepSeek V4 Flash connection defaults to Responses;
+wins. An ambiguous standard DeepSeek V4 connection defaults to Responses;
 using the CC wire requires an explicit Anthropic-compatible connection. Maka
 does not retry a failed native search over the other protocol.
 
@@ -162,7 +201,7 @@ search-heavy workflows that value source visibility over cache economics.
 
 | Provider or access path | Official hosted search surface | Model boundary | Maka state |
 | --- | --- | --- | --- |
-| DeepSeek | Responses `web_search`, server-executed | `deepseek-v4-flash`; DeepSeek documents V4 Pro as not yet supported by Responses | Integrated through `openai-responses` |
+| DeepSeek | Responses `web_search`, server-executed | `deepseek-v4-flash` and `deepseek-v4-pro` | Integrated through `openai-responses` |
 | OpenAI API | Responses `web_search` tool | Maka currently enables the native path for GPT-5 families, whose runtime wire is already Responses | Integrated through `openai-responses` |
 | Custom Responses relay | Responses `web_search` tool when explicitly declared by model metadata | `openai-responses-compatible` connections with `apiProtocol=openai-responses` and `capabilities.webSearch=true` | Integrated through `openai-responses` |
 | xAI API / OAuth | Responses Agent Tools `web_search` | Maka currently enables the verified Grok 4.5 Responses route | Integrated through `openai-responses` |
@@ -204,18 +243,10 @@ search-heavy workflows that value source visibility over cache economics.
 
 ## Follow-up adapters
 
-Add adapters in this order:
-
-1. Add an opt-in `web_search_20260209` capability for Anthropic deployments
-   that support dynamic filtering; retain `20250305` as the compatibility
-   baseline used by Claude Code and third-party Anthropic-compatible services.
-2. Gemini grounding with Google Search.
-3. Z.AI native model tool. Keep its standalone Search API outside the
-   provider-native path.
-4. OpenRouter web plugin.
-5. Mistral Agents and Groq Compound, after defining their cost and result-row
-   projection contracts.
-
 Every adapter must execute in the primary model request, preserve provider tool
 events and citation metadata, keep credential isolation, and retain explicit
 no-fallback behavior.
+
+Adapter status and ordering live in the tracker rather than a duplicate list in this design.
+
+Tracking: [Provider-native web search #4330](https://github.com/apache/maka/issues/4330)

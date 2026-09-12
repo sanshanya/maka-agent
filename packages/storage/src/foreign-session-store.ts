@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /**
  * Read-only scanner + digest reader over foreign agent session stores
  * (#1057): Claude Code (~/.claude/projects) and Codex (~/.codex).
@@ -28,6 +47,7 @@ import { open, readdir, realpath, stat, type FileHandle } from 'node:fs/promises
 import { homedir } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
 import {
+  CODEX_SUPPORTED_THREAD_SOURCES,
   FOREIGN_SESSION_DIGEST_MAX_READ_BYTES,
   FOREIGN_SESSION_HEAD_BYTES,
   FOREIGN_SESSION_SCAN_MAX_AGE_MS,
@@ -519,13 +539,6 @@ async function codexStateDbsNewestFirst(codexRoot: string): Promise<string[]> {
 }
 
 /**
- * Codex source tokens as stored in the DB — bare for cli/vscode, JSON-wrapped
- * for the `custom` variants. Used as bound `source IN (…)` params so archived
- * / foreign-source rows are excluded IN SQL (before LIMIT), not after.
- */
-const CODEX_SOURCE_SQL_VALUES = ['cli', 'vscode', '{"custom":"atlas"}', '{"custom":"chatgpt"}'];
-
-/**
  * Read candidate thread rows from one state DB, filtered and ordered in SQL.
  * undefined = DB unusable (cannot open, or lacks the id/rollout_path columns)
  * so the caller descends to an older generation. An empty array is a real
@@ -563,20 +576,32 @@ async function readCodexThreadRows(
       const params: string[] = [];
       if (columns.has('archived')) where.push('(archived IS NULL OR archived = 0)');
       if (columns.has('source')) {
-        where.push(`source IN (${CODEX_SOURCE_SQL_VALUES.map(() => '?').join(', ')})`);
-        params.push(...CODEX_SOURCE_SQL_VALUES);
+        const sourceTokens = [...CODEX_SUPPORTED_THREAD_SOURCES];
+        const placeholders = sourceTokens.map(() => '?').join(', ');
+        // Keep unsupported rows from consuming the bounded SQL window, but
+        // derive this coarse prefilter from the same token authority as
+        // normalizeCodexThreadRow(). The JS gate remains authoritative over
+        // exact shapes after bare, wrapped-custom, and legacy NULL sources
+        // have survived the query.
+        where.push(`(
+          source IS NULL
+          OR source IN (${placeholders})
+          OR CASE WHEN json_valid(source)
+            THEN json_extract(source, '$.custom')
+          END IN (${placeholders})
+        )`);
+        params.push(...sourceTokens, ...sourceTokens);
       }
       // Filter cwd IN SQL, before LIMIT: otherwise a multi-project store with
       // many newer threads from other directories fills the LIMIT window and
       // the target project's older thread never reaches the JS-side filter.
-      // This is a COARSE pre-filter — the exact normalized path or its
-      // trailing-separator variant — so a stored `/target/` isn't dropped
-      // before the authoritative two-sided normalizePath() comparison in
-      // codexRowsToSummaries(); SQL cannot run normalizePath on the stored side.
+      // This is a COARSE pre-filter across source-native and host-normalized
+      // separator forms. The authoritative two-sided normalizePath()
+      // comparison still runs in codexRowsToSummaries().
       if (cwdFilter !== undefined && columns.has('cwd')) {
-        const norm = normalizePath(cwdFilter);
-        where.push('(cwd = ? OR cwd = ?)');
-        params.push(norm, norm + sep);
+        const variants = codexCwdSqlVariants(cwdFilter);
+        where.push(`cwd IN (${variants.map(() => '?').join(', ')})`);
+        params.push(...variants);
       }
       const orderColumn = columns.has('updated_at_ms')
         ? 'updated_at_ms'
@@ -683,4 +708,21 @@ function rolloutFilenameMatchesId(base: string, id: string): boolean {
 function normalizePath(path: string): string {
   const resolved = resolve(path);
   return resolved.endsWith(sep) && resolved !== sep ? resolved.slice(0, -1) : resolved;
+}
+
+export function codexCwdSqlVariants(path: string): string[] {
+  const variants = new Set<string>();
+  for (const candidate of [path, normalizePath(path)]) {
+    for (const separatorForm of [
+      candidate,
+      candidate.replaceAll('\\', '/'),
+      candidate.replaceAll('/', '\\'),
+    ]) {
+      const withoutTrailingSeparator = separatorForm.replace(/[\\/]+$/, '') || separatorForm;
+      variants.add(withoutTrailingSeparator);
+      variants.add(`${withoutTrailingSeparator}/`);
+      variants.add(`${withoutTrailingSeparator}\\`);
+    }
+  }
+  return [...variants];
 }

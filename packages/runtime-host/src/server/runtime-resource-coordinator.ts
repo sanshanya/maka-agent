@@ -1,4 +1,24 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { createHash } from 'node:crypto';
+import { userInfo } from 'node:os';
 import type { ShellRunSnapshotResult, ShellRunUpdate, ToolResultContent } from '@maka/core/events';
 import { isActiveShellRunStatus } from '@maka/core/shell-run';
 import {
@@ -6,17 +26,21 @@ import {
   type PtyControlWriter,
   type RuntimeResourceReader,
   type ShellRunBashInput,
-  type ShellRunLauncher,
+  type ShellRunPtySnapshot,
   type ShellRunWriteInput,
   ShellRunPtyControlClosedError,
   isShellRunResourceRef,
-} from '@maka/runtime';
+} from '@maka/runtime/shell-run-contract';
+import { type ShellRunLauncher } from '@maka/runtime/shell-tools';
+import { defaultShellPlan, ShellPreferenceError, type ShellPlan } from '@maka/runtime/shell-detect';
 import { isSessionNotFoundError } from '@maka/storage/execution-stores';
 import {
   decodeRuntimeResourceControllerAcquireResult,
   decodeRuntimeResourceControllerControlResult,
   decodeRuntimeResourceQueryResult,
   decodeRuntimeResourceStopResult,
+  decodeRuntimeResourceStartResult,
+  RUNTIME_RESOURCE_CONTROLLER_ACQUIRE_RESULT_MAX_BYTES,
   RUNTIME_RESOURCE_MAX_CONTROL_SEQUENCE,
   type OperationOutcome,
   type RuntimeResourceControllerAcquireInput,
@@ -28,12 +52,15 @@ import {
   type RuntimeResourceQueryResult,
   type RuntimeResourceRevision,
   type RuntimeResourceStopInput,
+  type RuntimeResourceStartInput,
 } from '../protocol/index.js';
 import type { RuntimeHostResidency } from './host-kernel.js';
 import type {
   ConnectionContext,
   RuntimeResourceOperationHandlerMap,
 } from './operation-dispatcher.js';
+import type { RuntimeHostAccessAuthority } from './access-authority.js';
+import { boundedFailureDiagnostic } from './failure-diagnostic.js';
 import { SessionAdmissionGate } from './session-admission-gate.js';
 import {
   boundedRuntimeResourceSnapshot,
@@ -51,7 +78,10 @@ interface RuntimeResourceSessionReader {
 }
 
 interface RuntimeResourceHeaderReader {
-  readHeader(sessionId: string): Promise<{ readonly status: string; readonly isArchived: boolean }>;
+  readHeader(sessionId: string): Promise<{
+    readonly cwd: string;
+    readonly isArchived: boolean;
+  }>;
 }
 
 interface RuntimeResourceManager
@@ -60,6 +90,7 @@ interface RuntimeResourceManager
     BackgroundTaskStopper,
     PtyControlWriter {
   inspectResource(sessionId: string, ref: string): Promise<ShellRunSnapshotResult>;
+  getLivePtySnapshot(sessionId: string, ref: string): ShellRunPtySnapshot | null;
   terminateAll(): Promise<void>;
 }
 
@@ -70,7 +101,15 @@ export interface HostRuntimeResourceCoordinatorInput {
   readonly sessionAdmission: SessionAdmissionGate;
   readonly acquireResidency: () => RuntimeHostResidency;
   readonly requestDrain: () => void;
+  readonly sessionAccessAuthority?: Pick<RuntimeHostAccessAuthority, 'activeSessionGrant'>;
   readonly onProjectionChanged?: (update: ShellRunUpdate) => void;
+  /**
+   * Fallback shell resolution for callers that do not carry a plan (e.g.
+   * integrated terminal launches, which capture their plan at launch). A
+   * caller-supplied plan — the turn's admission-time resolution — always
+   * wins, so a mid-turn settings change cannot split guidance from execution.
+   */
+  readonly resolveShell?: () => Promise<ShellPlan> | ShellPlan;
 }
 
 interface ControllerState {
@@ -93,7 +132,8 @@ export class HostRuntimeResourceCoordinator
   implements ShellRunLauncher, RuntimeResourceReader, BackgroundTaskStopper, PtyControlWriter
 {
   readonly handlers: RuntimeResourceOperationHandlerMap = {
-    'runtime.resource.query': (input) => this.#query(input),
+    'runtime.resource.query': (input, context) => this.#query(input, context),
+    'runtime.resource.start': (input) => this.#start(input),
     'runtime.resource.controller.acquire': (input, context) => this.#acquire(input, context),
     'runtime.resource.controller.control': (input, context) => this.#control(input, context),
     'runtime.resource.controller.release': (input, context) => this.#release(input, context),
@@ -106,7 +146,11 @@ export class HostRuntimeResourceCoordinator
   readonly #sessionAdmission: SessionAdmissionGate;
   readonly #acquireResidency: () => RuntimeHostResidency;
   readonly #requestDrain: () => void;
+  readonly #sessionAccessAuthority:
+    | Pick<RuntimeHostAccessAuthority, 'activeSessionGrant'>
+    | undefined;
   readonly #onProjectionChanged: (update: ShellRunUpdate) => void;
+  readonly #resolveShell: () => Promise<ShellPlan> | ShellPlan;
   readonly #resourceQueue = new ResourceSerialQueue();
   readonly #controllers = new Map<string, ControllerState>();
   readonly #controllerResources = new Map<string, string>();
@@ -121,14 +165,29 @@ export class HostRuntimeResourceCoordinator
     this.#sessionAdmission = input.sessionAdmission;
     this.#acquireResidency = input.acquireResidency;
     this.#requestDrain = input.requestDrain;
+    this.#sessionAccessAuthority = input.sessionAccessAuthority;
     this.#onProjectionChanged = input.onProjectionChanged ?? (() => undefined);
+    this.#resolveShell = input.resolveShell ?? defaultShellPlan;
   }
 
-  runForegroundBash(input: ShellRunBashInput): ReturnType<ShellRunLauncher['runForegroundBash']> {
-    return this.#sessionAdmission.run(input.sessionId, async () => {
-      await this.#assertActiveSession(input.sessionId);
-      return this.#manager.runForegroundBash(input);
-    });
+  async runForegroundBash(
+    input: ShellRunBashInput,
+  ): Promise<Awaited<ReturnType<ShellRunLauncher['runForegroundBash']>>> {
+    if (this.#draining) throw new Error('Runtime resources are draining');
+    const residency = this.#acquireResidency();
+    try {
+      const { execution } = await this.#sessionAdmission.run(input.sessionId, async () => {
+        if (this.#draining) throw new Error('Runtime resources are draining');
+        await this.#assertActiveSession(input.sessionId);
+        if (this.#draining) throw new Error('Runtime resources are draining');
+        const shell = input.shell ?? (await this.#resolveShell());
+        if (this.#draining) throw new Error('Runtime resources are draining');
+        return { execution: this.#manager.runForegroundBash({ ...input, shell }) };
+      });
+      return await execution;
+    } finally {
+      residency.release();
+    }
   }
 
   async runBackgroundBash(
@@ -148,8 +207,12 @@ export class HostRuntimeResourceCoordinator
     };
     try {
       return await this.#sessionAdmission.run(input.sessionId, async () => {
+        if (this.#draining) throw new Error('Runtime resources are draining');
         await this.#assertActiveSession(input.sessionId);
-        return this.#manager.runBackgroundBash({ ...input, onCompletion: complete });
+        if (this.#draining) throw new Error('Runtime resources are draining');
+        const shell = input.shell ?? (await this.#resolveShell());
+        if (this.#draining) throw new Error('Runtime resources are draining');
+        return this.#manager.runBackgroundBash({ ...input, shell, onCompletion: complete });
       });
     } catch (error) {
       complete({ successful: false });
@@ -229,73 +292,221 @@ export class HostRuntimeResourceCoordinator
     return updates.some((update) => isActiveShellRunStatus(update.result.status));
   }
 
-  #query(input: RuntimeResourceQueryInput): Promise<OperationOutcome<'runtime.resource.query'>> {
+  async #query(
+    input: RuntimeResourceQueryInput,
+    context: ConnectionContext,
+  ): Promise<OperationOutcome<'runtime.resource.query'>> {
     if (input.kind === 'get' && !isShellRunResourceRef(input.ref)) {
-      return Promise.resolve(
-        queryFailure('invalid_request', 'Runtime Resource ref is unsupported'),
-      );
+      return queryFailure('invalid_request', 'Runtime Resource ref is unsupported');
     }
-    return this.#sessionAdmission.run(input.sessionId, async () => {
-      try {
-        await this.#sessionHeaders.readHeader(input.sessionId);
-      } catch (error) {
-        if (isSessionNotFoundError(error)) {
-          return queryFailure('not_found', 'Session was not found');
-        }
-        this.#requestDrain();
-        return queryFailure('internal_failure', 'Session state is unavailable');
-      }
-      if (input.kind === 'get') {
+    const guestGrantId = this.#guestObservationGrantId(context, input.sessionId);
+    if (context.principalKind === 'session_guest' && !guestGrantId) {
+      return queryFailure('not_found', 'Session was not found');
+    }
+    const outcome: OperationOutcome<'runtime.resource.query'> = await this.#sessionAdmission.run(
+      input.sessionId,
+      async () => {
         try {
-          const resource = await this.#sessions.getShellRunUpdate(input.sessionId, input.ref);
-          const canonical = resource ? (canonicalRuntimeResources([resource])[0] ?? null) : null;
+          await this.#sessionHeaders.readHeader(input.sessionId);
+        } catch (error) {
+          if (isSessionNotFoundError(error)) {
+            return queryFailure('not_found', 'Session was not found');
+          }
+          return this.#canonicalReadFailure(error, 'Session state is unavailable');
+        }
+        if (input.kind === 'get') {
+          try {
+            const resource = await this.#sessions.getShellRunUpdate(input.sessionId, input.ref);
+            const visible =
+              context.principalKind !== 'session_guest' || resource?.sessionId === input.sessionId
+                ? resource
+                : null;
+            const canonical = visible ? (canonicalRuntimeResources([visible])[0] ?? null) : null;
+            return {
+              ok: true,
+              result: decodeRuntimeResourceQueryResult({
+                kind: 'resource',
+                sessionId: input.sessionId,
+                revision: runtimeResourceRevision(canonical ? [canonical] : []),
+                resource: canonical,
+              }),
+            };
+          } catch (error) {
+            return this.#canonicalReadFailure(error, 'Runtime Resource state is unavailable');
+          }
+        }
+        let updates: ShellRunUpdate[];
+        try {
+          updates = await this.#sessions.listShellRunUpdates(input.sessionId);
+          if (context.principalKind === 'session_guest') {
+            updates = updates.filter((update) => update.sessionId === input.sessionId);
+          }
+        } catch (error) {
+          return this.#canonicalReadFailure(error, 'Runtime Resource state is unavailable');
+        }
+        try {
+          const resources = canonicalRuntimeResources(updates);
+          const revision = runtimeResourceRevision(resources);
+          if (input.kind === 'list_continue' && input.revision !== revision) {
+            return {
+              ok: true,
+              result: { kind: 'revision_changed', expected: input.revision, actual: revision },
+            };
+          }
+          const offset = input.kind === 'list_start' ? 0 : decodeCursor(input.cursor);
+          if (
+            offset === undefined ||
+            offset > resources.length ||
+            (input.kind === 'list_continue' && offset === 0) ||
+            (input.kind === 'list_continue' && offset === resources.length)
+          ) {
+            return queryFailure('invalid_request', 'Runtime Resource cursor is invalid');
+          }
           return {
             ok: true,
-            result: decodeRuntimeResourceQueryResult({
-              kind: 'resource',
-              sessionId: input.sessionId,
-              revision: runtimeResourceRevision(canonical ? [canonical] : []),
-              resource: canonical,
-            }),
+            result: createRuntimeResourcePage(input.sessionId, revision, resources, offset),
           };
         } catch {
-          this.#requestDrain();
-          return queryFailure('internal_failure', 'Runtime Resource state is unavailable');
+          return queryFailure('internal_failure', 'Runtime Resource projection is unavailable');
         }
-      }
-      let updates: ShellRunUpdate[];
-      try {
-        updates = await this.#sessions.listShellRunUpdates(input.sessionId);
-      } catch {
-        this.#requestDrain();
-        return queryFailure('internal_failure', 'Runtime Resource state is unavailable');
-      }
-      try {
-        const resources = canonicalRuntimeResources(updates);
-        const revision = runtimeResourceRevision(resources);
-        if (input.kind === 'list_continue' && input.revision !== revision) {
-          return {
-            ok: true,
-            result: { kind: 'revision_changed', expected: input.revision, actual: revision },
-          };
+      },
+    );
+    return guestGrantId && this.#guestObservationGrantId(context, input.sessionId) !== guestGrantId
+      ? queryFailure('not_found', 'Session was not found')
+      : outcome;
+  }
+
+  #canonicalReadFailure(
+    error: unknown,
+    message: string,
+  ): OperationOutcome<'runtime.resource.query'> {
+    console.error(
+      `[runtime-host] canonical Runtime Resource read failed: ${boundedFailureDiagnostic(error)}`,
+    );
+    this.#requestDrain();
+    return queryFailure('internal_failure', message);
+  }
+
+  #guestObservationGrantId(context: ConnectionContext, sessionId: string): string | undefined {
+    if (context.principalKind !== 'session_guest') return;
+    return this.#sessionAccessAuthority?.activeSessionGrant(
+      context.principal,
+      sessionId,
+      'session_observation',
+    )?.grantId;
+  }
+
+  async #start(
+    input: RuntimeResourceStartInput,
+  ): Promise<OperationOutcome<'runtime.resource.start'>> {
+    const unavailable = await this.#mutableSessionFailure(input.sessionId);
+    if (unavailable) return mutationFailure('runtime.resource.start', unavailable);
+    try {
+      // Header read, shell resolution, launch, and the initial snapshot all
+      // share ONE admission section: a concurrent `session.workspace.relocate`
+      // can otherwise commit between reading `header.cwd` and the admitted
+      // launch, admitting the command with a stale cwd (#3210 review).
+      return await this.#sessionAdmission.run(input.sessionId, async () => {
+        if (this.#draining) throw new Error('Runtime resources are draining');
+        const admittedUnavailable = await this.#mutableSessionFailure(input.sessionId);
+        if (admittedUnavailable) {
+          return mutationFailure('runtime.resource.start', admittedUnavailable);
         }
-        const offset = input.kind === 'list_start' ? 0 : decodeCursor(input.cursor);
-        if (
-          offset === undefined ||
-          offset > resources.length ||
-          (input.kind === 'list_continue' && offset === 0) ||
-          (input.kind === 'list_continue' && offset === resources.length)
-        ) {
-          return queryFailure('invalid_request', 'Runtime Resource cursor is invalid');
+        const header = await this.#sessionHeaders.readHeader(input.sessionId);
+        if (this.#draining) throw new Error('Runtime resources are draining');
+        const shell = await this.#resolveShell();
+        if (this.#draining) throw new Error('Runtime resources are draining');
+        const env = { ...process.env };
+        let command: string;
+        if (input.command !== undefined) {
+          command = input.command;
+        } else if (shell.kind === 'git-bash') {
+          env.SHELL = shell.exe;
+          env.CHERE_INVOKING = '1';
+          env.DISABLE_AUTO_UPDATE = 'true';
+          env.DISABLE_UPDATE_PROMPT = 'true';
+          command = 'exec "$SHELL" -l';
+        } else if (shell.kind === 'legacy-wsl-bash') {
+          env.DISABLE_AUTO_UPDATE = 'true';
+          env.DISABLE_UPDATE_PROMPT = 'true';
+          command = 'exec bash -l';
+        } else if (shell.kind === 'posix') {
+          env.SHELL ||=
+            userInfo().shell || (process.platform === 'darwin' ? '/bin/zsh' : '/bin/sh');
+          env.DISABLE_AUTO_UPDATE = 'true';
+          env.DISABLE_UPDATE_PROMPT = 'true';
+          command = 'exec "$SHELL" -l';
+        } else if (shell.kind === 'cmd') {
+          command = '%ComSpec% /d /q';
+        } else {
+          const executable = (shell.exe ?? shell.displayName).replace(/'/g, "''");
+          command = `& '${executable}' -NoLogo`;
         }
-        return {
-          ok: true,
-          result: createRuntimeResourcePage(input.sessionId, revision, resources, offset),
+        const residency = this.#acquireResidency();
+        let completed = false;
+        const complete = (): void => {
+          if (completed) return;
+          completed = true;
+          residency.release();
         };
-      } catch {
-        return queryFailure('internal_failure', 'Runtime Resource projection is unavailable');
+        let launched: Awaited<ReturnType<ShellRunLauncher['runBackgroundBash']>>;
+        try {
+          launched = await this.#manager.runBackgroundBash({
+            sessionId: input.sessionId,
+            sourceTurnId: input.launchId,
+            sourceToolCallId: input.launchId,
+            // Only the one-shot `!<command>` resources this Client owns are
+            // hidden from the model; the Desktop interactive login shell (no
+            // `command`) keeps its prior model-visible visibility (#3210).
+            ...(input.command === undefined ? {} : { visibility: 'user' as const }),
+            cwd: header.cwd,
+            command,
+            env,
+            pty: input.command === undefined,
+            emitOutput: () => undefined,
+            shell,
+            onCompletion: complete,
+          });
+        } catch (launchError) {
+          complete();
+          throw launchError;
+        }
+        try {
+          return {
+            ok: true as const,
+            result: decodeRuntimeResourceStartResult({
+              resource: boundedRuntimeResourceSnapshot(
+                await this.#manager.inspectResource(input.sessionId, launched.ref),
+              ),
+            }),
+          };
+        } catch (inspectError) {
+          // The command is already live but the operation must not report a
+          // success it cannot honor: stop it so a client retry cannot
+          // double-execute (#3210 review). Best-effort — the surfaced error
+          // stays the inspection failure.
+          try {
+            await this.#manager.stopBackgroundTask(
+              input.sessionId,
+              launched.ref,
+              new AbortController().signal,
+              'client',
+            );
+          } catch {
+            /* keep the inspection failure as the surfaced cause */
+          }
+          throw inspectError;
+        }
+      });
+    } catch (error) {
+      if (error instanceof ShellPreferenceError) {
+        return mutationFailure('runtime.resource.start', {
+          code: 'invalid_request',
+          message: error.message,
+        });
       }
-    });
+      return this.#resourceFailure('runtime.resource.start', error);
+    }
   }
 
   #acquire(
@@ -350,13 +561,21 @@ export class HostRuntimeResourceCoordinator
           };
           this.#controllers.set(key, controller);
           this.#controllerResources.set(identity, key);
+          const pty = this.#manager.getLivePtySnapshot(input.sessionId, input.ref);
+          if (!pty) {
+            this.#releaseController(key);
+            return mutationFailure('runtime.resource.controller.acquire', {
+              code: 'operation_conflict',
+              message: 'Runtime Resource PTY is no longer available',
+            });
+          }
           return {
             ok: true,
-            result: decodeRuntimeResourceControllerAcquireResult({
-              controllerId: controller.controllerId,
-              nextSequence: controller.nextSequence,
-              resource: boundedRuntimeResourceSnapshot(snapshot),
-            }),
+            result: boundedControllerAcquireResult(
+              controller.controllerId,
+              controller.nextSequence,
+              pty,
+            ),
           };
         } catch (error) {
           return this.#resourceFailure('runtime.resource.controller.acquire', error);
@@ -414,6 +633,7 @@ export class HostRuntimeResourceCoordinator
           const controlled = await this.#manager.writeStdin({
             sessionId: input.sessionId,
             ref: input.ref,
+            caller: 'client',
             ...controlWrite(input.control),
           });
           const result = decodeRuntimeResourceControllerControlResult({
@@ -503,6 +723,7 @@ export class HostRuntimeResourceCoordinator
             input.sessionId,
             input.ref,
             new AbortController().signal,
+            'client',
           );
           this.#releaseControllerIfTerminal(input.sessionId, input.ref, result);
           return {
@@ -520,7 +741,7 @@ export class HostRuntimeResourceCoordinator
 
   async #assertActiveSession(sessionId: string): Promise<void> {
     const header = await this.#sessionHeaders.readHeader(sessionId);
-    if (header.isArchived || header.status === 'archived') {
+    if (header.isArchived) {
       throw new Error('Session is archived');
     }
   }
@@ -532,7 +753,7 @@ export class HostRuntimeResourceCoordinator
   > {
     try {
       const header = await this.#sessionHeaders.readHeader(sessionId);
-      return header.isArchived || header.status === 'archived'
+      return header.isArchived
         ? { code: 'session_archived', message: 'Session is archived' }
         : undefined;
     } catch (error) {
@@ -596,6 +817,27 @@ function controlWrite(
     case 'input_and_resize':
       return { input: control.input, size: { cols: control.cols, rows: control.rows } };
   }
+}
+
+function boundedControllerAcquireResult(
+  controllerId: string,
+  nextSequence: number,
+  snapshot: ShellRunPtySnapshot,
+): ReturnType<typeof decodeRuntimeResourceControllerAcquireResult> {
+  const pty = structuredClone(snapshot);
+  let result = { controllerId, nextSequence, pty };
+  while (
+    Buffer.byteLength(JSON.stringify(result), 'utf8') >
+    RUNTIME_RESOURCE_CONTROLLER_ACQUIRE_RESULT_MAX_BYTES
+  ) {
+    const codePoints = Array.from(pty.buffer);
+    if (codePoints.length === 0) {
+      throw new Error('Runtime Resource PTY metadata exceeds the wire limit');
+    }
+    pty.buffer = codePoints.slice(Math.ceil(codePoints.length / 2)).join('');
+    result = { controllerId, nextSequence, pty };
+  }
+  return decodeRuntimeResourceControllerAcquireResult(result);
 }
 
 function decodeCursor(cursor: string): number | undefined {

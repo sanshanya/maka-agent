@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import { access, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -5,7 +24,6 @@ import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import type { SessionEvent } from '@maka/core/events';
 import type { SessionSummary } from '@maka/core/session';
-import type { InvocationResult, RuntimeContinuation } from '@maka/runtime';
 import {
   decodeActivationRequest,
   parseMakaActivateArgs,
@@ -14,7 +32,7 @@ import {
   type MakaActivationDeps,
   type MakaActivationRuntime,
 } from '../activation-command.js';
-import { parseMakaCliArgs } from '../cli.js';
+import type { MakaRunOutcome } from '../run-command-core.js';
 
 const ROOTS = {
   stateRoot: '/tmp/maka-state',
@@ -59,38 +77,33 @@ function summary(overrides: Partial<SessionSummary> = {}): SessionSummary {
   };
 }
 
-function completedResult(sessionId = 'maka-session-1'): InvocationResult {
+function completedResult(): MakaRunOutcome {
   return {
-    invocationId: 'invocation-1',
-    runId: 'run-1',
-    sessionId,
-    turnId: 'turn-1',
+    outcomeId: 'run-1',
     status: 'completed',
-    finalOutput: 'done',
-    events: [
-      {
-        id: 'event-1',
-        invocationId: 'invocation-1',
-        runId: 'run-1',
-        sessionId,
-        turnId: 'turn-1',
-        ts: 1,
-        partial: false,
-        role: 'model',
-        author: 'agent',
-        content: { kind: 'text', text: 'done', apiKey: 'sk-test-secret' } as never,
-      },
-    ],
-    startedAt: 1,
-    finishedAt: 2,
+    finalOutput: 'done sk-test-secret',
+    sandboxBoundary: 'none',
   };
+}
+
+function completedEvents(): SessionEvent[] {
+  return [
+    {
+      type: 'text_delta',
+      id: 'event-1',
+      turnId: 'turn-1',
+      ts: 1,
+      messageId: 'message-1',
+      text: 'done',
+    },
+  ];
 }
 
 function fakeDeps(
   options: {
     input?: string;
     sessions?: SessionSummary[];
-    result?: InvocationResult;
+    result?: MakaRunOutcome;
     events?: SessionEvent[];
     onContext?: (input: Parameters<NonNullable<MakaActivationDeps['createContext']>>[0]) => void;
     onCreateSession?: () => void;
@@ -105,7 +118,7 @@ function fakeDeps(
     ) => AsyncIterable<SessionEvent>;
   } = {},
 ): MakaActivationDeps {
-  let observer: ((result: InvocationResult) => void | Promise<void>) | undefined;
+  let observer: ((result: MakaRunOutcome) => void | Promise<void>) | undefined;
   const sessions = options.sessions ?? [];
   const runtime: MakaActivationRuntime = {
     async createSession() {
@@ -115,25 +128,21 @@ function fakeDeps(
     listSessions: async () => sessions,
     ...(options.safeBoundaryResume
       ? {
-          planLatestAuthoritativeSafeBoundaryContinuation: async () => ({
-            disposition: 'continue' as const,
-            rejectionReasons: [],
-            diagnostics: [],
-            continuation: {} as RuntimeContinuation,
-          }),
-          async *resumeSafeBoundaryContinuation() {
-            options.onResume?.();
-            await observer?.(options.result ?? completedResult('maka-session-1'));
-          },
+          resumeLatest: async () =>
+            (async function* () {
+              options.onResume?.();
+              for (const event of options.events ?? completedEvents()) yield event;
+              await observer?.(options.result ?? completedResult());
+            })(),
         }
       : {}),
     async *sendMessage(sessionId, input) {
       if (options.sendMessage) {
         yield* options.sendMessage(runtime, sessionId, input);
       } else {
-        for (const event of options.events ?? []) yield event;
+        for (const event of options.events ?? completedEvents()) yield event;
       }
-      await observer?.(options.result ?? completedResult(sessionId));
+      await observer?.(options.result ?? completedResult());
     },
     async respondToSandboxBoundary(_sessionId, response) {
       options.onSandboxBoundaryResponse?.(response);
@@ -144,7 +153,7 @@ function fakeDeps(
   return {
     createContext: async (input) => {
       options.onContext?.(input);
-      observer = input.runtimeInvocationObserver;
+      observer = input.runOutcomeObserver;
       const context: MakaActivationContext = {
         runtime,
         target: {
@@ -178,13 +187,6 @@ function fakeDeps(
 }
 
 describe('maka activate argument and request contracts', () => {
-  test('routes activate through the CLI parser', () => {
-    assert.deepEqual(parseMakaCliArgs(['activate'], '0.1.0'), {
-      kind: 'activate',
-      args: [],
-    });
-  });
-
   test('requires explicit non-overlapping roots and accepts JSON input options', () => {
     assert.deepEqual(
       parseMakaActivateArgs([
@@ -369,6 +371,7 @@ describe('maka activate JSONL protocol', () => {
             status: 'failed',
             finalOutput: undefined,
             failure: { class: 'permission_denied' },
+            sandboxBoundary: 'unresolved',
           },
           onSandboxBoundaryResponse: (response) => responses.push(response),
           events: [
@@ -426,26 +429,7 @@ describe('maka activate JSONL protocol', () => {
           result: {
             ...completedResult(),
             finalOutput: 'continued after the failed write',
-            events: [
-              {
-                id: 'event-boundary-result',
-                invocationId: 'invocation-1',
-                runId: 'run-1',
-                sessionId: 'maka-session-1',
-                turnId: 'turn-1',
-                ts: 1,
-                partial: false,
-                role: 'tool',
-                author: 'tool',
-                content: {
-                  kind: 'function_response',
-                  id: 'tool-boundary',
-                  name: 'Write',
-                  isError: true,
-                  result: boundaryFailure,
-                },
-              },
-            ],
+            sandboxBoundary: 'unresolved',
           },
           events: [
             {
@@ -475,6 +459,59 @@ describe('maka activate JSONL protocol', () => {
       reason: 'permission_required',
       requiredAction: 'grant_permission',
     });
+  });
+
+  test('blocks a completed invocation whose stream carried a boundary failure', async () => {
+    // Guards the current contract: a completed invocation whose stream carried
+    // a boundary failure reports `blocked` / `permission_required` with exit 3.
+    // The `maka activate` transition itself (main completed with exit 0 when
+    // the classifier cleared `recovered`) is not regression-coverable after
+    // the deletion: `recovered` no longer exists in the outcome type, so an
+    // injected `MakaRunOutcome` cannot express the old shape.
+    const lines: string[] = [];
+    const boundaryFailure = {
+      kind: 'text',
+      text: 'Write requires an approved session sandbox boundary expansion.',
+      sandboxFailure: {
+        reason: 'sandbox_boundary_required',
+        requiredExpansion: {
+          filesystem: {
+            entries: [{ path: '/tmp/output', access: 'write', scope: 'subtree' }],
+          },
+        },
+      },
+    } as const;
+    const result = await runMakaActivationCli(
+      [
+        '--state-root',
+        ROOTS.stateRoot,
+        '--workspace-root',
+        ROOTS.workspaceRoot,
+        '--config-root',
+        ROOTS.configRoot,
+      ],
+      {
+        ...fakeDeps({
+          result: completedResult(),
+          events: [
+            {
+              type: 'tool_result',
+              id: 'event-boundary-result',
+              turnId: 'turn-1',
+              ts: 1,
+              toolUseId: 'tool-boundary',
+              isError: true,
+              content: boundaryFailure,
+            },
+          ],
+        }),
+        writeStdout: (text) => lines.push(text.trim()),
+      },
+    );
+
+    assert.equal(result, 3);
+    assert.equal(JSON.parse(lines.at(-1)!).status, 'blocked');
+    assert.equal(JSON.parse(lines.at(-1)!).reason, 'permission_required');
   });
 
   test('retries non-permission blocked sessions instead of requesting permission', async () => {

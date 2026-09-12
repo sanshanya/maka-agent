@@ -1,33 +1,78 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { randomUUID } from 'node:crypto';
-import { PROVIDER_DEFAULTS, type RuntimeExecutionConnection } from '@maka/core/llm-connections';
+import {
+  authorizeConnectionModel,
+  effectiveBaseUrl,
+  PROVIDER_REGISTRY,
+  type RuntimeExecutionConnection,
+} from '@maka/core/llm-connections';
 import { isModelExplicitlyUnsupportedForChat } from '@maka/core/model-catalog';
-import type { RuntimePolicy } from '@maka/core/runtime-policy';
+import { parseRequestHeaders, type RuntimePolicy } from '@maka/core/runtime-policy';
 import type { RuntimeEvent } from '@maka/core/runtime-event';
 import type { SessionHeader } from '@maka/core/session';
+import {
+  applyWorkHubRoutingPolicy,
+  bindWorkHubRoutingDecision,
+  decodeWorkHubIntent,
+  decodeWorkHubRecall,
+  projectWorkHubIntentModelInput,
+  projectWorkHubRecallModelInput,
+  WORKHUB_INTENT_SYSTEM_PROMPT,
+  WORKHUB_RECALL_SYSTEM_PROMPT,
+  workHubIntentRequiresRecall,
+  type WorkHubRoutingDecision,
+} from '@maka/core/workhub-routing';
 import type { ModelCallKind } from '@maka/core/usage-stats/types';
 import {
   buildPricingLookup,
-  buildProviderOptions,
-  buildSessionRecapMessages,
-  buildSessionTitlePrompt,
-  cleanGeneratedSessionTitle,
-  createProxiedFetchTransport,
-  generateToolFreeModelCall,
-  generateProviderPrefixModelCall,
-  modelUsesAnthropicMessages,
-  getAIModel,
   llmCallUsageFields,
   recordLlmCallStrict,
+} from '@maka/runtime/telemetry';
+import { buildProviderOptions, getAIModel } from '@maka/runtime/model-factory';
+import { stableHash } from '@maka/runtime/request-shape';
+import { buildSessionRecapMessages } from '@maka/runtime/session-recap';
+import {
+  buildSessionTitlePrompt,
+  cleanGeneratedSessionTitle,
   SESSION_TITLE_GENERATION_TIMEOUT_MS,
-  type BackendFactoryContext,
-  type GoalEvaluatorResource,
-  type ModelMessage,
+} from './session-title.js';
+import {
+  createProxiedFetchTransport,
   type ProxiedFetchProxy,
   type ProxiedFetchTransport,
+} from '@maka/runtime/network/scoped-fetch-transport';
+import {
+  generateToolFreeModelCall,
+  generateProviderPrefixModelCall,
   type ToolFreeModelCallContent,
-  type MemoryExtractionSourceSnapshot,
   ProviderPrefixModelCallUnavailableError,
-} from '@maka/runtime';
+} from '@maka/runtime/tool-free-model-call';
+import { resolveModelRuntime } from '@maka/runtime/model-runtime';
+import { type BackendFactoryContext } from '@maka/runtime/session-manager';
+import { type GoalEvaluatorResource } from '@maka/runtime/goal-evaluator';
+import { type ModelMessage } from '@maka/runtime/model-protocol';
+import {
+  memoryExtractionMaxOutputTokens,
+  type MemoryExtractionSourceSnapshot,
+} from '@maka/runtime/memory-extraction';
 import type { RuntimePolicyStoresWriter } from '@maka/storage/runtime-policy-stores';
 import type { InteractiveUsageStoresWriter } from '@maka/storage/usage-stores';
 import {
@@ -41,7 +86,6 @@ import { toRuntimePolicyProxy } from './runtime-policy-proxy.js';
 export interface HostGoalEvaluatorInput {
   readonly runtimePolicy: RuntimePolicyStoresWriter;
   readonly oauthCredentials: HostOAuthExecutionAuthority;
-  readonly claudeDeviceId: string;
   readonly usage: InteractiveUsageStoresWriter;
   readonly requestDrain: () => void;
   readonly readSessionHeader: (sessionId: string) => Promise<SessionHeader>;
@@ -96,6 +140,45 @@ export interface HostSessionEffectModel {
 
 export type HostSessionEffectModelInput = Omit<HostGoalEvaluatorInput, 'readSessionHeader'>;
 
+export interface HostPluginModel {
+  generate(input: {
+    readonly sessionId: string;
+    readonly prompt: string;
+    readonly system?: string;
+    readonly maxOutputTokens?: number;
+    readonly abortSignal: AbortSignal;
+  }): Promise<{ readonly text: string; readonly modelId: string; readonly finishReason?: string }>;
+}
+
+/** Canonical credential, transport, retry, pricing and telemetry path for plugin model calls. */
+export function createHostPluginModel(input: HostGoalEvaluatorInput): HostPluginModel {
+  const authority = createAuxiliaryModelCallAuthority(input);
+  return Object.freeze({
+    generate: async ({
+      sessionId,
+      prompt,
+      system,
+      maxOutputTokens,
+      abortSignal,
+    }: Parameters<HostPluginModel['generate']>[0]) => {
+      const header = await input.readSessionHeader(sessionId);
+      return runHostAuxiliaryModelCall(authority, {
+        transportContextId: sessionId,
+        telemetrySessionId: sessionId,
+        header,
+        callKind: 'main',
+        callId: `plugin_${authority.newId()}`,
+        abortSignal,
+        buildRequest: () => ({
+          prompt,
+          ...(system ? { system } : {}),
+          maxOutputTokens: maxOutputTokens ?? 2_048,
+        }),
+      });
+    },
+  });
+}
+
 export type HostDailyReviewModelResult =
   | { readonly ok: true; readonly text: string; readonly modelKey: string }
   | {
@@ -123,6 +206,93 @@ export interface HostMemoryExtractionModel {
   >;
 }
 
+export interface HostWorkHubRoutingModel {
+  decide(input: {
+    readonly turnId: string;
+    readonly header: SessionHeader;
+    readonly userText: string;
+    readonly transcript: readonly { readonly role: 'user' | 'assistant'; readonly text: string }[];
+    readonly resolveCandidates: () => Promise<{
+      readonly candidateSetId: string;
+      readonly candidates: readonly {
+        readonly candidateRef: string;
+        readonly sessionName: string;
+        readonly workspaceName: string;
+        readonly state: string;
+        readonly recency: 'today' | 'this_week' | 'older';
+      }[];
+    }>;
+    readonly abortSignal: AbortSignal;
+  }): Promise<WorkHubRoutingDecision>;
+}
+
+/** Uses the Coordination Session's exact saved model target for split Intent and Recall. */
+export function createHostWorkHubRoutingModel(
+  input: HostSessionEffectModelInput,
+): HostWorkHubRoutingModel {
+  const authority = createAuxiliaryModelCallAuthority(input);
+  return Object.freeze({
+    decide: async ({
+      turnId,
+      header,
+      userText,
+      transcript,
+      resolveCandidates,
+      abortSignal,
+    }: Parameters<HostWorkHubRoutingModel['decide']>[0]) => {
+      const intentResult = await runHostAuxiliaryModelCall(authority, {
+        transportContextId: header.id,
+        telemetrySessionId: header.id,
+        header,
+        callKind: 'workhub_intent',
+        callId: `workhub_intent_${turnId}`,
+        abortSignal,
+        buildRequest: () => ({
+          system: WORKHUB_INTENT_SYSTEM_PROMPT,
+          prompt: JSON.stringify(projectWorkHubIntentModelInput({ userText, transcript })),
+          maxOutputTokens: 80,
+          maxRetries: 0,
+        }),
+      });
+      const intent = decodeWorkHubIntent(parseStrictJsonObject(intentResult.text));
+      if (!workHubIntentRequiresRecall(intent)) {
+        return bindWorkHubRoutingDecision(
+          applyWorkHubRoutingPolicy(intent, { kind: 'not_applicable' }),
+        );
+      }
+      const { candidateSetId, candidates } = await resolveCandidates();
+      const recallInput = projectWorkHubRecallModelInput({ userText, intent, candidates });
+      const recallResult = await runHostAuxiliaryModelCall(authority, {
+        transportContextId: header.id,
+        telemetrySessionId: header.id,
+        header,
+        callKind: 'workhub_recall',
+        callId: `workhub_recall_${turnId}`,
+        abortSignal,
+        buildRequest: () => ({
+          system: WORKHUB_RECALL_SYSTEM_PROMPT,
+          prompt: JSON.stringify(recallInput),
+          maxOutputTokens: 160,
+          maxRetries: 0,
+        }),
+      });
+      const recall = decodeWorkHubRecall(
+        parseStrictJsonObject(recallResult.text),
+        new Set(recallInput.candidates.map(({ candidateRef }) => candidateRef)),
+      );
+      return bindWorkHubRoutingDecision(applyWorkHubRoutingPolicy(intent, recall), candidateSetId);
+    },
+  });
+}
+
+function parseStrictJsonObject(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+    throw new Error('WorkHub routing model did not return a JSON object');
+  }
+  return JSON.parse(trimmed);
+}
+
 /** Creates bounded extraction calls on the source Session's model authority. */
 export function createHostMemoryExtractionModel(
   input: HostSessionEffectModelInput,
@@ -136,6 +306,7 @@ export function createHostMemoryExtractionModel(
       abortSignal,
     }: Parameters<HostMemoryExtractionModel['generate']>[0]) => {
       try {
+        const maxOutputTokens = memoryExtractionMaxOutputTokens(snapshot);
         const result = await runHostAuxiliaryModelCall(authority, {
           transportContextId: snapshot.sessionId,
           telemetrySessionId: snapshot.sessionId,
@@ -147,21 +318,25 @@ export function createHostMemoryExtractionModel(
             stage === 'canonicalize'
               ? {
                   prompt,
-                  maxOutputTokens: snapshot.sourceMaxOutputTokens ?? 2_048,
+                  maxOutputTokens,
                   maxRetries: 0,
                 }
-              : {
-                  ...(snapshot.sourceSystemPrompt ? { system: snapshot.sourceSystemPrompt } : {}),
-                  messages: [...snapshot.sourceMessages, { role: 'user', content: prompt }],
-                  tools: snapshot.sourceTools,
-                  activeTools: snapshot.sourceActiveTools,
-                  ...(snapshot.sourceProviderOptions
-                    ? { providerOptions: snapshot.sourceProviderOptions }
-                    : {}),
-                  ...(snapshot.sourceMaxOutputTokens !== undefined
-                    ? { maxOutputTokens: snapshot.sourceMaxOutputTokens }
-                    : {}),
-                },
+              : snapshot.trigger === 'compaction'
+                ? {
+                    messages: [...snapshot.sourceMessages, { role: 'user', content: prompt }],
+                    maxOutputTokens,
+                    maxRetries: 0,
+                  }
+                : {
+                    ...(snapshot.sourceSystemPrompt ? { system: snapshot.sourceSystemPrompt } : {}),
+                    messages: [...snapshot.sourceMessages, { role: 'user', content: prompt }],
+                    tools: snapshot.sourceTools,
+                    activeTools: snapshot.sourceActiveTools,
+                    ...(snapshot.sourceProviderOptions
+                      ? { providerOptions: snapshot.sourceProviderOptions }
+                      : {}),
+                    maxOutputTokens,
+                  },
         });
         return { ok: true as const, text: result.text };
       } catch (error) {
@@ -190,11 +365,12 @@ export function createHostDailyReviewModel(
         const header = await readAuxiliaryPreflight(authority, effectiveAbortSignal, () =>
           resolveDailyReviewHeader(authority.runtimePolicy, modelKey),
         );
+        const callId = authority.newId();
         const result = await runHostAuxiliaryModelCall(authority, {
-          transportContextId: 'daily-review',
+          transportContextId: callId,
           header,
           callKind: 'daily_review',
-          callId: `daily_review_${authority.newId()}`,
+          callId: `daily_review_${callId}`,
           abortSignal: effectiveAbortSignal,
           buildRequest: () => ({ prompt, maxOutputTokens: 2_048 }),
         });
@@ -324,7 +500,6 @@ type AuxiliaryModelCallAuthorityInput = Pick<
   HostGoalEvaluatorInput,
   | 'runtimePolicy'
   | 'oauthCredentials'
-  | 'claudeDeviceId'
   | 'usage'
   | 'requestDrain'
   | 'createFetchTransport'
@@ -335,7 +510,6 @@ type AuxiliaryModelCallAuthorityInput = Pick<
 interface AuxiliaryModelCallAuthority {
   readonly runtimePolicy: RuntimePolicyStoresWriter;
   readonly oauthCredentials: HostOAuthExecutionAuthority;
-  readonly claudeDeviceId: string;
   readonly usage: InteractiveUsageStoresWriter;
   readonly createFetchTransport: (proxy: ProxiedFetchProxy | null) => ProxiedFetchTransport;
   readonly telemetry: {
@@ -353,6 +527,7 @@ type AuxiliaryModelRequest =
       readonly maxOutputTokens: number;
       readonly maxRetries?: number;
       readonly system?: string;
+      readonly providerOptions?: Record<string, unknown>;
       readonly tools?: never;
     })
   | {
@@ -367,8 +542,11 @@ type AuxiliaryModelRequest =
 interface HostAuxiliaryModelCallInput {
   readonly transportContextId: string;
   readonly telemetrySessionId?: string;
-  readonly header: Pick<SessionHeader, 'llmConnectionSlug' | 'model' | 'thinkingLevel'>;
-  readonly callKind: Exclude<ModelCallKind, 'main'>;
+  readonly header: Pick<
+    SessionHeader,
+    'llmConnectionId' | 'llmConnectionSlug' | 'model' | 'thinkingLevel'
+  >;
+  readonly callKind: ModelCallKind;
   readonly callId: string;
   readonly abortSignal: AbortSignal;
   readonly buildRequest: (target: ResolvedExecutionTarget) => AuxiliaryModelRequest;
@@ -386,7 +564,6 @@ function createAuxiliaryModelCallAuthority(
   return {
     runtimePolicy: input.runtimePolicy,
     oauthCredentials: input.oauthCredentials,
-    claudeDeviceId: input.claudeDeviceId,
     usage: input.usage,
     createFetchTransport: input.createFetchTransport ?? createProxiedFetchTransport,
     telemetry: {
@@ -451,7 +628,6 @@ async function runHostAuxiliaryModelCall(
         connection: target.connection,
         sessionId: input.transportContextId,
         modelId: target.model,
-        claudeDeviceId: authority.claudeDeviceId,
         fetchFn: transport.fetch,
       });
     }
@@ -470,30 +646,35 @@ async function runHostAuxiliaryModelCall(
       | Awaited<ReturnType<typeof generateProviderPrefixModelCall>>;
     try {
       result = await readDuringBackendCreation(() => {
+        const runtime = resolveModelRuntime(target.connection, target.model);
+        const providerOptions = buildProviderOptions(
+          target.connection,
+          target.model,
+          input.header.thinkingLevel,
+          runtime,
+        );
         const model = getAIModel({
+          sessionId: input.transportContextId,
           connection: target.connection,
           apiKey,
           modelId: target.model,
           fetch: modelFetch,
+          requestHeaders: target.requestHeaders,
+          resolvedRuntime: runtime,
         });
         return request.tools !== undefined
           ? generateProviderPrefixModelCall({
               model,
               ...request,
-              toolChoicePolicy: modelUsesAnthropicMessages(target.connection, target.model)
-                ? 'omit'
-                : 'none',
+              toolChoicePolicy: runtime.wire === 'anthropic-messages' ? 'omit' : 'none',
               abortSignal: input.abortSignal,
+              providerOptions: request.providerOptions ?? providerOptions,
             })
           : generateToolFreeModelCall({
               model,
               ...request,
               abortSignal: input.abortSignal,
-              providerOptions: buildProviderOptions(
-                target.connection,
-                target.model,
-                input.header.thinkingLevel,
-              ),
+              providerOptions: request.providerOptions ?? providerOptions,
             });
       }, input.abortSignal);
       const oauthFailure = readDeferredOAuthFailure?.();
@@ -691,19 +872,56 @@ class AuxiliaryModelCallConfigurationError extends Error {
   }
 }
 
-interface ResolvedExecutionTarget {
+export interface ResolvedExecutionTarget {
   readonly connection: RuntimeExecutionConnection;
   readonly model: string;
   readonly apiKey: string;
+  readonly requestHeaders: Readonly<Record<string, string>>;
   readonly oauthBinding?: HostOAuthExecutionBinding;
   readonly networkProxy: RuntimePolicy['networkProxy'];
   readonly proxySecret?: string;
+  readonly providerStateIdentity: `sha256:${string}`;
+}
+
+type ExecutionRouteHeader = Pick<
+  BackendFactoryContext['header'],
+  'llmConnectionId' | 'llmConnectionSlug' | 'model'
+>;
+
+function executionConnectionRef(header: ExecutionRouteHeader) {
+  return header.llmConnectionId === undefined
+    ? { kind: 'catalog_slug' as const, connectionSlug: header.llmConnectionSlug }
+    : {
+        kind: 'bound' as const,
+        connectionId: header.llmConnectionId,
+        connectionSlug: header.llmConnectionSlug,
+      };
+}
+
+function providerStateIdentityForResolvedExecution(
+  resolved: Extract<
+    Awaited<ReturnType<RuntimePolicyStoresWriter['operations']['resolveExecutionConnection']>>,
+    { kind: 'ready' }
+  >,
+): `sha256:${string}` {
+  const credentialBasis = (material: typeof resolved.secretMaterial.connection) =>
+    material ? { credentialId: material.credentialId, revision: material.revision } : null;
+  return stableHash({
+    protocol: 'provider_state_identity_v1',
+    connectionId: resolved.connection.connectionId,
+    providerType: resolved.connection.providerType,
+    endpoint: new URL(effectiveBaseUrl(resolved.connection)).toString(),
+    credential: credentialBasis(resolved.secretMaterial.connection),
+    requestHeaders: credentialBasis(resolved.secretMaterial.requestHeaders),
+  });
 }
 
 async function resolveDailyReviewHeader(
   runtimePolicy: RuntimePolicyStoresWriter,
   modelKey: string,
-): Promise<Pick<SessionHeader, 'llmConnectionSlug' | 'model' | 'thinkingLevel'>> {
+): Promise<
+  Pick<SessionHeader, 'llmConnectionId' | 'llmConnectionSlug' | 'model' | 'thinkingLevel'>
+> {
   const explicit = parseDailyReviewModelKey(modelKey);
   if (modelKey.trim() && !explicit) {
     throw new AuxiliaryModelCallConfigurationError('Daily Review model key is invalid');
@@ -726,6 +944,7 @@ async function resolveDailyReviewHeader(
     );
   }
   return {
+    llmConnectionId: connection.connectionId,
     llmConnectionSlug: connection.slug,
     model: target.modelId,
     thinkingLevel: 'off',
@@ -745,26 +964,35 @@ function parseDailyReviewModelKey(
 }
 
 export async function resolveExecutionTarget(
-  header: Pick<BackendFactoryContext['header'], 'llmConnectionSlug' | 'model' | 'thinkingLevel'>,
-  runtimePolicy: RuntimePolicyStoresWriter,
+  header: Pick<
+    BackendFactoryContext['header'],
+    'llmConnectionId' | 'llmConnectionSlug' | 'model' | 'thinkingLevel'
+  >,
+  runtimePolicy: {
+    readonly operations: Pick<
+      RuntimePolicyStoresWriter['operations'],
+      'resolveExecutionConnection'
+    >;
+  },
   oauthCredentials: HostOAuthExecutionAuthority,
   createFetchTransport: (proxy: ProxiedFetchProxy | null) => ProxiedFetchTransport,
 ): Promise<ResolvedExecutionTarget> {
   const resolved = await runtimePolicy.operations.resolveExecutionConnection(
-    header.llmConnectionSlug,
+    executionConnectionRef(header),
   );
   if (resolved.kind !== 'ready') {
     throw new AuxiliaryModelCallConfigurationError(
       `Runtime Host model connection is not ready: ${resolved.kind}`,
     );
   }
-  const provider = PROVIDER_DEFAULTS[resolved.connection.providerType];
-  if (!provider || provider.runtimeAdapter.kind === 'unavailable') {
+  const provider = PROVIDER_REGISTRY[resolved.connection.providerType];
+  if (!provider) {
     throw new AuxiliaryModelCallConfigurationError('Runtime Host model provider is not executable');
   }
   const model = header.model.trim();
-  const modelInfo = resolved.connection.models.find((candidate) => candidate.id === model);
-  if (!model || !resolved.connection.enabledModelIds.includes(model) || !modelInfo) {
+  const discovered = resolved.connection.models.some((candidate) => candidate.id === model);
+  const modelInfo = authorizeConnectionModel(resolved.connection, model);
+  if (!model || !modelInfo) {
     throw new AuxiliaryModelCallConfigurationError(
       'Runtime Host Session model is not enabled by its canonical connection',
     );
@@ -775,13 +1003,27 @@ export async function resolveExecutionTarget(
     );
   }
 
+  // Relay profiles are part of the canonical connection so provider options
+  // and declared model capabilities derive from the same policy snapshot.
   const connection: RuntimeExecutionConnection = {
     slug: resolved.connection.slug,
     providerType: resolved.connection.providerType,
     ...(resolved.connection.baseUrl ? { baseUrl: resolved.connection.baseUrl } : {}),
     defaultModel: model,
-    models: [...resolved.connection.models],
+    models: discovered
+      ? [...resolved.connection.models]
+      : [...resolved.connection.models, modelInfo],
+    ...(resolved.connection.relayModelProfiles === undefined
+      ? {}
+      : { relayModelProfiles: resolved.connection.relayModelProfiles }),
+    ...(resolved.connection.requestBodyOverlay === undefined
+      ? {}
+      : { requestBodyOverlay: resolved.connection.requestBodyOverlay }),
   };
+  const requestHeaders = resolved.secretMaterial.requestHeaders
+    ? parseRequestHeaders(resolved.secretMaterial.requestHeaders.secret)
+    : {};
+  const providerStateIdentity = providerStateIdentityForResolvedExecution(resolved);
   if (provider.authKind === 'oauth_token') {
     const material = resolved.secretMaterial.connection;
     if (!material) {
@@ -797,13 +1039,16 @@ export async function resolveExecutionTarget(
       connection,
       model,
       apiKey: '',
+      requestHeaders,
       oauthBinding: oauthCredentials.bind({
         providerType: resolved.connection.providerType,
+        connectionId: resolved.connection.connectionId,
         connectionSlug: resolved.connection.slug,
         material,
         createRefreshTransport: () => createFetchTransport(refreshProxy),
       }),
       networkProxy: resolved.networkProxy,
+      providerStateIdentity,
       ...(resolved.secretMaterial.networkProxy
         ? { proxySecret: resolved.secretMaterial.networkProxy.secret }
         : {}),
@@ -814,7 +1059,9 @@ export async function resolveExecutionTarget(
     connection,
     model,
     apiKey: resolved.secretMaterial.connection?.secret ?? '',
+    requestHeaders,
     networkProxy: resolved.networkProxy,
+    providerStateIdentity,
     ...(resolved.secretMaterial.networkProxy
       ? { proxySecret: resolved.secretMaterial.networkProxy.secret }
       : {}),

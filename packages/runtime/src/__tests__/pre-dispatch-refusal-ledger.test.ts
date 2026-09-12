@@ -1,17 +1,41 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { nextId } from '@maka/core/test-only/async-primitives';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import {
-  scanToolLedger,
-  type LlmConnection,
-  type RuntimeEvent,
-  type SessionEvent,
-  type SessionHeader,
-} from '@maka/core';
+import { type LlmConnection } from '@maka/core/llm-connections';
+
+import { type RuntimeEvent } from '@maka/core/runtime-event';
+
+import { type SessionEvent } from '@maka/core/events';
+
+import { type SessionHeader } from '@maka/core/session';
+import { scanToolLedger } from '@maka/core/tool-ledger-scanner';
 import { z } from 'zod';
 
-import { createSessionEventMapMemory, mapSessionEventToRuntimeEvent } from '../ai-sdk-flow.js';
-import type { InvocationContext } from '../invocation-context.js';
+import {
+  createSessionEventMapMemory,
+  mapSessionEventToRuntimeEvent,
+} from '../session-event-runtime-mapper.js';
+import type { RuntimeEventMapContext } from '../session-event-runtime-mapper.js';
 import type { RuntimeCommitSink } from '../runtime-commit-sink.js';
 import { LOOP_GATE_IDENTICAL_THRESHOLD, type MakaTool, type ToolRuntime } from '../tool-runtime.js';
 import { createTestToolRuntime } from './execution-boundary-test-helpers.js';
@@ -34,7 +58,7 @@ const RUN_ID = 'run-1';
 const INVOCATION_ID = 'invocation-1';
 const TURN_ID = 'turn-1';
 
-/** `agent_swarm`'s shape: per-item cross-field rule, which is what DeepSeek tripped. */
+/** Batch-like per-item cross-field validation, which is what DeepSeek tripped. */
 const swarmLikeSchema = z
   .object({
     items: z.array(
@@ -96,12 +120,8 @@ function projectLedger(h: LedgerHarness): RuntimeEvent[] {
     invocationId: INVOCATION_ID,
     runId: RUN_ID,
     turnId: TURN_ID,
-    source: 'test',
-    startedAt: 1,
-    request: { sessionId: SESSION_ID, turnId: TURN_ID, text: '', source: 'test' },
-    newId: () => 'unused',
     now: () => 1,
-  } satisfies InvocationContext;
+  } satisfies RuntimeEventMapContext;
   const generic = h.events
     .map((event) => mapSessionEventToRuntimeEvent(event, ctx, memory))
     .filter((event) => {
@@ -122,7 +142,6 @@ function runtimeInput(h: LedgerHarness) {
     runId: RUN_ID,
     invocationId: INVOCATION_ID,
     runtimeCommitSink: h.sink,
-    appendMessage: async () => {},
     newId: nextId(),
     now: () => 1,
     getPermissionPauseTarget: () => null,
@@ -162,13 +181,27 @@ function ledgerIssues(h: LedgerHarness): string[] {
 }
 
 const swarmTool: MakaTool = {
-  name: 'agent_swarm',
+  name: 'exclusive_batch',
   description: 'test',
   parameters: swarmLikeSchema,
   impl: async () => {
     assert.fail('invalid arguments must not reach the implementation');
   },
 };
+
+function clientCapabilityTool(): MakaTool {
+  return {
+    name: 'browser_click',
+    description: 'test',
+    categoryHint: 'client_capability',
+    hostAdmission: 'client_capability',
+    parameters: z.object({}),
+    prepareExecution: async () => {
+      assert.fail('a pre-dispatch refusal must not prepare Client Capability work');
+    },
+    impl: async () => ({ ok: true }),
+  };
+}
 
 /**
  * Every pre-dispatch refusal, not just the one that produced the bug report.
@@ -197,7 +230,7 @@ const REFUSAL_PATHS: Array<{
     name: 'exclusive-step admission',
     expect: /cannot share an assistant step/,
     drive: async (h) => {
-      // agent_swarm is `exclusive_step`: the second call in one step is refused.
+      // An `exclusive_step` tool refuses the second call in one step.
       const runtime = runtimeFor(h);
       const ok = { items: [{ item_id: 'a', task: 'one', subagent_id: 'reviewer' }] };
       const tool: MakaTool = {
@@ -255,7 +288,7 @@ const REFUSAL_PATHS: Array<{
   },
   {
     name: 'deferred tool used before its load',
-    expect: /load_tools/,
+    expect: /tool_search/,
     drive: async (h) => {
       const runtime = runtimeFor(h);
       runtime.setGating({ gatedNames: new Set(['Deferred']), activeNames: () => new Set() });
@@ -278,14 +311,7 @@ const REFUSAL_PATHS: Array<{
           throw new Error('boundary read exploded');
         },
       });
-      const tool: MakaTool = {
-        name: 'browser_click',
-        description: 'test',
-        categoryHint: 'client_capability',
-        parameters: z.object({}),
-        impl: async () => ({ ok: true }),
-      };
-      return settle(h, tool, {}, { runtime, toolCallId: 'call_boundary_read' });
+      return settle(h, clientCapabilityTool(), {}, { runtime, toolCallId: 'call_boundary_read' });
     },
   },
   {
@@ -293,14 +319,7 @@ const REFUSAL_PATHS: Array<{
     expect: /require the Bypass execution boundary/,
     drive: (h) => {
       // The default test boundary is `external`, not `bypass`.
-      const tool: MakaTool = {
-        name: 'browser_click',
-        description: 'test',
-        categoryHint: 'client_capability',
-        parameters: z.object({}),
-        impl: async () => ({ ok: true }),
-      };
-      return settle(h, tool, {}, { toolCallId: 'call_boundary_blocked' });
+      return settle(h, clientCapabilityTool(), {}, { toolCallId: 'call_boundary_blocked' });
     },
   },
 ];
@@ -327,10 +346,25 @@ for (const path of REFUSAL_PATHS) {
   });
 }
 
+test('client-capability refusal carries actionable bypass metadata', async () => {
+  const h = harness();
+  await settle(h, clientCapabilityTool(), {}, { toolCallId: 'call_boundary_metadata' });
+
+  const result = h.events.find(
+    (event) => event.type === 'tool_result' && event.toolUseId === 'call_boundary_metadata',
+  );
+  assert.deepEqual(
+    result?.type === 'tool_result' && result.content.kind === 'text'
+      ? result.content.sandboxFailure
+      : undefined,
+    { reason: 'requires_bypass', source: 'client_capability' },
+  );
+});
+
 test('arguments the schema rejects leave a matched call/response pair on the generic lane', async () => {
   const h = harness();
 
-  const { result } = await settle(h, swarmTool, {
+  const settlement = await settle(h, swarmTool, {
     items: [
       { item_id: 'a', task: 'one', subagent_id: 'reviewer' },
       { item_id: 'b', task: 'two', subagent_id: 'reviewer' },
@@ -341,8 +375,8 @@ test('arguments the schema rejects leave a matched call/response pair on the gen
 
   // The refusal still reaches the model, unchanged.
   assert.match(
-    (result as { error?: string }).error ?? '',
-    /Tool "agent_swarm" arguments failed validation/,
+    (settlement.result as { error?: string }).error ?? '',
+    /Tool "exclusive_batch" arguments failed validation/,
   );
 
   // Nothing crossed T1: no prepared/dispatch/outcome commit for a call that
@@ -372,7 +406,7 @@ test('arguments the schema rejects leave a matched call/response pair on the gen
 test('a dispatched call still claims the T1 lane and settles through the commit sink', async () => {
   const h = harness();
   const tool: MakaTool = {
-    name: 'agent_swarm',
+    name: 'exclusive_batch',
     description: 'test',
     parameters: swarmLikeSchema,
     impl: async () => ({ ok: true }),
@@ -402,19 +436,12 @@ test('a dispatched call still claims the T1 lane and settles through the commit 
   assert.ok(operation?.dispatchEvent, 'the T1 dispatch fact is missing');
   assert.ok(operation?.responseEvent, 'the T1 outcome fact is missing');
 });
-
-function nextId(): () => string {
-  let sequence = 0;
-  return () => `id-${++sequence}`;
-}
-
 function header(): SessionHeader {
   return {
     id: SESSION_ID,
     workspaceRoot: '/workspace',
     cwd: '/workspace',
     createdAt: 1,
-    lastUsedAt: 1,
     name: 'Test',
     titleIsManual: true,
     isFlagged: false,

@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 // apps/desktop/src/renderer/command-palette.tsx
 //
 // ⌘K (Ctrl+K off macOS) command palette. Combines static actions (new chat, theme
@@ -7,6 +26,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ICON_SIZE,
   ChevronRight,
   CornerDownLeft,
 } from '@maka/ui/icons';
@@ -17,6 +37,7 @@ import {
   AstryxLocaleProvider,
   type SearchSource,
   type SearchableItem,
+  PlatformShortcutText,
   useUiLocale,
 } from '@maka/ui';
 import { Kbd } from '@astryxdesign/core/Kbd';
@@ -119,6 +140,13 @@ export function CommandPalette(props: {
           if (!command) return false;
           if (fuzzy(normalized, command.label)) return true;
           if (command.hint && fuzzy(normalized, command.hint)) return true;
+          if (
+            command.platformHint &&
+            (fuzzy(normalized, command.platformHint.apple) ||
+              fuzzy(normalized, command.platformHint.other))
+          ) {
+            return true;
+          }
           return command.keywords?.some((keyword) =>
             fuzzy(normalized, keyword),
           ) ?? false;
@@ -151,11 +179,12 @@ export function CommandPalette(props: {
           />
         )}
         emptySearchText={(
+          /* Filter empty (DESIGN.md §10 tier 1): no clear action here — the
+             palette input itself is the exit from a no-match search. */
           <EmptyState
             role="presentation"
             className="maka-palette-empty"
             title={copy.emptyTitle}
-            description={copy.emptyDescription}
             isCompact
           />
         )}
@@ -167,17 +196,22 @@ export function CommandPalette(props: {
           return (
             <>
               <span className="maka-palette-icon" aria-hidden="true">
-                <command.Icon size={15} />
+                <command.Icon size={ICON_SIZE.chrome} />
               </span>
               <span className="maka-palette-label">{command.label}</span>
-              {command.hint ? (
+              {command.hint || command.platformHint ? (
                 <span className="maka-palette-hint">
-                  {command.hint}
-                  <ChevronRight size={12} aria-hidden="true" />
+                  {command.hint ?? (
+                    <PlatformShortcutText
+                      apple={command.platformHint!.apple}
+                      other={command.platformHint!.other}
+                    />
+                  )}
+                  <ChevronRight size={ICON_SIZE.meta} aria-hidden="true" />
                 </span>
               ) : (
                 <span className="maka-palette-hint maka-palette-cursor" aria-hidden="true">
-                  <CornerDownLeft size={12} />
+                  <CornerDownLeft size={ICON_SIZE.meta} />
                 </span>
               )}
             </>

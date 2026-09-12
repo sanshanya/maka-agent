@@ -1,20 +1,45 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import type {
   BranchFromTurnInput,
-  QuoteRef,
   RegenerateTurnInput,
   ReviseBeforeTurnInput,
   TurnOrchestration,
-  UserQuestionResponse,
-} from '@maka/core';
-import type { SandboxBoundaryResponse } from '@maka/core/sandbox-boundary';
+} from '@maka/core/runtime-inputs';
 import {
-  isCanonicalStorageRef,
-  isOrchestrationMode,
-  isTurnOrchestrationSource,
-} from '@maka/core';
+  isDirectoryReference,
+  DIRECTORY_REFERENCE_MAX_COUNT,
+  type DirectoryReference,
+  type QuoteRef,
+} from '@maka/core/events';
+import type { UserQuestionResponse } from '@maka/core/user-question';
+import type { SandboxBoundaryResponse } from '@maka/core/sandbox-boundary';
+import type { ClientCapabilityResponse } from '@maka/core/client-capability-grant';
+import { MAX_ATTACHMENT_COUNT } from '@maka/core/attachments';
+import { isAttachmentRef, isCanonicalStorageRef, type AttachmentRef } from '@maka/core/events';
+
+import { isOrchestrationMode, isTurnOrchestrationSource } from '@maka/core/orchestration';
 
 const MAX_PERMISSION_REQUEST_ID_LENGTH = 128;
 const MAX_TURN_ID_LENGTH = 128;
+const MAX_COPY_ID_LENGTH = 128;
 const MAX_BRANCH_NAME_LENGTH = 200;
 const MAX_SESSION_SEND_TEXT_LENGTH = 128_000;
 const MAX_QUOTE_COUNT = 16;
@@ -28,19 +53,28 @@ interface WorkspaceFileReferencePosition {
   start: number;
 }
 
+export type RuntimeHostBranchFromTurnInput = BranchFromTurnInput & { copyId: string };
+export type RuntimeHostReviseBeforeTurnInput = ReviseBeforeTurnInput & { copyId: string };
+
 interface NormalizedSendSessionCommand {
   type: 'send';
+  messageId?: string;
   turnId?: string;
   text: string;
   displayText?: string;
-  voiceOperationId?: string;
   skillIds?: string[];
   attachmentItems?: unknown;
+  retainedAttachments?: AttachmentRef[];
   turnOrchestration?: TurnOrchestration;
+  directoryReferences?: DirectoryReference[];
   quotes?: QuoteRef[];
   workspaceFileReferences?: WorkspaceFileReferencePosition[];
 }
-type NormalizedStopSessionInput = { source?: 'stop_button' };
+type NormalizedStopSessionInput = {
+  source?: 'stop_button';
+  expectedTurnId?: string;
+  expectedAdmissionId?: string;
+};
 
 export function normalizeSandboxBoundaryResponse(input: unknown): SandboxBoundaryResponse {
   if (!input || typeof input !== 'object') {
@@ -61,6 +95,24 @@ export function normalizeSandboxBoundaryResponse(input: unknown): SandboxBoundar
     requestId: value.requestId,
     decision: value.decision,
   };
+}
+
+export function normalizeClientCapabilityResponse(input: unknown): ClientCapabilityResponse {
+  if (!input || typeof input !== 'object') {
+    throw new Error('Invalid Client Capability response');
+  }
+  const value = input as Record<string, unknown>;
+  if (
+    typeof value.requestId !== 'string' ||
+    value.requestId.length === 0 ||
+    value.requestId.length > MAX_PERMISSION_REQUEST_ID_LENGTH
+  ) {
+    throw new Error('Invalid Client Capability response requestId');
+  }
+  if (value.decision !== 'allow' && value.decision !== 'deny') {
+    throw new Error('Invalid Client Capability response decision');
+  }
+  return { requestId: value.requestId, decision: value.decision };
 }
 
 export function normalizeUserQuestionResponse(input: unknown): UserQuestionResponse {
@@ -99,9 +151,23 @@ export function normalizeBranchFromTurnInput(input: unknown): BranchFromTurnInpu
     value.name === undefined
       ? undefined
       : normalizeOptionalString(value.name, 'Invalid branch name', MAX_BRANCH_NAME_LENGTH);
+  if (value.sideConversation !== undefined && typeof value.sideConversation !== 'boolean') {
+    throw new Error('Invalid branch sideConversation');
+  }
+  // Absent sourceTurnId forks with an empty context (a side conversation opened
+  // before the source has any settled turn).
+  const sourceTurnId =
+    value.sourceTurnId === undefined
+      ? undefined
+      : normalizeRequiredString(
+          value.sourceTurnId,
+          'Invalid branch sourceTurnId',
+          MAX_TURN_ID_LENGTH,
+        );
   return {
-    sourceTurnId: normalizeRequiredString(value.sourceTurnId, 'Invalid branch sourceTurnId', MAX_TURN_ID_LENGTH),
+    ...(sourceTurnId === undefined ? {} : { sourceTurnId }),
     ...(name ? { name } : {}),
+    ...(value.sideConversation === true ? { sideConversation: true } : {}),
   };
 }
 
@@ -116,37 +182,78 @@ export function normalizeReviseBeforeTurnInput(input: unknown): ReviseBeforeTurn
   };
 }
 
+export function normalizeRuntimeHostBranchFromTurnInput(
+  input: unknown,
+): RuntimeHostBranchFromTurnInput {
+  const value = requireObject(input, 'Invalid branch turn input');
+  return {
+    ...normalizeBranchFromTurnInput(value),
+    copyId: normalizeRequiredString(value.copyId, 'Invalid conversation copyId', MAX_COPY_ID_LENGTH),
+  };
+}
+
+export function normalizeRuntimeHostReviseBeforeTurnInput(
+  input: unknown,
+): RuntimeHostReviseBeforeTurnInput {
+  const value = requireObject(input, 'Invalid revision turn input');
+  return {
+    ...normalizeReviseBeforeTurnInput(value),
+    copyId: normalizeRequiredString(value.copyId, 'Invalid conversation copyId', MAX_COPY_ID_LENGTH),
+  };
+}
+
 export function normalizeSessionSendCommand(input: unknown): NormalizedSendSessionCommand | undefined {
   const value = requireObject(input, 'Invalid session command');
   if (value.type !== 'send') return undefined;
   const text = normalizeSendText(value.text);
   const displayText =
     value.displayText === undefined ? undefined : normalizeSendText(value.displayText);
-  const voiceOperationId =
-    value.voiceOperationId === undefined
-      ? undefined
-      : normalizeVoiceOperationId(value.voiceOperationId);
   const skillIds = normalizeSessionSkillIds(value.skillIds);
-  if (!text.trim() && skillIds.length === 0 && !voiceOperationId) {
+  if (!text.trim() && skillIds.length === 0) {
     throw new Error('Invalid send text');
   }
   return {
     type: 'send',
+    ...normalizeOptionalSendMessageId(value.messageId),
     ...normalizeOptionalSendTurnId(value.turnId),
     text,
     ...(displayText !== undefined ? { displayText } : {}),
-    ...(voiceOperationId ? { voiceOperationId } : {}),
     ...(skillIds.length > 0 ? { skillIds } : {}),
     ...(value.attachmentItems !== undefined ? { attachmentItems: value.attachmentItems } : {}),
+    ...normalizeOptionalRetainedAttachments(value.retainedAttachments),
     ...(value.turnOrchestration !== undefined
       ? { turnOrchestration: normalizeTurnOrchestration(value.turnOrchestration) }
       : {}),
+    ...normalizeOptionalDirectoryReferences(value.directoryReferences),
     ...normalizeOptionalQuotes(value.quotes),
     ...normalizeOptionalWorkspaceFileReferences(
       value.workspaceFileReferences,
       displayText ?? text,
     ),
   };
+}
+
+function normalizeOptionalSendMessageId(input: unknown): { messageId?: string } {
+  if (input === undefined) return {};
+  return {
+    messageId: normalizeRequiredString(input, 'Invalid send messageId', MAX_TURN_ID_LENGTH),
+  };
+}
+
+function normalizeOptionalRetainedAttachments(
+  input: unknown,
+): { retainedAttachments?: AttachmentRef[] } {
+  if (input === undefined) return {};
+  if (
+    !Array.isArray(input) ||
+    input.length > MAX_ATTACHMENT_COUNT ||
+    !input.every(isAttachmentRef)
+  ) {
+    throw new Error('Invalid retained attachments');
+  }
+  return input.length > 0
+    ? { retainedAttachments: input.map((attachment) => structuredClone(attachment)) }
+    : {};
 }
 
 function normalizeOptionalWorkspaceFileReferences(
@@ -185,17 +292,6 @@ function normalizeOptionalWorkspaceFileReferences(
     return { value: tokenValue, start: value.start };
   });
   return workspaceFileReferences.length > 0 ? { workspaceFileReferences } : {};
-}
-
-function normalizeVoiceOperationId(input: unknown): string {
-  if (
-    typeof input !== 'string' ||
-    input.length > 64 ||
-    !/^[0-9a-f]{8}-[0-9a-f-]{27,36}$/i.test(input)
-  ) {
-    throw new Error('Invalid voice operation id');
-  }
-  return input;
 }
 
 function normalizeTurnOrchestration(input: unknown): TurnOrchestration {
@@ -264,11 +360,28 @@ export function normalizeSessionSkillIds(input: unknown): string[] {
 export function normalizeStopSessionInput(input: unknown): NormalizedStopSessionInput {
   if (input === undefined) return {};
   const value = requireObject(input, 'Invalid stop session input');
-  if (value.source === undefined) return {};
-  if (value.source !== 'stop_button') {
+  if (value.source !== undefined && value.source !== 'stop_button') {
     throw new Error('Invalid stop session source');
   }
-  return { source: 'stop_button' };
+  const expectedTurnId = value.expectedTurnId === undefined
+    ? undefined
+    : normalizeRequiredString(
+        value.expectedTurnId,
+        'Invalid stop session expectedTurnId',
+        MAX_TURN_ID_LENGTH,
+      );
+  const expectedAdmissionId = value.expectedAdmissionId === undefined
+    ? undefined
+    : normalizeRequiredString(
+        value.expectedAdmissionId,
+        'Invalid stop session expectedAdmissionId',
+        MAX_TURN_ID_LENGTH,
+      );
+  return {
+    ...(value.source ? { source: 'stop_button' as const } : {}),
+    ...(expectedTurnId ? { expectedTurnId } : {}),
+    ...(expectedAdmissionId ? { expectedAdmissionId } : {}),
+  };
 }
 
 function requireObject(input: unknown, errorMessage: string): Record<string, unknown> {
@@ -309,4 +422,18 @@ function normalizeOptionalSendTurnId(input: unknown): { turnId?: string } {
   return {
     turnId: normalizeRequiredString(input, 'Invalid send turnId', MAX_TURN_ID_LENGTH),
   };
+}
+
+function normalizeOptionalDirectoryReferences(
+  input: unknown,
+): { directoryReferences?: DirectoryReference[] } {
+  if (input === undefined) return {};
+  if (
+    !Array.isArray(input) ||
+    input.length > DIRECTORY_REFERENCE_MAX_COUNT ||
+    !input.every(isDirectoryReference)
+  ) {
+    throw new Error('Invalid directory references');
+  }
+  return input.length ? { directoryReferences: input.map((ref) => ({ ...ref })) } : {};
 }

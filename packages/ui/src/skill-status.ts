@@ -1,15 +1,37 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 // packages/ui/src/skill-status.ts
 //
 // One severity reading for one Skill, shared by the list rows and the
 // inspector so a skill never reads as two different states depending on
-// where it is shown — the same contract plan-reminder-status.ts keeps for
+// where it is shown — the same contract scheduled-task-status.ts keeps for
 // 定时任务.
 //
-// Tone rules: error is a broken state file or unreadable metadata; warning
-// is anything that asks for a decision (review, shadowed, budget-omitted, a
-// managed update); a deliberately disabled skill is neutral, not broken; an
-// enabled skill in context is simply live (accent), never success-green.
+// Meaning rules: `error` is a broken state file or unreadable metadata;
+// `attention` is anything that asks for a decision (review, shadowed,
+// budget-omitted, a managed update); a deliberately disabled skill is
+// `neutral`, not broken; an enabled skill in context is simply `active`,
+// never success-green. What those words look like is status-vocabulary's
+// call, not this file's.
 
+import { dotForStatus, type StatusSemantic } from './status-vocabulary.js';
 import type { SkillEntry } from './module-panel-types.js';
 import type { SkillsCopy } from './skills-copy.js';
 
@@ -24,20 +46,30 @@ function hasManagedUpdateAttention(skill: SkillEntry): boolean {
     && skill.managedUpdateStatus !== 'up_to_date';
 }
 
-export function skillStatusDotVariant(skill: SkillEntry): 'accent' | 'warning' | 'error' | 'neutral' {
+/**
+ * The ladder is the domain knowledge here: which of a skill's several
+ * independent problems wins the one dot it gets. Broken beats needs-looking-at
+ * beats off beats fine, and the order inside each rung is this file's business
+ * — status-vocabulary only decides what the words look like.
+ */
+export function skillStatusSemantic(skill: SkillEntry): StatusSemantic {
   const contextStatus = skillContextStatus(skill);
   if (skill.runtimeStatus === 'state_error' || skill.validationStatus === 'metadata_error' || contextStatus === 'invalid') {
     return 'error';
   }
-  if (skill.kind === 'discovery_diagnostic') return 'warning';
-  if (skill.needsReview) return 'warning';
-  if (skill.validationStatus && skill.validationStatus !== 'ok') return 'warning';
+  if (skill.kind === 'discovery_diagnostic') return 'attention';
+  if (skill.needsReview) return 'attention';
+  if (skill.validationStatus && skill.validationStatus !== 'ok') return 'attention';
   if (contextStatus === 'shadowed' || contextStatus === 'budget' || contextStatus === 'host_incompatible') {
-    return 'warning';
+    return 'attention';
   }
-  if (hasManagedUpdateAttention(skill)) return 'warning';
+  if (hasManagedUpdateAttention(skill)) return 'attention';
   if (!skill.enabled) return 'neutral';
-  return 'accent';
+  return 'active';
+}
+
+export function skillStatusDotVariant(skill: SkillEntry) {
+  return dotForStatus(skillStatusSemantic(skill));
 }
 
 /**
@@ -85,26 +117,6 @@ export function formatSkillRuntimeLabel(skill: SkillEntry, copy: SkillsCopy): st
 export function formatSkillLibraryDescription(skill: SkillEntry, copy: SkillsCopy): string | undefined {
   const raw = skill.description?.trim();
   if (!raw) return undefined;
-  if (/[\u3400-\u9fff]/.test(raw)) return raw;
-
-  const source = `${skill.id} ${skill.name} ${raw}`.toLowerCase();
-  if (source.includes('docx') || source.includes('word') || source.includes('google docs')) {
-    return copy.description.document;
-  }
-  if (source.includes('ppt') || source.includes('powerpoint') || source.includes('slide') || source.includes('presentation')) {
-    return copy.description.presentation;
-  }
-  if (source.includes('spreadsheet') || source.includes('excel') || source.includes('csv') || source.includes('xlsx')) {
-    return copy.description.spreadsheet;
-  }
-  if (source.includes('image') || source.includes('photo') || source.includes('bitmap')) {
-    return copy.description.image;
-  }
-  if (source.includes('browser') || source.includes('chrome') || source.includes('web target')) {
-    return copy.description.browser;
-  }
-  if (source.includes('macos') || source.includes('swiftui') || source.includes('appkit')) {
-    return copy.description.macos;
-  }
-  return copy.description.fallback;
+  if (skill.sourceType !== 'bundled' || skill.userModified) return raw;
+  return copy.bundledDescription[skill.id] ?? raw;
 }

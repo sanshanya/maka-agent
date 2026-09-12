@@ -1,3 +1,24 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { withTimeout } from '@maka/core/test-only/async-primitives';
+import { defineInteractiveRuntimeHostComposition } from '../server/host-composition.js';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -6,10 +27,12 @@ import { test } from 'node:test';
 import {
   agentGraphIdForRootSession,
   type AgentGraphClientChangedListener,
-  type AgentGraphClientSnapshot,
   type AgentGraphCoordinator,
+} from '@maka/runtime/stream-graph-coordinator';
+import {
+  type AgentGraphClientSnapshot,
   type AgentGraphOperatorInspection,
-} from '@maka/runtime';
+} from '@maka/runtime/stream-graph-read-model';
 import { resolveStorageRoot, tryAcquireInteractiveRootOwner } from '@maka/storage/root-authority';
 import {
   connectRuntimeHost,
@@ -26,13 +49,15 @@ import { SessionContinuityCoordinator } from '../server/session-continuity-coord
 
 const ROOT_SESSION_ID = 'root-1';
 const GRAPH_ID = agentGraphIdForRootSession(ROOT_SESSION_ID);
+// Injected client liveness cadence: the fake authority's slow stop() holds a
+// request past probe cycles measured in this unit instead of the real 2s one.
+const LIVENESS_INTERVAL_MS = 100;
 const PROTOCOL = {
   min: RUNTIME_HOST_PROTOCOL_VERSION,
   max: RUNTIME_HOST_PROTOCOL_VERSION,
 } as const;
 
-test('two UDS Clients query and control one Agent graph through Session invalidation', {
-  skip: process.platform === 'win32' ? 'POSIX UDS integration' : false,
+test('two Clients query and control one Agent graph through Session invalidation', {
   timeout: 10_000,
 }, async () => {
   const base = await mkdtemp(join(tmpdir(), 'maka-agent-graph-two-client-'));
@@ -45,7 +70,7 @@ test('two UDS Clients query and control one Agent graph through Session invalida
   const host = await RuntimeHostKernel.start({
     owner,
     idleGraceMs: 10_000,
-    compositionFactory: async (context) => {
+    composition: defineInteractiveRuntimeHostComposition(async (context) => {
       const continuity = new SessionContinuityCoordinator(
         context.hostEpoch,
         async (sessionId) => (sessionId === ROOT_SESSION_ID ? canonical(context.hostEpoch) : null),
@@ -55,6 +80,8 @@ test('two UDS Clients query and control one Agent graph through Session invalida
       const graph = new HostAgentGraphCoordinator({
         authority,
         continuity,
+        stopExecution: (rootSessionId, expectedGraphId) =>
+          authority.stopExecution(rootSessionId, expectedGraphId),
       });
       return {
         handlers: {
@@ -70,15 +97,32 @@ test('two UDS Clients query and control one Agent graph through Session invalida
           continuity.close();
         },
       };
-    },
+    }),
   });
+  // Two probe round-trips observed while the stop request is pending resolve
+  // the fake's stopGate. The observer is wired only onto the final TUI
+  // connection that issues agent.graph.stop, so no other connection's slow
+  // query could ever satisfy the counter.
+  let livenessProbes = 0;
+  let markProbesCrossed!: () => void;
+  const probeWindowCrossed = new Promise<void>((resolve) => {
+    markProbesCrossed = resolve;
+  });
+  const onLivenessProbe = () => {
+    livenessProbes += 1;
+    if (livenessProbes >= 2) markProbesCrossed();
+  };
+  authority.stopGate = probeWindowCrossed;
   let desktop: RuntimeHostConnection | undefined;
   let tui: RuntimeHostConnection | undefined;
   let subscription: RuntimeHostSessionSubscription | undefined;
   try {
-    desktop = await connect(root, 'desktop');
-    tui = await connect(root, 'tui');
-    subscription = await desktop.openSessionSubscription({ sessionId: ROOT_SESSION_ID });
+    desktop = await connect(root);
+    tui = await connect(root);
+    subscription = await desktop.openSessionSubscription({
+      sessionId: ROOT_SESSION_ID,
+      transcript: { kind: 'none' },
+    });
 
     const [desktopSnapshot, tuiSnapshot] = await Promise.all([
       desktop.request('agent.graph.query', { rootSessionId: ROOT_SESSION_ID }),
@@ -101,8 +145,11 @@ test('two UDS Clients query and control one Agent graph through Session invalida
       'active',
     );
 
-    tui = await connect(root, 'tui');
-    const stopped = await tui.request('agent.graph.stop', { rootSessionId: ROOT_SESSION_ID });
+    tui = await connect(root, onLivenessProbe);
+    const stopped = await tui.request('agent.graph.stop', {
+      rootSessionId: ROOT_SESSION_ID,
+      expectedGraphId: GRAPH_ID,
+    });
     assert.deepEqual(stopped, { rootSessionId: ROOT_SESSION_ID, graphId: GRAPH_ID });
     assert.equal(authority.stopCount, 1);
 
@@ -134,7 +181,13 @@ test('two UDS Clients query and control one Agent graph through Session invalida
 
 type GraphAuthority = Pick<
   AgentGraphCoordinator,
-  'getSnapshot' | 'inspectOperator' | 'stop' | 'subscribeAll'
+  | 'currentGraphId'
+  | 'getGraphSnapshot'
+  | 'getSnapshot'
+  | 'inspectGraphOperator'
+  | 'inspectOperator'
+  | 'listGraphEpochPage'
+  | 'subscribeAll'
 >;
 
 class FakeAgentGraphAuthority implements GraphAuthority {
@@ -142,7 +195,31 @@ class FakeAgentGraphAuthority implements GraphAuthority {
   #snapshot = snapshot();
   stopCount = 0;
 
+  async currentGraphId(): Promise<string> {
+    return this.#snapshot.graphId;
+  }
+
+  async listGraphEpochPage() {
+    return {
+      epochs: [
+        {
+          schemaVersion: 1 as const,
+          rootSessionId: ROOT_SESSION_ID,
+          epoch: 1,
+          graphId: this.#snapshot.graphId,
+          createdAt: 0,
+        },
+      ],
+      nextBeforeEpoch: null,
+      currentEpoch: 1,
+    };
+  }
+
   async getSnapshot(): Promise<AgentGraphClientSnapshot> {
+    return structuredClone(this.#snapshot);
+  }
+
+  async getGraphSnapshot(): Promise<AgentGraphClientSnapshot> {
     return structuredClone(this.#snapshot);
   }
 
@@ -150,8 +227,19 @@ class FakeAgentGraphAuthority implements GraphAuthority {
     return inspection(this.#snapshot);
   }
 
-  async stop(): Promise<void> {
-    await new Promise((resolve) => setTimeout(resolve, 2_100));
+  async inspectGraphOperator(): Promise<AgentGraphOperatorInspection> {
+    return inspection(this.#snapshot);
+  }
+
+  /** Resolved by the test once two client liveness probes have observably
+   *  round-tripped, so the pending agent.graph.stop request provably crosses
+   *  probe cycles — causal ordering, no fixed timing at all. */
+  stopGate: Promise<void> = Promise.resolve();
+
+  async stopExecution(rootSessionId: string, expectedGraphId?: string): Promise<void> {
+    assert.equal(rootSessionId, ROOT_SESSION_ID);
+    assert.equal(expectedGraphId, GRAPH_ID);
+    await this.stopGate;
     this.stopCount += 1;
     this.#snapshot.status = 'stopped';
     for (const listener of this.#listeners) {
@@ -172,9 +260,14 @@ class FakeAgentGraphAuthority implements GraphAuthority {
 
 async function connect(
   rootPath: string,
-  surface: 'desktop' | 'tui',
+  onLivenessProbe?: () => void,
 ): Promise<RuntimeHostConnection> {
-  const result = await connectRuntimeHost({ rootPath, surface, protocol: PROTOCOL });
+  const result = await connectRuntimeHost({
+    rootPath,
+    protocol: PROTOCOL,
+    livenessIntervalMs: LIVENESS_INTERVAL_MS,
+    onLivenessProbe,
+  });
   assert.equal(result.kind, 'connected');
   if (result.kind !== 'connected') throw new Error('Runtime Host did not accept the Client');
   return result.connection;
@@ -186,6 +279,7 @@ function snapshot(): AgentGraphClientSnapshot {
     schemaVersion: 1,
     rootSessionId: ROOT_SESSION_ID,
     graphId: GRAPH_ID,
+    orchestrationMode: 'graph',
     snapshotVersion: version,
     status: 'active',
     scheduleRevision: 1,
@@ -194,6 +288,7 @@ function snapshot(): AgentGraphClientSnapshot {
     operators: [operator()],
     edges: [],
     work: [],
+    reconciliationFailures: [],
     stoppedTargets: [],
     claims: [],
     recentControlDecisions: [],
@@ -203,6 +298,7 @@ function snapshot(): AgentGraphClientSnapshot {
       operators: 0,
       edges: 0,
       work: 0,
+      reconciliationFailures: 0,
       stoppedTargets: 0,
       claims: 0,
       controlDecisions: 0,
@@ -264,7 +360,6 @@ function canonical(hostEpoch: string): CanonicalSessionProjection {
       metadataRevision: 1,
       status: 'active',
       createdAt: 1,
-      lastUsedAt: 1,
       isArchived: false,
     },
     rootTurn: null,
@@ -272,18 +367,4 @@ function canonical(hostEpoch: string): CanonicalSessionProjection {
     queue: { hostEpoch, queueRevision: 0, steering: [], followup: [] },
     interactions: { pending: [] },
   };
-}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<T>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
 }

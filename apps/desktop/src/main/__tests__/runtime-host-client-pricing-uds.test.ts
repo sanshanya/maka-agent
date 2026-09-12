@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -5,12 +24,12 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { connectRuntimeHost } from '@maka/runtime-host/client';
 import {
-  HOST_OPERATION_SPECS,
   RUNTIME_HOST_PROTOCOL_VERSION,
   type EffectivePricingEntry,
-  type OperationKey,
 } from '@maka/runtime-host/protocol';
 import {
+  createUnavailableDomainOperationHandlers,
+  defineInteractiveRuntimeHostComposition,
   RuntimeHostKernel,
   type RuntimeHostComposition,
 } from '@maka/runtime-host/server';
@@ -39,7 +58,7 @@ test('drives the Desktop Pricing adapter through a real Runtime Host connection'
     host = await RuntimeHostKernel.start({
       owner,
       idleGraceMs: 10_000,
-      compositionFactory: async () => ({
+      composition: defineInteractiveRuntimeHostComposition(async () => ({
         handlers: handlers({
           'pricing.query': async (input) => {
             if (input.kind === 'continue' && input.revision !== revision) {
@@ -92,11 +111,10 @@ test('drives the Desktop Pricing adapter through a real Runtime Host connection'
         beginDrain() {},
         async recover() {},
         async close() {},
-      }),
+      })),
     });
     const connected = await connectRuntimeHost({
       rootPath: base,
-      surface: 'desktop',
       protocol: {
         min: RUNTIME_HOST_PROTOCOL_VERSION,
         max: RUNTIME_HOST_PROTOCOL_VERSION,
@@ -114,7 +132,6 @@ test('drives the Desktop Pricing adapter through a real Runtime Host connection'
     await client.close();
     const reconnected = await connectRuntimeHost({
       rootPath: base,
-      surface: 'desktop',
       protocol: {
         min: RUNTIME_HOST_PROTOCOL_VERSION,
         max: RUNTIME_HOST_PROTOCOL_VERSION,
@@ -170,21 +187,10 @@ test('drives the Desktop Pricing adapter through a real Runtime Host connection'
 type TestHandlers = Partial<RuntimeHostComposition['handlers']>;
 
 function handlers(overrides: TestHandlers): RuntimeHostComposition['handlers'] {
-  const unavailable = Object.fromEntries(
-    (Object.keys(HOST_OPERATION_SPECS) as OperationKey[])
-      .filter((operation) => operation !== 'host.status')
-      .map((operation) => [
-        operation,
-        async () => ({
-          ok: false,
-          error: {
-            code: 'operation_unavailable',
-            message: `${operation} is unavailable in the Desktop Pricing adapter fixture`,
-          },
-        }),
-      ]),
-  );
-  return { ...unavailable, ...overrides } as RuntimeHostComposition['handlers'];
+  return {
+    ...createUnavailableDomainOperationHandlers(),
+    ...overrides,
+  } as RuntimeHostComposition['handlers'];
 }
 
 function builtin(modelKey: string, inputUsdPer1M: number): EffectivePricingEntry {

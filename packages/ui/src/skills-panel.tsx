@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 // packages/ui/src/skills-panel.tsx
 //
 // The Skills module page, on the shared ModulePage shell (Astryx Layout,
@@ -18,8 +37,10 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMountedRef } from './use-mounted-ref.js';
 import { useRovingRowFocus } from './use-roving-row-focus.js';
 import {
+  ICON_SIZE,
   Blocks,
   BookOpen,
+  Check,
   Download,
   FolderOpen,
   Loader2,
@@ -27,8 +48,8 @@ import {
   RefreshCcw,
   Search,
 } from './icons.js';
-import type { CapabilityAuditReport } from '@maka/core';
-import { deriveCapabilityAuditReport } from '@maka/core';
+import type { CapabilityAuditReport } from '@maka/core/capability-audit';
+import { deriveCapabilityAuditReport } from '@maka/core/capability-audit';
 import {
   Button as UiButton,
   EmptyState,
@@ -39,6 +60,7 @@ import {
   SegmentedControlItem,
   Selector,
   StatusDot,
+  Text,
   TextInput,
   Toolbar,
 } from '@astryxdesign/core';
@@ -227,7 +249,39 @@ export function SkillsModuleMain(props: {
     if (!normalizedSkillQuery) return true;
     return `${entry.id} ${entry.name} ${entry.description} ${entry.category}`.toLowerCase().includes(normalizedSkillQuery);
   });
+  /**
+   * Built-in skills grouped by category.
+   *
+   * Structure, not colour, is how a browse surface gets richer: a reader
+   * scanning for "something that writes docs" is served by a heading, and no
+   * amount of tinting substitutes for one.
+   *
+   * Guarded twice, because grouping can make a list WORSE. With one category
+   * the headings are pure overhead, and while searching the user has already
+   * said what they want — splitting the few hits across headings buries them.
+   */
+  const bundledCatalogGroups = useMemo(() => {
+    const byCategory = new Map<ManagedSkillCategory, BundledSkillCatalogEntry[]>();
+    for (const entry of bundledCatalogFiltered) {
+      const group = byCategory.get(entry.category);
+      if (group) group.push(entry);
+      else byCategory.set(entry.category, [entry]);
+    }
+    return [...byCategory.entries()];
+  }, [bundledCatalogFiltered]);
+  const showBundledGroups = normalizedSkillQuery === '' && bundledCatalogGroups.length > 1;
+
   const allManagedSources = props.managedSkillSources ?? [];
+  // Distinct ids across both catalogs: a skill offered by the marketplace and
+  // shipped built-in is one thing you can install, not two.
+  const availableToInstallCount = useMemo(() => {
+    const ids = new Set<string>();
+    for (const entry of bundledCatalog) if (!entry.installed) ids.add(entry.id);
+    for (const source of allManagedSources) {
+      if (!skills.some((skill) => skill.id === source.id)) ids.add(source.id);
+    }
+    return ids.size;
+  }, [bundledCatalog, allManagedSources, skills]);
   const marketSources = useMemo(() => {
     const filtered = allManagedSources.filter((source) => {
       if (marketCategory !== MARKET_CATEGORY_ALL && source.category !== marketCategory) return false;
@@ -281,6 +335,15 @@ export function SkillsModuleMain(props: {
 
   // ── Catalog rows (市场 / 内置): one job each — install. ──────────────
   function catalogInstallButton(key: string, name: string, installing: boolean, installed: boolean, onInstall?: () => void) {
+    const installIcon = installing
+      ? <Loader2 size={ICON_SIZE.chrome} aria-hidden="true" />
+      : installed
+        ? (
+          <span className="maka-skill-install-complete-icon">
+            <Check size={ICON_SIZE.chrome} aria-hidden="true" />
+          </span>
+        )
+        : <Download size={ICON_SIZE.chrome} aria-hidden="true" />;
     return (
       <IconButton
         key={key}
@@ -288,9 +351,9 @@ export function SkillsModuleMain(props: {
         size="sm"
         onClick={onInstall}
         isDisabled={installed || skillActionBusy || !onInstall}
-        label={copy.install.action(name)}
+        label={installed ? copy.install.installedAction(name) : copy.install.action(name)}
         tooltip={installed ? copy.install.installedTitle : copy.install.action(name)}
-        icon={installing ? <Loader2 size={16} aria-hidden="true" /> : <Download size={16} aria-hidden="true" />}
+        icon={installIcon}
       />
     );
   }
@@ -312,14 +375,19 @@ export function SkillsModuleMain(props: {
     <div className="maka-module-page-panel">
       {searchSummary}
       {allManagedSources.length === 0 ? (
-        <EmptyState
-          icon={<BookOpen />}
+        /* With a query in play this is a search empty, so it carries the clear
+           action (DESIGN.md §10); without one it stays a plain panel empty. */
+        (<EmptyState
+          icon={<BookOpen size={ICON_SIZE.empty} />}
           title={normalizedSkillQuery ? copy.market.emptySearchTitle : copy.market.emptyTitle}
           description={normalizedSkillQuery ? copy.market.emptySearchBody : copy.market.emptyBody}
-        />
+          actions={normalizedSkillQuery ? (
+            <UiButton variant="ghost" size="sm" label={copy.market.clearSearch} onClick={() => setSkillSearchQuery('')} />
+          ) : undefined}
+        />)
       ) : marketSources.length === 0 ? (
         <EmptyState
-          icon={<Search />}
+          icon={<Search size={ICON_SIZE.empty} />}
           title={copy.market.emptySearchTitle}
           description={copy.market.emptyFilterBody}
           actions={(
@@ -342,10 +410,18 @@ export function SkillsModuleMain(props: {
               <ListItem
                 key={source.id}
                 label={source.name}
-                description={[source.description || copy.market.sourceFallback, installed ? copy.install.installed : null]
+                description={[
+                  copy.categories[source.category],
+                  installed ? copy.install.installed : null,
+                  source.description || copy.market.sourceFallback,
+                ]
                   .filter(Boolean)
                   .join(' · ')}
-                startContent={<Blocks size={18} aria-hidden="true" />}
+                startContent={(
+                  <span className="maka-module-market-icon" aria-hidden="true">
+                    <Blocks size={ICON_SIZE.empty} />
+                  </span>
+                )}
                 endContent={catalogInstallButton(
                   source.id,
                   source.name,
@@ -366,35 +442,63 @@ export function SkillsModuleMain(props: {
       {searchSummary}
       {bundledCatalog.length === 0 ? (
         <EmptyState
-          icon={<Blocks />}
+          icon={<Blocks size={ICON_SIZE.empty} />}
           title={copy.builtin.emptyTitle}
           description={copy.builtin.emptyBody}
         />
       ) : bundledCatalogFiltered.length === 0 ? (
         <EmptyState
-          icon={<Search />}
+          icon={<Search size={ICON_SIZE.empty} />}
           title={copy.builtin.noMatchTitle}
           description={copy.builtin.noMatchBody}
           actions={<UiButton variant="ghost" size="sm" label={copy.market.clearSearch} onClick={() => setSkillSearchQuery('')} />}
         />
       ) : (
-        <List density="balanced" hasDividers className="maka-module-page-rows" aria-label={copy.builtin.ariaLabel}>
-          {bundledCatalogFiltered.map((entry) => (
-            <ListItem
-              key={entry.id}
-              label={entry.name}
-              description={entry.description || copy.builtin.fallback}
-              startContent={<Blocks size={18} aria-hidden="true" />}
-              endContent={catalogInstallButton(
-                entry.id,
-                entry.name,
-                pendingSkillAction === `bundled:install:${entry.id}`,
-                entry.installed,
-                props.onInstallBundledSkill ? () => void runSkillAction(`bundled:install:${entry.id}`, () => props.onInstallBundledSkill?.(entry.id)) : undefined,
-              )}
-            />
-          ))}
-        </List>
+        // One List per category when grouping is on, each carrying its own
+        // heading; a single flat List otherwise. `header` is List's own slot,
+        // so the heading is associated with its rows rather than floating
+        // above them as loose text.
+        ((showBundledGroups ? bundledCatalogGroups : [[null, bundledCatalogFiltered] as const]).map(([category, entries]) => (
+      <List
+        key={category ?? 'all'}
+        density="balanced"
+        hasDividers
+        className="maka-module-page-rows"
+        aria-label={category ? copy.categories[category] : copy.builtin.ariaLabel}
+        header={category ? <Text type="label" size="sm" color="secondary">{copy.categories[category]}</Text> : undefined}
+      >
+        {entries.map((entry) => (
+          <ListItem
+            key={entry.id}
+            label={entry.name}
+            description={[
+              // The category is the group heading when grouping is on;
+              // repeating it on every row under that heading is the
+              // duplicate-count noise we removed from this page before.
+              showBundledGroups ? null : copy.categories[entry.category],
+              entry.declaredTools.length > 0
+                ? copy.builtin.toolCount(entry.declaredTools.length)
+                : null,
+              entry.description || copy.builtin.fallback,
+            ]
+              .filter(Boolean)
+              .join(' · ')}
+            startContent={(
+              <span className="maka-module-market-icon" aria-hidden="true">
+                <Blocks size={ICON_SIZE.empty} />
+              </span>
+            )}
+            endContent={catalogInstallButton(
+              entry.id,
+              entry.name,
+              pendingSkillAction === `bundled:install:${entry.id}`,
+              entry.installed,
+              props.onInstallBundledSkill ? () => void runSkillAction(`bundled:install:${entry.id}`, () => props.onInstallBundledSkill?.(entry.id)) : undefined,
+            )}
+          />
+        ))}
+      </List>
+        )))
       )}
     </div>
   );
@@ -412,18 +516,20 @@ export function SkillsModuleMain(props: {
       {searchSummary}
       {skills.length === 0 ? (
         <EmptyState
-          icon={<Blocks />}
+          icon={<Blocks size={ICON_SIZE.empty} />}
           title={normalizedSkillQuery ? copy.installed.emptySearchTitle : copy.installed.emptyTitle}
           description={normalizedSkillQuery ? copy.installed.emptySearchBody : installedEmptyBody}
           actions={(
-            props.onRefreshSkills
-              ? <UiButton variant="ghost" label={pendingSkillAction === 'refresh' ? copy.installed.refreshPending : copy.installed.refresh} onClick={() => void runSkillAction('refresh', refreshSkillData)} isDisabled={skillActionBusy} />
-              : undefined
+            // A search that matched nothing exits through clear (DESIGN.md
+            // §10); only the true first-run empty offers the refresh.
+            (normalizedSkillQuery ? <UiButton variant="ghost" size="sm" label={copy.market.clearSearch} onClick={() => setSkillSearchQuery('')} /> : props.onRefreshSkills
+                ? <UiButton variant="ghost" size="sm" label={pendingSkillAction === 'refresh' ? copy.installed.refreshPending : copy.installed.refresh} onClick={() => void runSkillAction('refresh', refreshSkillData)} isDisabled={skillActionBusy} />
+                : undefined)
           )}
         />
       ) : filteredSkills.length === 0 ? (
         <EmptyState
-          icon={<Search />}
+          icon={<Search size={ICON_SIZE.empty} />}
           title={copy.installed.emptySearchTitle}
           description={copy.installed.emptySearchBody}
           actions={<UiButton variant="ghost" size="sm" label={copy.market.clearSearch} onClick={() => setSkillSearchQuery('')} />}
@@ -432,7 +538,7 @@ export function SkillsModuleMain(props: {
         /* Selectable, otherwise inert rows: every control that used to ride
            the row now lives in the inspector — no interactive elements
            inside an interactive list item. */
-        <List density="balanced" hasDividers className="maka-module-page-rows" aria-label={copy.installed.listAriaLabel}>
+        (<List density="balanced" hasDividers className="maka-module-page-rows" aria-label={copy.installed.listAriaLabel}>
           {filteredSkills.map((skill) => {
             const isDiscoveryDiagnostic = skill.kind === 'discovery_diagnostic';
             const skillRef = skill.ref ?? skill.id;
@@ -489,18 +595,23 @@ export function SkillsModuleMain(props: {
               />
             );
           })}
-        </List>
+        </List>)
       )}
     </div>
   );
 
   return (
-    <main className="maka-main detailPane maka-module-main agents-chat-panel" data-page-shell="layout" data-module="skills" aria-label={props.hubHeader?.title ?? copy.page.title}>
+    <section className="maka-main detailPane maka-module-main agents-chat-panel" data-page-shell="layout" data-module="skills" aria-label={props.hubHeader?.title ?? copy.page.title}>
       <ModulePage
         title={props.hubHeader?.title ?? copy.page.title}
+        // The page header said only how many skills are installed, which made
+        // a page whose other two tabs are catalogs look like it had nothing in
+        // them. Counting what is available to install is the number a browser
+        // is actually looking for.
         meta={[
           copy.page.metaInstalled(skills.length),
           updateAvailableCount > 0 ? copy.page.metaUpdates(updateAvailableCount) : null,
+          availableToInstallCount > 0 ? copy.page.metaAvailable(availableToInstallCount) : null,
         ].filter(Boolean).join(' · ')}
         inspectorLabel={copy.detail.label}
         inspectorAutoSaveId="maka-skill-inspector"
@@ -535,7 +646,7 @@ export function SkillsModuleMain(props: {
             <DropdownMenu
               button={{
                 label: copy.page.moreActions,
-                icon: <MoreHorizontal size={16} aria-hidden="true" />,
+                icon: <MoreHorizontal size={ICON_SIZE.chrome} aria-hidden="true" />,
                 isIconOnly: true,
                 variant: 'ghost',
                 isDisabled: skillActionBusy,
@@ -543,21 +654,21 @@ export function SkillsModuleMain(props: {
             >
               {props.onOpenSkillsFolder ? (
                 <DropdownMenuItem
-                  icon={<FolderOpen size={14} aria-hidden="true" />}
+                  icon={<FolderOpen size={ICON_SIZE.control} aria-hidden="true" />}
                   label={copy.page.openFolder}
                   onClick={() => runPageActionAfterMenuClose('folder', props.onOpenSkillsFolder)}
                 />
               ) : null}
               {props.onImportManagedSkillSource ? (
                 <DropdownMenuItem
-                  icon={<Download size={14} aria-hidden="true" />}
+                  icon={<Download size={ICON_SIZE.control} aria-hidden="true" />}
                   label={copy.market.importLocal}
                   onClick={() => runPageActionAfterMenuClose('source:import', props.onImportManagedSkillSource)}
                 />
               ) : null}
               {canRefreshSkillData ? (
                 <DropdownMenuItem
-                  icon={<RefreshCcw size={14} aria-hidden="true" />}
+                  icon={<RefreshCcw size={ICON_SIZE.control} aria-hidden="true" />}
                   label={pendingSkillAction === 'refresh' ? copy.page.refreshing : copy.page.refresh}
                   onClick={() => runPageActionAfterMenuClose('refresh', refreshSkillData)}
                 />
@@ -637,6 +748,6 @@ export function SkillsModuleMain(props: {
         {activeSkillTab === 'builtin' ? builtinPanel : null}
         {activeSkillTab === 'installed' ? installedPanel : null}
       </ModulePage>
-    </main>
+    </section>
   );
 }

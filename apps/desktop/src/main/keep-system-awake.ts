@@ -1,12 +1,31 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /**
  * Keep-system-awake controller.
  *
  * Two capabilities need the machine to stay running while nobody is touching
  * it, and they arrive independently:
  *
- *  - 定时任务: scheduled reminders are driven by an in-process timer (see
- *    `plan-reminders`); when the machine sleeps that timer is frozen and the
- *    reminder silently never fires. The user opts into this with 保持系统唤醒.
+ *  - 定时任务: scheduled tasks are driven by an in-process timer (see
+ *    `scheduled-tasks`); when the machine sleeps that timer is frozen and the
+ *    task silently never fires. The user opts into this with 保持系统唤醒.
  *  - Computer Use: a run drives another app for as long as the model needs,
  *    and the physical-input guard means it does its work precisely when the
  *    user is not touching anything — which is exactly when idle sleep lands.

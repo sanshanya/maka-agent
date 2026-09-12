@@ -1,14 +1,33 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { RootExecutionDescriptor } from '@maka/core/agent-run';
+import type { RootExecutionDescriptor } from '@maka/core/runtime-invocation';
 import { createSqliteAgentRunStore, type AdmitRootTurnInput } from '../agent-run-store.js';
 
 test('Agent Graph supervisor admission durably binds wake identity and Graph orchestration', async () => {
-  await withTempRoot(async (root) => {
-    const store = createSqliteAgentRunStore(root);
+  await withTempRoot(async (_root, openStore) => {
+    const store = openStore();
     const admitted = await store.admitRootTurn(admissionInput());
 
     assert.equal(admitted.kind, 'admitted');
@@ -18,7 +37,7 @@ test('Agent Graph supervisor admission durably binds wake identity and Graph orc
       source: 'host_api',
     });
 
-    const reopened = createSqliteAgentRunStore(root);
+    const reopened = openStore();
     assert.deepEqual(
       await reopened.readRootTurnAdmission('root-session', 'supervisor-turn'),
       admitted.admission,
@@ -27,8 +46,8 @@ test('Agent Graph supervisor admission durably binds wake identity and Graph orc
 });
 
 test('Agent Graph supervisor admission rejects malformed identity and non-Graph orchestration', async () => {
-  await withTempRoot(async (root) => {
-    const store = createSqliteAgentRunStore(root);
+  await withTempRoot(async (_root, openStore) => {
+    const store = openStore();
     await assert.rejects(
       () =>
         store.admitRootTurn(
@@ -95,11 +114,22 @@ function admissionInput(overrides: Partial<AdmitRootTurnInput> = {}): AdmitRootT
   };
 }
 
-async function withTempRoot(run: (root: string) => Promise<void>): Promise<void> {
+async function withTempRoot(
+  run: (
+    root: string,
+    openStore: () => ReturnType<typeof createSqliteAgentRunStore>,
+  ) => Promise<void>,
+): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'maka-graph-supervisor-admission-'));
+  const stores: ReturnType<typeof createSqliteAgentRunStore>[] = [];
   try {
-    await run(root);
+    await run(root, () => {
+      const store = createSqliteAgentRunStore(root);
+      stores.push(store);
+      return store;
+    });
   } finally {
+    for (const store of stores.reverse()) store.close?.();
     await rm(root, { recursive: true, force: true });
   }
 }

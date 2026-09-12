@@ -1,6 +1,32 @@
-import { requireCount, requireExactRecord, requireRecord } from './codec.js';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { isPermissionMode, type PermissionMode } from '@maka/core/permission';
+import { requireCount, requireEntityId, requireExactRecord, requireRecord } from './codec.js';
 import { invalidProtocolFrame } from './errors.js';
-import { defineOperation } from './operation-spec.js';
+import { defineHostPathOperation } from './operation-spec.js';
+import {
+  decodeWorkspaceProjection,
+  decodeWorkspaceTarget,
+  type WorkspaceProjection,
+  type WorkspaceTarget,
+} from './workspace.js';
 
 export const SKILL_CATALOG_PAGE_MAX_ITEMS = 128;
 export const SKILL_CATALOG_PAGE_MAX_BYTES = 48 * 1024;
@@ -8,7 +34,6 @@ export const SKILL_CATALOG_PREVIEW_RESULT_MAX_BYTES = 48 * 1024;
 export const SKILL_CATALOG_REF_MAX_BYTES = 512;
 export const SKILL_CATALOG_DISPLAY_ID_MAX_BYTES = 256;
 
-const PROJECT_ROOT_MAX_BYTES = 4096;
 const CURSOR_MAX_BYTES = 1024;
 const ID_MAX_BYTES = 81;
 export const SKILL_CATALOG_NAME_MAX_BYTES = 256;
@@ -26,6 +51,7 @@ const QUERY_ERRORS = [
   'persistence_failed',
   'internal_failure',
 ] as const;
+const INVOCABLE_QUERY_ERRORS = [...QUERY_ERRORS, 'not_found', 'session_archived'] as const;
 const MUTATION_ERRORS = [...QUERY_ERRORS, 'commit_outcome_unknown'] as const;
 
 export type SkillCatalogRevision = `sha256:${string}`;
@@ -85,8 +111,24 @@ export type SkillCatalogValidationCode =
   | 'read_failed'
   | 'projection_truncated';
 
-export interface SkillCatalogLocalContext {
-  readonly projectRoot: string;
+export interface SkillCatalogWorkspaceContext {
+  readonly workspace: WorkspaceTarget;
+}
+
+export type SkillCatalogInvocableTarget =
+  | { readonly kind: 'session'; readonly sessionId: string }
+  | {
+      readonly kind: 'new_session';
+      readonly context: SkillCatalogWorkspaceContext;
+      readonly collaborationMode: 'agent' | 'plan';
+      readonly permissionMode: PermissionMode;
+    };
+
+export interface SkillCatalogInvocableItem {
+  readonly ref: string;
+  readonly id: string;
+  readonly name: string;
+  readonly description: string;
 }
 
 export interface SkillCatalogGovernanceItem {
@@ -144,23 +186,48 @@ export type SkillCatalogPageItem =
 export type SkillCatalogQueryInput =
   | {
       readonly kind: 'start';
-      readonly context: SkillCatalogLocalContext;
+      readonly context: SkillCatalogWorkspaceContext;
       readonly view: SkillCatalogView;
     }
   | {
       readonly kind: 'continue';
-      readonly context: SkillCatalogLocalContext;
+      readonly context: SkillCatalogWorkspaceContext;
       readonly view: SkillCatalogView;
       readonly revision: SkillCatalogRevision;
       readonly cursor: string;
     };
 
-export type SkillCatalogQueryResult =
+export type SkillCatalogQueryProjection =
   | {
       readonly kind: 'page';
       readonly view: SkillCatalogView;
       readonly revision: SkillCatalogRevision;
       readonly items: readonly SkillCatalogPageItem[];
+      readonly nextCursor: string | null;
+    }
+  | SkillCatalogRevisionChanged;
+
+export type SkillCatalogQueryResult = SkillCatalogQueryProjection & {
+  readonly resolvedWorkspace: WorkspaceProjection;
+};
+
+export type SkillCatalogInvocableQueryInput =
+  | {
+      readonly kind: 'start';
+      readonly target: SkillCatalogInvocableTarget;
+    }
+  | {
+      readonly kind: 'continue';
+      readonly target: SkillCatalogInvocableTarget;
+      readonly revision: SkillCatalogRevision;
+      readonly cursor: string;
+    };
+
+export type SkillCatalogInvocableQueryResult =
+  | {
+      readonly kind: 'page';
+      readonly revision: SkillCatalogRevision;
+      readonly items: readonly SkillCatalogInvocableItem[];
       readonly nextCursor: string | null;
     }
   | {
@@ -198,7 +265,7 @@ export type SkillCatalogManagedUpdateMutation =
     };
 
 export interface SkillCatalogMutateInput {
-  readonly context: SkillCatalogLocalContext;
+  readonly context: SkillCatalogWorkspaceContext;
   readonly expectedRevision: SkillCatalogRevision;
   readonly mutation: SkillCatalogMutation;
 }
@@ -217,7 +284,7 @@ export type SkillCatalogMutationRejectedReason =
   | 'blocked_path'
   | 'state_error';
 
-export type SkillCatalogMutateResult =
+export type SkillCatalogMutationOutcome =
   | {
       readonly kind: 'committed' | 'unchanged';
       readonly revision: SkillCatalogRevision;
@@ -226,8 +293,12 @@ export type SkillCatalogMutateResult =
   | SkillCatalogRevisionConflict
   | { readonly kind: 'rejected'; readonly reason: SkillCatalogMutationRejectedReason };
 
+export type SkillCatalogMutateResult = SkillCatalogMutationOutcome & {
+  readonly resolvedWorkspace: WorkspaceProjection;
+};
+
 export interface SkillCatalogPreviewUpdateInput {
-  readonly context: SkillCatalogLocalContext;
+  readonly context: SkillCatalogWorkspaceContext;
   readonly expectedRevision: SkillCatalogRevision;
   readonly ref: string;
 }
@@ -245,7 +316,7 @@ export type SkillCatalogPreviewRejectedReason =
   | 'source_invalid'
   | 'metadata_error';
 
-export type SkillCatalogPreviewUpdateResult =
+export type SkillCatalogPreviewUpdateOutcome =
   | {
       readonly kind: 'preview';
       readonly revision: SkillCatalogRevision;
@@ -261,6 +332,16 @@ export type SkillCatalogPreviewUpdateResult =
   | SkillCatalogRevisionConflict
   | { readonly kind: 'rejected'; readonly reason: SkillCatalogPreviewRejectedReason };
 
+export type SkillCatalogPreviewUpdateResult = SkillCatalogPreviewUpdateOutcome & {
+  readonly resolvedWorkspace: WorkspaceProjection;
+};
+
+export interface SkillCatalogRevisionChanged {
+  readonly kind: 'revision_changed';
+  readonly expectedRevision: SkillCatalogRevision;
+  readonly actualRevision: SkillCatalogRevision;
+}
+
 export interface SkillCatalogRevisionConflict {
   readonly kind: 'revision_conflict';
   readonly expectedRevision: SkillCatalogRevision;
@@ -268,40 +349,122 @@ export interface SkillCatalogRevisionConflict {
 }
 
 export const SKILL_CATALOG_OPERATION_SPECS = {
-  'skill.catalog.query': defineOperation<
+  'skill.catalog.query': defineHostPathOperation<
     SkillCatalogQueryInput,
     SkillCatalogQueryResult,
     (typeof QUERY_ERRORS)[number]
-  >({
-    mode: 'query',
-    availability: 'ready',
-    errors: QUERY_ERRORS,
-    decodeInput: decodeQueryInput,
-    decodeOutput: decodeQueryResult,
-  }),
-  'skill.catalog.mutate': defineOperation<
+  >(
+    {
+      mode: 'query',
+      availability: 'ready',
+      errors: QUERY_ERRORS,
+      decodeInput: decodeQueryInput,
+      decodeOutput: decodeQueryResult,
+    },
+    usesWorkspaceHostPath,
+  ),
+  'skill.catalog.invocable.query': defineHostPathOperation<
+    SkillCatalogInvocableQueryInput,
+    SkillCatalogInvocableQueryResult,
+    (typeof INVOCABLE_QUERY_ERRORS)[number]
+  >(
+    {
+      mode: 'query',
+      availability: 'ready',
+      errors: INVOCABLE_QUERY_ERRORS,
+      decodeInput: decodeInvocableQueryInput,
+      decodeOutput: decodeInvocableQueryResult,
+    },
+    (input) =>
+      input.target.kind === 'new_session' && input.target.context.workspace.kind === 'host_path',
+  ),
+  'skill.catalog.mutate': defineHostPathOperation<
     SkillCatalogMutateInput,
     SkillCatalogMutateResult,
     (typeof MUTATION_ERRORS)[number]
-  >({
-    mode: 'command',
-    availability: 'ready',
-    errors: MUTATION_ERRORS,
-    decodeInput: decodeMutateInput,
-    decodeOutput: decodeMutateResult,
-  }),
-  'skill.catalog.preview-update': defineOperation<
+  >(
+    {
+      mode: 'command',
+      availability: 'ready',
+      errors: MUTATION_ERRORS,
+      decodeInput: decodeMutateInput,
+      decodeOutput: decodeMutateResult,
+    },
+    usesWorkspaceHostPath,
+  ),
+  'skill.catalog.preview-update': defineHostPathOperation<
     SkillCatalogPreviewUpdateInput,
     SkillCatalogPreviewUpdateResult,
     (typeof QUERY_ERRORS)[number]
-  >({
-    mode: 'query',
-    availability: 'ready',
-    errors: QUERY_ERRORS,
-    decodeInput: decodePreviewInput,
-    decodeOutput: decodePreviewResult,
-  }),
+  >(
+    {
+      mode: 'query',
+      availability: 'ready',
+      errors: QUERY_ERRORS,
+      decodeInput: decodePreviewInput,
+      decodeOutput: decodePreviewResult,
+    },
+    usesWorkspaceHostPath,
+  ),
 } as const;
+
+function usesWorkspaceHostPath(input: { readonly context: SkillCatalogWorkspaceContext }): boolean {
+  return input.context.workspace.kind === 'host_path';
+}
+
+function decodeInvocableQueryInput(value: unknown): SkillCatalogInvocableQueryInput {
+  const record = requireRecord(value, 'invocable skill catalog query input');
+  if (record.kind === 'start') {
+    const start = requireExactRecord(record, 'invocable skill catalog start query', [
+      'kind',
+      'target',
+    ]);
+    return { kind: 'start', target: invocableTarget(start.target) };
+  }
+  if (record.kind === 'continue') {
+    const continuation = requireExactRecord(record, 'invocable skill catalog continuation query', [
+      'kind',
+      'target',
+      'revision',
+      'cursor',
+    ]);
+    return {
+      kind: 'continue',
+      target: invocableTarget(continuation.target),
+      revision: sha256(continuation.revision, 'invocable skill catalog revision'),
+      cursor: utf8String(continuation.cursor, 'invocable skill catalog cursor', CURSOR_MAX_BYTES),
+    };
+  }
+  throw invalidProtocolFrame('Invalid invocable skill catalog query kind');
+}
+
+function decodeInvocableQueryResult(value: unknown): SkillCatalogInvocableQueryResult {
+  const record = requireRecord(value, 'invocable skill catalog query result');
+  if (record.kind === 'revision_changed') return revisionChanged(record);
+  const page = requireExactRecord(record, 'invocable skill catalog page result', [
+    'kind',
+    'revision',
+    'items',
+    'nextCursor',
+  ]);
+  if (page.kind !== 'page' || !Array.isArray(page.items)) {
+    throw invalidProtocolFrame('Invalid invocable skill catalog page result');
+  }
+  if (page.items.length > SKILL_CATALOG_PAGE_MAX_ITEMS) {
+    throw invalidProtocolFrame('Invocable skill catalog page exceeds item limit');
+  }
+  const decoded: SkillCatalogInvocableQueryResult = {
+    kind: 'page',
+    revision: sha256(page.revision, 'invocable skill catalog revision'),
+    items: page.items.map(invocableItem),
+    nextCursor:
+      page.nextCursor === null
+        ? null
+        : utf8String(page.nextCursor, 'invocable skill catalog next cursor', CURSOR_MAX_BYTES),
+  };
+  assertJsonByteLimit(decoded, SKILL_CATALOG_PAGE_MAX_BYTES, 'Invocable skill catalog page');
+  return decoded;
+}
 
 function decodeQueryInput(value: unknown): SkillCatalogQueryInput {
   const record = requireRecord(value, 'skill catalog query input');
@@ -311,7 +474,11 @@ function decodeQueryInput(value: unknown): SkillCatalogQueryInput {
       'context',
       'view',
     ]);
-    return { kind: 'start', context: localContext(start.context), view: catalogView(start.view) };
+    return {
+      kind: 'start',
+      context: localContext(start.context),
+      view: catalogView(start.view),
+    };
   }
   if (record.kind === 'continue') {
     const continuation = requireExactRecord(record, 'skill catalog continuation query', [
@@ -334,13 +501,29 @@ function decodeQueryInput(value: unknown): SkillCatalogQueryInput {
 
 function decodeQueryResult(value: unknown): SkillCatalogQueryResult {
   const record = requireRecord(value, 'skill catalog query result');
-  if (record.kind === 'revision_changed') return revisionChanged(record);
+  if (record.kind === 'revision_changed') {
+    const changed = requireExactRecord(record, 'skill catalog revision changed result', [
+      'kind',
+      'expectedRevision',
+      'actualRevision',
+      'resolvedWorkspace',
+    ]);
+    return {
+      ...revisionChanged({
+        kind: changed.kind,
+        expectedRevision: changed.expectedRevision,
+        actualRevision: changed.actualRevision,
+      }),
+      resolvedWorkspace: decodeWorkspaceProjection(changed.resolvedWorkspace),
+    };
+  }
   const page = requireExactRecord(record, 'skill catalog page result', [
     'kind',
     'view',
     'revision',
     'items',
     'nextCursor',
+    'resolvedWorkspace',
   ]);
   if (page.kind !== 'page' || !Array.isArray(page.items)) {
     throw invalidProtocolFrame('Invalid skill catalog page result');
@@ -358,8 +541,13 @@ function decodeQueryResult(value: unknown): SkillCatalogQueryResult {
       page.nextCursor === null
         ? null
         : utf8String(page.nextCursor, 'skill catalog next cursor', CURSOR_MAX_BYTES),
+    resolvedWorkspace: decodeWorkspaceProjection(page.resolvedWorkspace),
   };
-  assertJsonByteLimit(decoded, SKILL_CATALOG_PAGE_MAX_BYTES, 'Skill catalog page');
+  assertJsonByteLimit(
+    decoded,
+    SKILL_CATALOG_PAGE_MAX_BYTES + resolvedWorkspaceByteOverhead(decoded.resolvedWorkspace),
+    'Skill catalog page',
+  );
   return decoded;
 }
 
@@ -595,18 +783,39 @@ function mutation(value: unknown): SkillCatalogMutation {
 
 function decodeMutateResult(value: unknown): SkillCatalogMutateResult {
   const record = requireRecord(value, 'skill catalog mutate result');
-  if (record.kind === 'revision_conflict') return revisionConflict(record);
+  if (record.kind === 'revision_conflict') {
+    const conflict = requireExactRecord(record, 'skill catalog revision conflict', [
+      'kind',
+      'expectedRevision',
+      'actualRevision',
+      'resolvedWorkspace',
+    ]);
+    return {
+      ...revisionConflict({
+        kind: conflict.kind,
+        expectedRevision: conflict.expectedRevision,
+        actualRevision: conflict.actualRevision,
+      }),
+      resolvedWorkspace: decodeWorkspaceProjection(conflict.resolvedWorkspace),
+    };
+  }
   if (record.kind === 'rejected') {
     const rejected = requireExactRecord(record, 'skill catalog mutation rejected result', [
       'kind',
       'reason',
+      'resolvedWorkspace',
     ]);
-    return { kind: 'rejected', reason: mutationRejectedReason(rejected.reason) };
+    return {
+      kind: 'rejected',
+      reason: mutationRejectedReason(rejected.reason),
+      resolvedWorkspace: decodeWorkspaceProjection(rejected.resolvedWorkspace),
+    };
   }
   const result = requireExactRecord(record, 'skill catalog mutation result', [
     'kind',
     'revision',
     'entry',
+    'resolvedWorkspace',
   ]);
   if (result.kind !== 'committed' && result.kind !== 'unchanged') {
     throw invalidProtocolFrame('Invalid skill catalog mutation result kind');
@@ -615,6 +824,7 @@ function decodeMutateResult(value: unknown): SkillCatalogMutateResult {
     kind: result.kind,
     revision: sha256(result.revision, 'skill catalog revision'),
     entry: result.entry === null ? null : governanceItem(result.entry),
+    resolvedWorkspace: decodeWorkspaceProjection(result.resolvedWorkspace),
   };
 }
 
@@ -633,13 +843,33 @@ function decodePreviewInput(value: unknown): SkillCatalogPreviewUpdateInput {
 
 function decodePreviewResult(value: unknown): SkillCatalogPreviewUpdateResult {
   const record = requireRecord(value, 'skill catalog preview result');
-  if (record.kind === 'revision_conflict') return revisionConflict(record);
+  if (record.kind === 'revision_conflict') {
+    const conflict = requireExactRecord(record, 'skill catalog revision conflict', [
+      'kind',
+      'expectedRevision',
+      'actualRevision',
+      'resolvedWorkspace',
+    ]);
+    return {
+      ...revisionConflict({
+        kind: conflict.kind,
+        expectedRevision: conflict.expectedRevision,
+        actualRevision: conflict.actualRevision,
+      }),
+      resolvedWorkspace: decodeWorkspaceProjection(conflict.resolvedWorkspace),
+    };
+  }
   if (record.kind === 'rejected') {
     const rejected = requireExactRecord(record, 'skill catalog preview rejected result', [
       'kind',
       'reason',
+      'resolvedWorkspace',
     ]);
-    return { kind: 'rejected', reason: previewRejectedReason(rejected.reason) };
+    return {
+      kind: 'rejected',
+      reason: previewRejectedReason(rejected.reason),
+      resolvedWorkspace: decodeWorkspaceProjection(rejected.resolvedWorkspace),
+    };
   }
   const preview = requireExactRecord(record, 'skill catalog preview result', [
     'kind',
@@ -652,6 +882,7 @@ function decodePreviewResult(value: unknown): SkillCatalogPreviewUpdateResult {
     'summary',
     'expectedCurrentSha256',
     'expectedSourceSha256',
+    'resolvedWorkspace',
   ]);
   if (preview.kind !== 'preview') throw invalidProtocolFrame('Invalid skill catalog preview kind');
   const decoded: SkillCatalogPreviewUpdateResult = {
@@ -675,27 +906,70 @@ function decodePreviewResult(value: unknown): SkillCatalogPreviewUpdateResult {
     summary: lineSummary(preview.summary),
     expectedCurrentSha256: sha256(preview.expectedCurrentSha256, 'expected current sha256'),
     expectedSourceSha256: sha256(preview.expectedSourceSha256, 'expected source sha256'),
+    resolvedWorkspace: decodeWorkspaceProjection(preview.resolvedWorkspace),
   };
   assertJsonByteLimit(
     decoded,
-    SKILL_CATALOG_PREVIEW_RESULT_MAX_BYTES,
+    SKILL_CATALOG_PREVIEW_RESULT_MAX_BYTES +
+      resolvedWorkspaceByteOverhead(decoded.resolvedWorkspace),
     'Skill catalog preview result',
   );
   return decoded;
 }
 
-function localContext(value: unknown): SkillCatalogLocalContext {
-  const record = requireExactRecord(value, 'skill catalog local context', ['projectRoot']);
-  const projectRoot = utf8String(
-    record.projectRoot,
-    'skill catalog project root',
-    PROJECT_ROOT_MAX_BYTES,
-  );
-  if (!isSkillCatalogProjectRootLexicallyAbsolute(projectRoot)) {
-    throw invalidProtocolFrame('Skill catalog project root must be absolute');
+function localContext(value: unknown): SkillCatalogWorkspaceContext {
+  const record = requireExactRecord(value, 'skill catalog workspace context', ['workspace']);
+  return { workspace: decodeWorkspaceTarget(record.workspace) };
+}
+
+function invocableTarget(value: unknown): SkillCatalogInvocableTarget {
+  const record = requireRecord(value, 'invocable skill catalog target');
+  if (record.kind === 'session') {
+    const session = requireExactRecord(record, 'invocable Session target', ['kind', 'sessionId']);
+    return {
+      kind: 'session',
+      sessionId: requireEntityId(session.sessionId, 'invocable Skill Session id'),
+    };
   }
+  if (record.kind === 'new_session') {
+    const fresh = requireExactRecord(record, 'invocable new Session target', [
+      'kind',
+      'context',
+      'collaborationMode',
+      'permissionMode',
+    ]);
+    if (fresh.collaborationMode !== 'agent' && fresh.collaborationMode !== 'plan') {
+      throw invalidProtocolFrame('Invalid invocable Skill collaboration mode');
+    }
+    if (!isPermissionMode(fresh.permissionMode)) {
+      throw invalidProtocolFrame('Invalid invocable Skill permission mode');
+    }
+    return {
+      kind: 'new_session',
+      context: localContext(fresh.context),
+      collaborationMode: fresh.collaborationMode,
+      permissionMode: fresh.permissionMode,
+    };
+  }
+  throw invalidProtocolFrame('Invalid invocable skill catalog target');
+}
+
+function invocableItem(value: unknown): SkillCatalogInvocableItem {
+  const record = requireExactRecord(value, 'invocable skill catalog item', [
+    'ref',
+    'id',
+    'name',
+    'description',
+  ]);
   return {
-    projectRoot,
+    ref: utf8String(record.ref, 'invocable skill ref', SKILL_CATALOG_REF_MAX_BYTES),
+    id: utf8String(record.id, 'invocable skill id', SKILL_CATALOG_DISPLAY_ID_MAX_BYTES),
+    name: utf8String(record.name, 'invocable skill name', SKILL_CATALOG_NAME_MAX_BYTES),
+    description: utf8String(
+      record.description,
+      'invocable skill description',
+      SKILL_CATALOG_DESCRIPTION_MAX_BYTES,
+    ),
   };
 }
 
@@ -707,9 +981,7 @@ export function isSkillCatalogProjectRootLexicallyAbsolute(
   return /^[A-Za-z]:[\\/]/.test(value) || /^[\\/]{2}[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/.test(value);
 }
 
-function revisionChanged(
-  value: unknown,
-): Extract<SkillCatalogQueryResult, { kind: 'revision_changed' }> {
+function revisionChanged(value: unknown): SkillCatalogRevisionChanged {
   const record = requireExactRecord(value, 'skill catalog revision changed result', [
     'kind',
     'expectedRevision',
@@ -969,6 +1241,10 @@ function previewRejectedReason(value: unknown): SkillCatalogPreviewRejectedReaso
     return value;
   }
   throw invalidProtocolFrame('Invalid skill catalog preview rejection reason');
+}
+
+function resolvedWorkspaceByteOverhead(workspace: WorkspaceProjection): number {
+  return Buffer.byteLength(`,"resolvedWorkspace":${JSON.stringify(workspace)}`, 'utf8');
 }
 
 function assertJsonByteLimit(value: unknown, maxBytes: number, label: string): void {

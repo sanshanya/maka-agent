@@ -1,4 +1,23 @@
-import type { OsPermissionId, OsPermissionState } from '@maka/core';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import type { OsPermissionId, OsPermissionState } from '@maka/core/capabilities';
 
 export function mapMediaAccessStatus(status: string): OsPermissionState {
   switch (status) {
@@ -15,15 +34,14 @@ export function mapMediaAccessStatus(status: string): OsPermissionState {
 }
 
 export function supportsMediaPermissionProbe(
-  id: 'screen_recording' | 'microphone',
+  id: 'screen_recording',
   platform: NodeJS.Platform,
 ): boolean {
-  if (id === 'screen_recording') return platform === 'darwin';
-  return platform === 'darwin' || platform === 'win32';
+  return id === 'screen_recording' && platform === 'darwin';
 }
 
 export function mediaPermissionActions(input: {
-  id: 'screen_recording' | 'microphone';
+  id: 'screen_recording';
   platform: NodeJS.Platform;
   status: OsPermissionState;
 }): { canOpenSettings: boolean; canRequest: boolean } {
@@ -31,8 +49,8 @@ export function mediaPermissionActions(input: {
     canOpenSettings: input.platform === 'darwin',
     canRequest:
       input.platform === 'darwin'
-      && ((input.id === 'microphone' && input.status === 'not_determined')
-        || (input.id === 'screen_recording' && input.status !== 'granted')),
+      && input.id === 'screen_recording'
+      && input.status !== 'granted',
   };
 }
 
@@ -40,22 +58,17 @@ export type PermissionRequestPlan =
   | 'unsupported_platform'
   | 'already_granted'
   | 'request_screen_capture'
-  | 'request_microphone'
   | 'open_settings';
 
 export function planPermissionRequest(input: {
   id: OsPermissionId;
   platform: NodeJS.Platform;
-  microphoneStatus?: string;
   screenStatus?: string;
 }): PermissionRequestPlan {
   if (input.platform !== 'darwin') return 'unsupported_platform';
   if (input.id === 'screen_recording') {
     return input.screenStatus === 'granted' ? 'already_granted' : 'request_screen_capture';
   }
-  if (input.id !== 'microphone') return 'open_settings';
-  if (input.microphoneStatus === 'granted') return 'already_granted';
-  if (input.microphoneStatus === 'not-determined') return 'request_microphone';
   return 'open_settings';
 }
 

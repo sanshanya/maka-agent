@@ -1,9 +1,28 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   BotOnboardingBrand,
   BotOnboardingProvider,
   BotOnboardingSnapshot,
-} from '@maka/core';
+} from '@maka/core/bot-onboarding';
 import { Spinner } from '@astryxdesign/core';
 import {
   Button,
@@ -15,10 +34,10 @@ import {
   DialogHeader,
 } from '@astryxdesign/core/Dialog';
 import { Layout, LayoutContent } from '@astryxdesign/core/Layout';
-import { AlertCircle, Check } from '@maka/ui/icons';
+import { ICON_SIZE, AlertCircle, Check } from '@maka/ui/icons';
 import { BotBrandLogo } from './bot-chat-shared';
 import { settingsActionErrorMessage } from './settings-error-copy';
-import { getBotSettingsCopy, type BotSettingsCopy } from '../locales/settings-bot-copy';
+import { botOnboardingErrorMessage, botStatusReasonMessage, getBotSettingsCopy, type BotSettingsCopy } from '../locales/settings-bot-copy';
 
 export function BotOnboardingModal(props: {
   provider: BotOnboardingProvider;
@@ -149,7 +168,7 @@ export function BotOnboardingModal(props: {
       isOpen={props.isOpen}
       onOpenChange={handleOpenChange}
       className="settingsBotOnboardingModal"
-      width={520}
+      width={480}
       aria-label={copy.ariaLabel}
       purpose="form"
     >
@@ -169,20 +188,20 @@ export function BotOnboardingModal(props: {
             {showQr ? (
               <img src={qrDataUrl ?? undefined} alt={copy.qrAlt} />
             ) : starting || snapshot?.state === 'connecting' ? (
-              <Spinner size="xl" aria-label={onboardingCopy.generatingAria} />
+              <Spinner size="lg" aria-label={onboardingCopy.generatingAria} />
             ) : snapshot?.state === 'connected' ? (
-              snapshot.warning ? (
+              snapshot.warningCode ? (
                 <span className="settingsBotOnboardingEmpty" aria-hidden="true">
-                  <AlertCircle size={28} />
+                  <AlertCircle size={ICON_SIZE.plate} />
                 </span>
               ) : (
                 <span className="settingsBotOnboardingSuccess" aria-hidden="true">
-                  <Check size={28} />
+                  <Check size={ICON_SIZE.plate} />
                 </span>
               )
             ) : (
               <span className="settingsBotOnboardingEmpty" aria-hidden="true">
-                <AlertCircle size={28} />
+                <AlertCircle size={ICON_SIZE.plate} />
               </span>
             )}
           </div>
@@ -232,7 +251,7 @@ function statusCopy(
   starting: boolean,
   error: string | null,
   copy: BotSettingsCopy['onboarding']['providers'][BotOnboardingProvider],
-  locale: 'zh' | 'en' = 'zh',
+  locale: 'zh-CN' | 'zh-TW' | 'en',
 ): string {
   const shared = getBotSettingsCopy(locale).onboarding;
   if (starting) return shared.generating;
@@ -243,13 +262,15 @@ function statusCopy(
     case 'connecting': return shared.connecting;
     // PR1197 review (P0-3): honour the honest "saved but not connected" notice
     // instead of claiming a healthy connection.
-    case 'connected': return snapshot.warning
-      ? (locale === 'zh' ? snapshot.warning : shared.connectedWarning)
+    case 'connected': return snapshot.warningCode
+      ? (snapshot.warningDetail
+          ? shared.savedNotConnectedDetail(botStatusReasonMessage(snapshot.warningDetail, locale))
+          : shared.savedNotConnected)
       : shared.connected(getBotSettingsCopy(locale).providers[snapshot.provider].label);
     case 'expired': return shared.expired;
     case 'denied': return shared.denied;
     case 'cancelled': return shared.cancelled;
-    case 'error': return locale === 'zh' ? (snapshot.error ?? shared.failed) : shared.failed;
+    case 'error': return botOnboardingErrorMessage(snapshot.errorCode, locale);
     default: return shared.preparing;
   }
 }

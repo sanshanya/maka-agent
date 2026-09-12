@@ -1,10 +1,31 @@
-import { randomUUID } from 'node:crypto';
-import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { writeAtomicFile } from './atomic-file-write.js';
+import { withFileUpdateLock } from './file-update-lock.js';
+import { hardenDirectory } from './stable-storage.js';
 
 /**
  * Pure-Node credential store. Shared by the desktop app and any
- * headless consumer (CLI / eval harness / third party) that runs the
+ * non-desktop consumer (CLI / third party) that runs the
  * runtime outside Electron.
  *
  * At rest this is plaintext JSON behind 0600 file perms (file-first;
@@ -27,17 +48,23 @@ import { dirname, join } from 'node:path';
 type StoredCredentialKind =
   | 'apiKey'
   | 'oauthToken'
+  | 'requestHeaders'
   | 'botToken'
   | 'botAppSecret'
   | 'proxyPassword'
-  | 'tavilyApiKey';
+  | 'tavilyApiKey'
+  | 'runtimeHostAccess'
+  | 'runtimeHostCapabilityProvider';
 export type CredentialKind =
   | 'api_key'
   | 'oauth_token'
+  | 'request_headers'
   | 'bot_token'
   | 'app_secret'
   | 'proxy_password'
-  | 'tavily_api_key';
+  | 'tavily_api_key'
+  | 'runtime_host_access'
+  | 'runtime_host_capability_provider';
 
 /** Current on-disk schema version. Unknown versions fail closed on read. */
 export const CREDENTIAL_SCHEMA_VERSION = 1;
@@ -216,56 +243,17 @@ class FileCredentialStore implements CredentialStore {
 }
 
 /**
- * Create (or harden) the directory that holds a secret file: 0700, and
- * re-chmod a pre-existing looser dir so neither the secret nor the lock can sit
- * world-readable. mkdir's mode only applies on creation, so the chmod is what
- * fixes an existing dir. On POSIX a chmod failure fails closed (we must not
- * write plaintext credentials into a dir we couldn't lock down); no-op on
- * Windows. Shared by the writer and the lock so their dir hardening can't drift.
- */
-async function ensureSecretDir(dir: string): Promise<void> {
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  await chmodStrict(dir, 0o700);
-}
-
-/**
- * Owner-only atomic write for a credentials file: a 0700 dir, an exclusive
- * 0600 temp ('wx'/O_EXCL so we never follow a pre-planted symlink at a
- * predictable path), 0600 re-enforced, an atomic rename, and temp cleanup on
- * failure.
+ * Owner-only atomic write for a credentials file. Directory hardening is an
+ * explicit credential-store policy; file publication uses the shared legacy
+ * JSON writer so its mode, synchronization, and cleanup behavior remains
+ * aligned with settings and MCP config.
  */
 async function writeSecretFileAtomic(path: string, contents: string): Promise<void> {
-  await ensureSecretDir(dirname(path));
-  const tempPath = `${path}.${randomUUID()}.tmp`;
-  try {
-    await writeFile(tempPath, contents, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-    await chmodStrict(tempPath, 0o600);
-    await rename(tempPath, path);
-  } catch (error) {
-    await rm(tempPath, { force: true });
-    throw error;
-  }
+  await hardenDirectory(dirname(path));
+  await writeAtomicFile(path, contents, { fileMode: 0o600 });
 }
 
-/**
- * chmod that fails loud on POSIX and is best-effort on Windows. A secret file
- * or its directory left looser than intended breaks the 0600/0700 boundary, so
- * on POSIX we surface the failure rather than write plaintext into it; Windows
- * has no POSIX mode, so a failure there is a no-op. One policy for both the
- * secret file (0600) and its directory (0700) so they can't drift apart.
- */
-async function chmodStrict(path: string, mode: number): Promise<void> {
-  if (process.platform === 'win32') {
-    await chmod(path, mode).catch(() => {});
-    return;
-  }
-  await chmod(path, mode);
-}
-
-// A contended acquire polls this often, then fails loud after the timeout.
-const LOCK_POLL_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
-const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Serialize a read-modify-write across processes / store instances that share
@@ -298,40 +286,22 @@ export async function withCredentialFileLock<T>(
   fn: () => Promise<T>,
   timeoutMs: number = LOCK_TIMEOUT_MS,
 ): Promise<T> {
-  const lockPath = `${targetPath}.lock`;
-  // mkdir (the acquire below) is atomic but needs its parent to exist; harden it
-  // to 0700 the same way the writer does so the lock dir never sits loose.
-  await ensureSecretDir(dirname(targetPath));
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    try {
-      await mkdir(lockPath);
-      break;
-    } catch (error) {
-      if ((error as { code?: string }).code !== 'EEXIST') throw error;
-      if (Date.now() >= deadline) {
-        throw new Error(
-          `credentials.json is locked by another process (${lockPath}). ` +
-            'If no other process is using it, remove that directory and retry.',
-        );
-      }
-      await delay(LOCK_POLL_MS);
-    }
-  }
-  try {
-    return await fn();
-  } finally {
-    await rm(lockPath, { recursive: true, force: true });
-  }
+  // Same owner-only hardening the writer applies, so the lock directory can
+  // never sit looser than the secret it guards.
+  await hardenDirectory(dirname(targetPath));
+  return withFileUpdateLock(targetPath, fn, timeoutMs);
 }
 
 const STORED_CREDENTIAL_KINDS = [
   'apiKey',
   'oauthToken',
+  'requestHeaders',
   'botToken',
   'botAppSecret',
   'proxyPassword',
   'tavilyApiKey',
+  'runtimeHostAccess',
+  'runtimeHostCapabilityProvider',
 ] as const satisfies readonly StoredCredentialKind[];
 
 function toStoredKind(kind: CredentialKind): StoredCredentialKind {
@@ -340,6 +310,8 @@ function toStoredKind(kind: CredentialKind): StoredCredentialKind {
       return 'apiKey';
     case 'oauth_token':
       return 'oauthToken';
+    case 'request_headers':
+      return 'requestHeaders';
     case 'bot_token':
       return 'botToken';
     case 'app_secret':
@@ -348,5 +320,9 @@ function toStoredKind(kind: CredentialKind): StoredCredentialKind {
       return 'proxyPassword';
     case 'tavily_api_key':
       return 'tavilyApiKey';
+    case 'runtime_host_access':
+      return 'runtimeHostAccess';
+    case 'runtime_host_capability_provider':
+      return 'runtimeHostCapabilityProvider';
   }
 }

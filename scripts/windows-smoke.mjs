@@ -1,4 +1,22 @@
 #!/usr/bin/env node
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
@@ -11,6 +29,15 @@ const REPO_ROOT = resolve(dirname(SCRIPT_PATH), '..');
 const CLI_PATH = join(REPO_ROOT, 'packages', 'cli', 'dist', 'cli.js');
 const DESKTOP_MAIN = join(REPO_ROOT, 'apps', 'desktop', 'dist', 'main', 'main.js');
 const DESKTOP_PRELOAD = join(REPO_ROOT, 'apps', 'desktop', 'dist', 'preload', 'preload.cjs');
+const DESKTOP_RENDERER = join(REPO_ROOT, 'apps', 'desktop', 'dist-renderer', 'index.html');
+const DESKTOP_RUNTIME_WORKER = join(
+  REPO_ROOT,
+  'apps',
+  'desktop',
+  'resources',
+  'workers',
+  'filesystem-worker.js',
+);
 const DESKTOP_SMOKE = join(REPO_ROOT, 'scripts', 'desktop-real-window-smoke.mjs');
 const CLI_TIMEOUT_MS = 15_000;
 const DESKTOP_TIMEOUT_MS = 45_000;
@@ -21,7 +48,13 @@ export function runWindowsSmoke(options = {}) {
   const exists = options.existsSync ?? existsSync;
   if (platform !== 'win32') throw new Error('Windows smoke must run on Windows');
 
-  for (const artifact of [CLI_PATH, DESKTOP_MAIN, DESKTOP_PRELOAD]) {
+  for (const artifact of [
+    CLI_PATH,
+    DESKTOP_MAIN,
+    DESKTOP_PRELOAD,
+    DESKTOP_RENDERER,
+    DESKTOP_RUNTIME_WORKER,
+  ]) {
     if (!exists(artifact)) {
       throw new Error(`Missing build artifact: ${artifact}. Run npm run build first.`);
     }

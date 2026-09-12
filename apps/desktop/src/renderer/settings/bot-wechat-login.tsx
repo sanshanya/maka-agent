@@ -1,8 +1,27 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { useEffect, useRef, useState } from 'react';
-import type { BotChannelSettings } from '@maka/core';
-import type { WechatBridgeQrCodeResult } from '@maka/runtime';
+import type { BotChannelSettings } from '@maka/core/bot-chat-settings';
+import type { WechatBridgeQrCodeResult } from '@maka/runtime/bots';
 import { Button, EmptyState, FormLayout, Spinner, TextInput, useUiLocale, Banner } from '@maka/ui';
-import { CircleCheckBig } from '@maka/ui/icons';
+import { ICON_SIZE, MessageSquare } from '@maka/ui/icons';
 import { Collapsible } from '@astryxdesign/core/Collapsible';
 import {
   Dialog,
@@ -80,7 +99,8 @@ export function WechatQrLoginModal(props: {
   onRefreshStatuses(): void | Promise<unknown>;
 }) {
   const locale = useUiLocale();
-  const copy = getBotSettingsCopy(locale).wechat;
+  const botCopy = getBotSettingsCopy(locale);
+  const copy = botCopy.wechat;
   const [result, setResult] = useState<WechatBridgeQrCodeResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [reloadNonce, setReloadNonce] = useState(0);
@@ -101,6 +121,9 @@ export function WechatQrLoginModal(props: {
     void window.maka.settings.bots.wechatQrCode()
       .then((next) => {
         if (!active) return;
+        // The raw error is an English diagnostic, never product copy; the
+        // dialog renders hint-code titles and the localized generic hint.
+        if (!next.ok && next.error) console.warn(`[bots:wechat] QR sign-in: ${next.error}`);
         setResult(next);
         if (next.ok && next.loggedIn && !notifiedLoggedInRef.current) {
           notifiedLoggedInRef.current = true;
@@ -109,10 +132,10 @@ export function WechatQrLoginModal(props: {
       })
       .catch((error) => {
         if (!active) return;
+        console.warn('[bots:wechat] QR sign-in failed:', error);
         setResult({
           ok: false,
           error: settingsActionErrorMessage(error, locale),
-          hint: copy.readQrFailed,
         });
       })
       .finally(() => {
@@ -153,7 +176,7 @@ export function WechatQrLoginModal(props: {
       isOpen={props.isOpen}
       onOpenChange={props.onOpenChange}
       className="settingsWechatQrModal"
-      width={360}
+      width={480}
       purpose="info"
     >
       <Layout
@@ -172,21 +195,24 @@ export function WechatQrLoginModal(props: {
                 light background regardless of theme). */}
             <div className="settingsWechatQrBody">
           {loading ? (
-            <EmptyState isCompact headingLevel={4} icon={<Spinner size="lg" />} title={copy.generating} />
+            /* Loading is a wait, not an absence (§10): a page-centred spinner
+               with one muted line, never a Spinner in an EmptyState icon slot. */
+            (<>
+              <Spinner size="lg" />
+              <p className="settingsWechatQrCaption">{copy.generating}</p>
+            </>)
           ) : loggedIn ? (
-            <EmptyState
-              isCompact
-              headingLevel={4}
-              icon={<CircleCheckBig size={24} aria-hidden="true" />}
-              title={copy.loggedIn}
-            />
+            <Banner status="success" title={copy.loggedIn} />
           ) : expired ? (
-            <EmptyState
-              isCompact
+            /* First-run empties (DESIGN.md §10 tier 3) below; headingLevel 4 is
+               derived from the dialog outline — DialogHeader owns the title level. */
+            (<EmptyState
               headingLevel={4}
+              icon={<MessageSquare size={ICON_SIZE.empty} />}
               title={copy.expired}
+              description={copy.expiredHint}
               actions={<Button variant="secondary" size="sm" isDisabled={loading} onClick={reloadQrCode} label={loading ? copy.refreshing : copy.refresh} />}
-            />
+            />)
           ) : qrDataUrl ? (
             <>
               <div className="settingsWechatQrFrame">
@@ -197,18 +223,19 @@ export function WechatQrLoginModal(props: {
           ) : error ? (
             <div role="alert">
               <EmptyState
-                isCompact
                 headingLevel={4}
-                title={error.error}
-                description={error.hint}
+                icon={<MessageSquare size={ICON_SIZE.empty} />}
+                title={error.hintCode ? botCopy.testHints[error.hintCode] : copy.readQrFailed}
+                description={copy.readQrFailed}
                 actions={<Button variant="secondary" size="sm" isDisabled={loading} onClick={reloadQrCode} label={loading ? copy.retrying : copy.retry} />}
               />
             </div>
           ) : (
             <EmptyState
-              isCompact
               headingLevel={4}
+              icon={<MessageSquare size={ICON_SIZE.empty} />}
               title={copy.bridgeGenerating}
+              description={copy.bridgeGeneratingHint}
               actions={<Button variant="secondary" size="sm" isDisabled={loading} onClick={reloadQrCode} label={loading ? copy.fetching : copy.fetchAgain} />}
             />
           )}

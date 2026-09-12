@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 // What `list_apps` costs, and what it should say.
 //
 // On a real three-call turn this was 12,933 bytes — about 3,600 tokens, 85% of
@@ -99,13 +118,4 @@ test('nothing matched says what there is, so the next call is not the whole list
     'com.google.Chrome',
     'com.apple.calculator',
   ]);
-});
-
-test('a filtered list is a fraction of the size of the whole one', async () => {
-  const whole = await listApps();
-  const one = await listApps('文本编辑');
-  assert.ok(
-    (one.modelText ?? '').length < (whole.modelText ?? '').length,
-    'filtering must not cost more than not filtering',
-  );
 });

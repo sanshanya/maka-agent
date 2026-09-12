@@ -1,17 +1,45 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 export type OperationMode = 'command' | 'query' | 'control';
 export type OperationAvailability = 'bootstrap' | 'ready';
 
 export type HostOperationErrorCode =
   | 'host_not_ready'
   | 'host_draining'
+  | 'unauthorized'
   | 'operation_unavailable'
   | 'not_found'
   | 'session_archived'
   | 'session_busy'
+  | 'transcript_preparing'
+  | 'candidate_set_stale'
   | 'operation_conflict'
   | 'capability_unavailable'
+  | 'slug_taken'
   | 'invalid_request'
+  // External-session import: no usable model connection to attach the task to.
+  | 'model_unavailable'
+  // External-session import: the source could not be read or converted.
+  | 'source_unreadable'
   | 'projection_incomplete'
+  | 'stale_cursor'
   | 'persistence_failed'
   | 'commit_outcome_unknown'
   | 'already_resolved'
@@ -27,6 +55,7 @@ export interface OperationSpec<Input, Output, ErrorCode extends HostOperationErr
   mode: OperationMode;
   availability: OperationAvailability;
   errors: readonly ErrorCode[];
+  usesHostPaths?(input: Input): boolean;
   decodeInput(value: unknown): Input;
   decodeOutput(value: unknown): Output;
   assertOutputForInput?(input: Input, output: Output): void;
@@ -65,6 +94,13 @@ export function defineOperation<Input, Output, ErrorCode extends HostOperationEr
     throw new Error('Every Runtime Host operation must declare internal_failure');
   }
   return spec;
+}
+
+export function defineHostPathOperation<Input, Output, ErrorCode extends HostOperationErrorCode>(
+  spec: Omit<OperationSpec<Input, Output, ErrorCode>, 'usesHostPaths'>,
+  usesHostPaths: (input: Input) => boolean = () => true,
+): OperationSpec<Input, Output, ErrorCode> {
+  return defineOperation({ ...spec, usesHostPaths });
 }
 
 export function composeOperationSpecMaps<const Maps extends OperationSpecMaps>(

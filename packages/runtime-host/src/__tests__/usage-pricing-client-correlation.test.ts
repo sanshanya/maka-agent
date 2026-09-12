@@ -1,3 +1,23 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { RuntimeHostProtocolError } from '../protocol/errors.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -14,10 +34,11 @@ import { prepareRuntimeHostEndpoint } from '../control/endpoint.js';
 import { removeHostRegistration, writeHostRegistration } from '../control/registration.js';
 import {
   decodeClientFrame,
+  encodeProtocolMessage,
   RUNTIME_HOST_COMPATIBILITY_EPOCH,
   RUNTIME_HOST_PROTOCOL_VERSION,
   RUNTIME_HOST_REGISTRATION_SCHEMA_VERSION,
-  RuntimeHostProtocolError,
+  type HostFrame,
   type OperationInput,
   type OperationOutput,
   type RequestFrame,
@@ -151,10 +172,10 @@ describe('Usage/Pricing client response correlation', () => {
       skip: process.platform === 'win32',
     }, async () => {
       await withProtocolPeer(
-        async (transport, hostEpoch) => {
-          const request = await acceptConnectionAndReadRequest(transport, hostEpoch);
+        async (transport, hostEpoch, rootId) => {
+          const request = await acceptConnectionAndReadRequest(transport, hostEpoch, rootId);
           assert.equal(request.operation, mismatch.operation);
-          await transport.write({
+          await writeHostFrame(transport, {
             requestId: request.requestId,
             operation: mismatch.operation,
             ok: true,
@@ -166,7 +187,7 @@ describe('Usage/Pricing client response correlation', () => {
           const request = requestUnchecked(connection, mismatch.operation, mismatch.input);
           await assert.rejects(request, isInvalidFrame);
           await connection.closed;
-          await assert.rejects(requestUnchecked(connection, 'host.status', {}), isInvalidFrame);
+          await assert.rejects(connection.status(REQUEST_TIMEOUT_MS), isInvalidFrame);
         },
       );
     });
@@ -176,8 +197,8 @@ describe('Usage/Pricing client response correlation', () => {
     skip: process.platform === 'win32',
   }, async () => {
     await withProtocolPeer(
-      async (transport, hostEpoch) => {
-        const request = await acceptConnectionAndReadRequest(transport, hostEpoch);
+      async (transport, hostEpoch, rootId) => {
+        const request = await acceptConnectionAndReadRequest(transport, hostEpoch, rootId);
         assert.equal(request.operation, 'usage.query');
         assert.deepEqual(request.input, {
           kind: 'logs',
@@ -186,7 +207,7 @@ describe('Usage/Pricing client response correlation', () => {
           offset: 50,
           limit: 10,
         });
-        await transport.write({
+        await writeHostFrame(transport, {
           requestId: request.requestId,
           operation: 'usage.query',
           ok: true,
@@ -249,7 +270,7 @@ function requestUnchecked(
 }
 
 async function withProtocolPeer(
-  serve: (transport: FramedTransport, hostEpoch: string) => Promise<void>,
+  serve: (transport: FramedTransport, hostEpoch: string, rootId: string) => Promise<void>,
   run: (connection: RuntimeHostConnection) => Promise<void>,
 ): Promise<void> {
   const base = await mkdtemp(join(tmpdir(), 'maka-usage-pricing-correlation-'));
@@ -268,7 +289,10 @@ async function withProtocolPeer(
     rejectServer = reject;
   });
   const server = createServer((socket) => {
-    void serve(new FramedTransport(socket), hostEpoch).then(resolveServer, rejectServer);
+    void serve(new FramedTransport(socket), hostEpoch, capability.rootId).then(
+      resolveServer,
+      rejectServer,
+    );
   });
   try {
     await listen(server, endpoint.path);
@@ -282,13 +306,14 @@ async function withProtocolPeer(
       protocolMin: RUNTIME_HOST_PROTOCOL_VERSION,
       protocolMax: RUNTIME_HOST_PROTOCOL_VERSION,
       compatibilityEpoch: RUNTIME_HOST_COMPATIBILITY_EPOCH,
+      compositionId: 'maka.interactive',
+      compositionRevision: '1',
       state: 'ready',
       pid: process.pid,
       createdAt: new Date().toISOString(),
     });
     const connected = await connectRuntimeHost({
       rootPath: root,
-      surface: 'tui',
       protocol: PROTOCOL,
     });
     assert.equal(connected.kind, 'connected');
@@ -310,20 +335,28 @@ async function withProtocolPeer(
 async function acceptConnectionAndReadRequest(
   transport: FramedTransport,
   hostEpoch: string,
+  rootId: string,
 ): Promise<RequestFrame> {
   const hello = decodeClientFrame(await transport.read(REQUEST_TIMEOUT_MS));
   assert.ok('kind' in hello && hello.kind === 'hello');
-  await transport.write({
+  await writeHostFrame(transport, {
     kind: 'accepted',
+    rootId,
     hostEpoch,
     connectionId: 'usage-pricing-correlation',
     selectedProtocol: RUNTIME_HOST_PROTOCOL_VERSION,
     compatibilityEpoch: RUNTIME_HOST_COMPATIBILITY_EPOCH,
+    compositionId: 'maka.interactive',
+    compositionRevision: '1',
     state: 'ready',
   });
   const request = decodeClientFrame(await transport.read(REQUEST_TIMEOUT_MS));
   assert.ok(!('kind' in request));
   return request as RequestFrame;
+}
+
+function writeHostFrame(transport: FramedTransport, frame: HostFrame): Promise<void> {
+  return transport.write(encodeProtocolMessage(frame));
 }
 
 function listen(server: Server, path: string): Promise<void> {

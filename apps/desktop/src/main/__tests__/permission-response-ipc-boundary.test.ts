@@ -1,10 +1,32 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
   normalizeBranchFromTurnInput,
+  normalizeClientCapabilityResponse,
   normalizeRegenerateTurnInput,
   normalizeReviseBeforeTurnInput,
+  normalizeRuntimeHostBranchFromTurnInput,
+  normalizeRuntimeHostReviseBeforeTurnInput,
   normalizeSandboxBoundaryResponse,
   normalizeSessionSendCommand,
   normalizeStopSessionInput,
@@ -29,6 +51,14 @@ describe('permission response IPC boundary', () => {
       }),
       { requestId: 'question-1', answers: ['Option A', null] },
     );
+    assert.deepEqual(
+      normalizeClientCapabilityResponse({
+        requestId: 'capability-1',
+        decision: 'allow',
+        ignored: true,
+      }),
+      { requestId: 'capability-1', decision: 'allow' },
+    );
 
     const invalidPermissionResponses = [
       null,
@@ -38,6 +68,12 @@ describe('permission response IPC boundary', () => {
     ];
     for (const response of invalidPermissionResponses) {
       assert.throws(() => normalizeSandboxBoundaryResponse(response), /sandbox boundary response/);
+    }
+    for (const response of invalidPermissionResponses) {
+      assert.throws(
+        () => normalizeClientCapabilityResponse(response),
+        /Client Capability response/,
+      );
     }
 
     const invalidQuestionResponses = [
@@ -56,19 +92,76 @@ describe('permission response IPC boundary', () => {
       sourceTurnId: 'turn-2',
       turnId: 'turn-3',
     });
+    // A through-turn branch keeps its sourceTurnId; a spurious copyId is dropped.
     assert.deepEqual(
-      normalizeBranchFromTurnInput({ sourceTurnId: 'turn-3', name: '  Branch name  ', ignored: 1 }),
-      { sourceTurnId: 'turn-3', name: 'Branch name' },
+      normalizeBranchFromTurnInput({ sourceTurnId: 'turn-legacy', copyId: 'ignored-here' }),
+      { sourceTurnId: 'turn-legacy' },
     );
-    assert.deepEqual(normalizeReviseBeforeTurnInput({ sourceTurnId: 'turn-4', ignored: true }), {
-      sourceTurnId: 'turn-4',
-    });
+    assert.deepEqual(
+      normalizeBranchFromTurnInput({
+        sourceTurnId: 'turn-3',
+        name: '  Branch name  ',
+        sideConversation: true,
+        ignored: 1,
+      }),
+      {
+        sourceTurnId: 'turn-3',
+        name: 'Branch name',
+        sideConversation: true,
+      },
+    );
+    // An empty side-conversation branch omits sourceTurnId entirely.
+    assert.deepEqual(
+      normalizeBranchFromTurnInput({ sideConversation: true }),
+      { sideConversation: true },
+    );
+    assert.deepEqual(
+      normalizeRuntimeHostBranchFromTurnInput({
+        sourceTurnId: 'turn-3',
+        name: '  Branch name  ',
+        sideConversation: true,
+        copyId: 'branch-copy-1',
+        ignored: 1,
+      }),
+      {
+        sourceTurnId: 'turn-3',
+        name: 'Branch name',
+        sideConversation: true,
+        copyId: 'branch-copy-1',
+      },
+    );
+    assert.deepEqual(
+      normalizeRuntimeHostReviseBeforeTurnInput({
+        sourceTurnId: 'turn-4',
+        copyId: 'revision-copy-1',
+        ignored: true,
+      }),
+      {
+        sourceTurnId: 'turn-4',
+        copyId: 'revision-copy-1',
+      },
+    );
 
     const invalidActions: Array<() => unknown> = [
       () => normalizeRegenerateTurnInput({ sourceTurnId: 'turn-1', turnId: 1 }),
-      () => normalizeBranchFromTurnInput({ sourceTurnId: 'turn-1', name: 1 }),
-      () => normalizeBranchFromTurnInput({ sourceTurnId: 'x'.repeat(129) }),
+      () =>
+        normalizeBranchFromTurnInput({
+          sourceTurnId: 'turn-1',
+          name: 1,
+        }),
+      () =>
+        normalizeBranchFromTurnInput({
+          sourceTurnId: 'turn-1',
+          sideConversation: 'yes',
+        }),
+      () =>
+        normalizeBranchFromTurnInput({ sourceTurnId: 'x'.repeat(129) }),
       () => normalizeReviseBeforeTurnInput({ sourceTurnId: 1 }),
+      () =>
+        normalizeRuntimeHostBranchFromTurnInput({
+          sourceTurnId: 'turn-1',
+        }),
+      () => normalizeRuntimeHostReviseBeforeTurnInput({ sourceTurnId: 'turn-1', copyId: '' }),
     ];
     for (const action of invalidActions) assert.throws(action, /Invalid/);
   });
@@ -82,6 +175,19 @@ describe('permission response IPC boundary', () => {
         displayText: 'review @packages/ui/src/chat turn.tsx',
         skillIds: ['weekly-report', 'project:maka:writer'],
         attachmentItems: [{ approvalId: 'a', name: 'n' }],
+        retainedAttachments: [
+          {
+            kind: 'other',
+            name: 'notes.txt',
+            mimeType: 'text/plain',
+            bytes: 5,
+            ref: {
+              kind: 'session_file',
+              sessionId: 'session-1',
+              relativePath: 'attachments/notes.txt',
+            },
+          },
+        ],
         turnOrchestration: { mode: 'swarm', source: 'slash_command', ignored: true },
         quotes: [
           { text: 'the excerpt', label: '  Assistant  ', sourceTurnId: 'turn-9', extra: true },
@@ -103,6 +209,19 @@ describe('permission response IPC boundary', () => {
         displayText: 'review @packages/ui/src/chat turn.tsx',
         skillIds: ['weekly-report', 'project:maka:writer'],
         attachmentItems: [{ approvalId: 'a', name: 'n' }],
+        retainedAttachments: [
+          {
+            kind: 'other',
+            name: 'notes.txt',
+            mimeType: 'text/plain',
+            bytes: 5,
+            ref: {
+              kind: 'session_file',
+              sessionId: 'session-1',
+              relativePath: 'attachments/notes.txt',
+            },
+          },
+        ],
         turnOrchestration: { mode: 'swarm', source: 'slash_command' },
         quotes: [{ text: 'the excerpt', label: 'Assistant', sourceTurnId: 'turn-9' }],
         workspaceFileReferences: [
@@ -126,6 +245,7 @@ describe('permission response IPC boundary', () => {
       null,
       { type: 'send', text: '' },
       { type: 'send', text: 'x'.repeat(128_001) },
+      { type: 'send', text: 'ok', retainedAttachments: [{ name: 'broken' }] },
       { type: 'send', text: 'hello', turnId: 1 },
       { type: 'send', text: 'hello', skillIds: ['/bad'] },
       { type: 'send', text: 'hello', turnOrchestration: { mode: 'swarm', source: 'prompt' } },
@@ -155,31 +275,41 @@ describe('permission response IPC boundary', () => {
     }
   });
 
-  it('allows a valid voice-only send and validates the operation id', () => {
-    assert.deepEqual(
-      normalizeSessionSendCommand({
-        type: 'send',
-        text: '',
-        voiceOperationId: '123e4567-e89b-12d3-a456-426614174000',
-      }),
-      {
-        type: 'send',
-        text: '',
-        voiceOperationId: '123e4567-e89b-12d3-a456-426614174000',
-      },
+  it('rejects empty send text without skills', () => {
+    assert.throws(
+      () => normalizeSessionSendCommand({ type: 'send', text: '' }),
+      /Invalid send text/,
     );
     assert.throws(
-      () => normalizeSessionSendCommand({ type: 'send', text: '', voiceOperationId: 'not-a-uuid' }),
-      /voice operation id/,
+      () => normalizeSessionSendCommand({ type: 'send', text: '   ' }),
+      /Invalid send text/,
     );
   });
 
   it('accepts only the supported stop source', () => {
     assert.deepEqual(normalizeStopSessionInput(undefined), {});
-    assert.deepEqual(normalizeStopSessionInput({ source: 'stop_button', extra: true }), {
-      source: 'stop_button',
-    });
+    assert.deepEqual(
+      normalizeStopSessionInput({
+        source: 'stop_button',
+        expectedTurnId: 'turn-workhub',
+        expectedAdmissionId: 'side-admission',
+        extra: true,
+      }),
+      {
+        source: 'stop_button',
+        expectedTurnId: 'turn-workhub',
+        expectedAdmissionId: 'side-admission',
+      },
+    );
     assert.throws(() => normalizeStopSessionInput(null), /stop session input/);
     assert.throws(() => normalizeStopSessionInput({ source: 'toolbar' }), /stop session source/);
+    assert.throws(
+      () => normalizeStopSessionInput({ expectedTurnId: '' }),
+      /expectedTurnId/,
+    );
+    assert.throws(
+      () => normalizeStopSessionInput({ expectedAdmissionId: '' }),
+      /expectedAdmissionId/,
+    );
   });
 });

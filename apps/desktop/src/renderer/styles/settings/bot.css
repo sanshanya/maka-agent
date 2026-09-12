@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /* Astryx convergence: the pre-#1972 remote-access dialect is retired — page
    containers → SettingsPage, section headers → SettingsSection, the runtime
    tinted card + <dl> status grid → SettingsSection + MetadataList, the
@@ -18,8 +37,8 @@
   display: block;
 }
 .settingsBotLogo[data-large="true"] {
-  width: 44px;
-  height: 44px;
+  width: 36px;
+  height: 36px;
 }
 
 .settingsRemoteAccessChannelRow,
@@ -46,7 +65,7 @@
 }
 
 .settingsRemoteAccessChannelRow[data-attention="true"] {
-  background: oklch(from var(--warning) l c h / 0.06);
+  background: var(--color-warning-muted);
 }
 
 .settingsRemoteAccessItemActions {
@@ -104,14 +123,14 @@
 .settingsBotDetailHeader p {
   font: var(--maka-text-body);
   margin: 0;
-  color: var(--foreground-secondary);
+  color: var(--muted-foreground);
 }
 
 .settingsBotEnableHint {
   font: var(--maka-text-supporting);
   display: block;
   margin-top: var(--space-1);
-  color: var(--warning-text, var(--foreground-secondary));
+  color: var(--warning-text, var(--muted-foreground));
 }
 
 .settingsBotConfigDocLink {
@@ -124,6 +143,10 @@
   white-space: nowrap;
 }
 .settingsBotConfigDocLink:hover {
+  text-decoration: underline;
+}
+
+.settingsBotConfigDocLink:focus-visible {
   text-decoration: underline;
 }
 
@@ -180,13 +203,18 @@
 
 .settingsBotOnboardingQrFrame {
   display: grid;
-  width: 284px;
-  height: 284px;
+  /* Shared with the WeChat QR login frame (settings/wechat.css): both read
+     --qr-frame-size so the paired dialogs present one QR spec. */
+  width: var(--qr-frame-size);
+  height: var(--qr-frame-size);
   place-items: center;
   overflow: hidden;
   border: var(--border-width-hairline) solid var(--border);
   border-radius: var(--radius-surface);
-  background: white;
+  /* Paper, not a ladder tier: a QR code has to stay dark-on-light to be
+     scannable at all. See --surface-paper in maka-tokens.css. */
+  background: var(--surface-paper);
+  padding: var(--space-3);
 }
 
 .settingsBotOnboardingQrFrame img {
@@ -198,27 +226,28 @@
 
 .settingsBotOnboardingQrFrame[data-state="starting"],
 .settingsBotOnboardingQrFrame[data-state="connecting"] {
-  color: var(--foreground-secondary);
+  color: var(--muted-foreground);
   background: var(--foreground-3);
 }
 
 .settingsBotOnboardingSuccess,
 .settingsBotOnboardingEmpty {
   display: grid;
-  width: 52px;
-  height: 52px;
+  width: 48px;
+  height: 48px;
   place-items: center;
+  /* Pill, not --radius-plate: a status circle is a circle. */
   border-radius: var(--radius-pill);
 }
 
 .settingsBotOnboardingSuccess {
   color: var(--success-text);
-  background: oklch(from var(--success) l c h / 0.12);
+  background: var(--color-success-muted);
 }
 
 .settingsBotOnboardingEmpty {
   color: var(--destructive);
-  background: oklch(from var(--destructive) l c h / 0.10);
+  background: var(--color-error-muted);
 }
 
 .settingsBotOnboardingStatus,

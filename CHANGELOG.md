@@ -1,6 +1,292 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
 # Changelog
 
 ## Unreleased
+
+## 0.2.0 - Unreleased
+
+### Added
+
+- Added `/transcript` to browse long TUI sessions without depending on terminal
+  scrollback, with line, page, and first/last navigation.
+
+### Fixed
+
+- Fixed a renderer crash dialog reporting React error #185 ("Maximum update depth
+  exceeded") coming from the composer's prompt-history inline completion (#4117): the
+  offer engine the 0.1.11 composer fed could flip-flop its announcement state on
+  real-layout measurements until React hit its nested-update limit, which surfaced as
+  the crash dialog. The unstable completion wiring was removed from the composer
+  (#3292), Astryx 0.5.0 no longer ships the engine (#3755), and regression tests now
+  keep that seam closed.
+
+### Changed
+
+- Made typed `request()` the sole direct Runtime Host operation API; removed the 17 forwarding
+  aliases from direct and reconnecting connections while preserving status validation,
+  subscriptions, capabilities, listeners, lifecycle, and close behavior.
+- Collapsed the RuntimeRunner/Flow/Invocation shell into `RuntimeKernel`; backend dispatch,
+  terminal coalescing, stop/drain, and durable continuation admission now have one production
+  owner, immutable request snapshots remain enforced at AgentRun acceptance and backend dispatch,
+  and SessionEvent-to-RuntimeEvent conversion remains a pure mapper.
+- Retired the Task Ledger domain: SessionTodo is now the sole authority for in-session work items, and the operational-state schema drops the `workflow_task_ledger_events` table on first open. **Unfinished Tasks are not migrated and are permanently deleted.** This affects workspaces last opened by `v0.1.0` through `v0.1.11`, `cli-v0.1.0-beta.1`, `v0.2.0-incubating-rc1`, or a `v0.2.0-dev` build; those releases wrote Tasks to a table that no shipped build ever bridged into SessionTodo. Before opening such a workspace with this build, finish or export the Tasks you still need, or copy the workspace's `runtime.sqlite` aside — the migration removes the only live copy, so afterwards recovery requires a backup made in advance.
+- A compaction rejected as too large for the summarizer's own window now retreats to the span the last accepted request's input covered, instead of halving the covered range. That span is the newest reply this route produced, found through the run headers, so it was accepted by this model on this connection and is provably within capacity; halving can overshoot (discarding verbatim history for nothing) or undershoot (paying another round trip), and a span another route accepted proves nothing at all. One retreat, then the fold fails open and the provider decides.
+- `token_usage` anchors now record the model and connection that produced them. A token count is a number in one model's tokenizer against one connection; carrying the route on the record lets any reader apply the rule the runtime already enforces, instead of pairing one model's usage with another model's window. The record decodes against a closed allowlist, so sessions written with these keys do not open in earlier releases, and the Runtime Host compatibility epoch moves to 107.
+- The provider-dropping note now also fires across the send boundary. A provider that truncates to a fixed window reports the same input on every later request while the user keeps adding turns, which a send of one or two steps cannot see from the inside; the first request of a send compares against the persisted anchor instead. Across the boundary the test is equality rather than "did not grow": inside a send Maka knows it only appended, while across it a manual compaction, a smaller tool set or an edited history all shrink the input legitimately, and none of them lands on exactly the same count. The note carries the two counts it compared, and is reported once per backend rather than once per send, because the condition persists once it starts.
+- Let the provider decide whether a request fits. Proactive compaction now uses only a user-declared Maka window and the previous accepted request's provider-reported `inputTokens + outputTokens`; no declaration means no proactive capacity threshold. `/models` and generated model metadata are display hints, not limits. `token_usage` records persist the last-request anchor under `lastRequestAnchor`; its new `{ inputTokens, outputTokens }` shape still decodes the retired `payloadChars` key from older sessions. Requests that are too large are compacted and retried once after a real provider rejection, then reported as a `context_overflow` provider error. Compaction is entered at most once per send, and a request rejected after a fold was actually applied is reported as still too large after compaction. A fold that failed open makes no such claim: that request went out with its full raw history. A reply cut at `finishReason: length` no longer triggers a fold, because the provider running out of window room and the provider's own lower output cap are indistinguishable from outside. Five system notes explain the provider-side cases: dropping context, a window worth declaring, an exchange past the declared window, a request accepted past the window the model reports (once per crossing, while nothing is declared), and a request still too large after compaction. The reply reserve that arms the proactive threshold is twice the last real reply, bounded at 8,000 tokens, rather than the model's maximum output. **Sessions this build writes do not open in earlier releases:** those decode `token_usage` against a closed allowlist, so the reshaped `lastRequestAnchor` key fails the record and, with it, the Session that contains it; downgrading therefore needs a copy of the workspace's `runtime.sqlite` taken before the upgrade. Nothing produces the `context_budget_exhausted` stop reason any more — a request that really is too large is compacted and retried once, then reported as a `context_overflow` provider error — though sessions that already recorded it still decode and present. The Runtime Host compatibility epoch moves to 106.
+- Unified context management under one Runtime-owned policy. `MAKA_CONTEXT_*` environment overrides no longer tune or disable compaction and Tool Result pruning; model-visible archive placeholders are read on demand through bounded `ArchiveRead` calls instead of eager hydration. Previously supported overrides are ignored on upgrade: if Tool Result pruning was set to `off`, pruning is re-enabled, and there is currently no supported replacement opt-out.
+- Moved Read image snapshots into the durable context-offload store with Runtime-owned
+  lifecycle identity, exact branch and revision copying, recovery-safe cleanup, and bounded
+  physical garbage collection after Session retirement.
+
+## 0.1.11 - 2026-08-18
+
+### Highlights
+
+- Expanded Runtime Host from a local execution service into the shared authority for multiple connected Hosts, remote project registration, live run state, and archived session lifecycle (#3097, #3145, #3079, #3074, #3151).
+- Added the installable Maka CLI package and its protected staged npm release pipeline, including cross-platform artifact and Eval validation (#3169, #3173, #3185, #3188, #3192, #3197, #3200, #3201).
+- Added brokered Windows AppContainer sandbox support and tightened local IPC ownership and ACL enforcement (#2961, #3179, #3182).
+- Added Work Board storage foundations, Host-scoped task creation, prompt-history completion, and first-run viewport containment (#3028, #3122, #1874, #3195).
+- Added native Desktop and TUI locale authorities and Qwen3.8 Max Token Plan support (#2686, #2691, #3157).
+
+### Reliability and developer experience
+
+- Preserved live turns across refresh and projected authoritative live execution state through Runtime Host (#3189, #3079).
+- Kept restored tasks safe from concurrent removal, queued busy-raced sends as steering, bounded summarizer inputs, and retired obsolete compact and compatibility paths (#3056, #3032, #3113, #3128, #2742).
+- Hardened MCP rediscovery, provider failure diagnostics, rate-limit handling, session stream completion, and scheduled-task ownership (#2989, #2675, #3115, #2682, #2655).
+- Added fair multi-arm Eval infrastructure and the DeepSeek Harness benchmark arm, while isolating subject metering from framework accounting (#2668, #2971, #3176).
+- Strengthened Windows installer, crash-recovery, remote service restart, and release artifact coverage (#2650, #2562, #3186, #2941).
+
+### Fixed
+
+- Disabled TUI taskbar-progress keepalives by default on native Windows and
+  Windows Terminal sessions, where repeated OSC 9;4 updates can make Explorer's
+  taskbar unresponsive. `MAKA_TASKBAR_PROGRESS=1` restores the prior behavior,
+  while `MAKA_TASKBAR_PROGRESS=0` disables it explicitly.
+
+### Distribution
+
+- Ships for Apple Silicon macOS as a signed and notarized DMG and ZIP, and for Windows x64 as an unsigned NSIS installer and ZIP, built and verified in the same release run.
+- The bundled Computer Use skill ships with the app, but the Computer Use executor remains excluded from this release.
+
+## 0.1.10 - 2026-08-10
+
+### Highlights
+
+- Rebuilt the Runtime Host around durable ownership and recovery: clients now
+  reconnect across host restarts, incompatible host epochs retire cleanly, and
+  evicted session streams recover without losing the active conversation
+  (#2613, #2618, #2630, #2633).
+- Added remote capability provider mode and stopped agent graph supervisors
+  from generating unnecessary wake-ups (#2625, #2626).
+- Made the changes panel Git-authoritative, restored slash command discovery,
+  exposed archived conversations, and added an About-page update check
+  (#2610, #2612, #2573, #2629).
+- Added managed dependency artifact authority to storage and routed DeepSeek V4
+  Flash edits through ApplyPatch (#2485, #2606).
+
+### Reliability and developer experience
+
+- Recovered stuck xAI login attempts and stale connection deletion, kept
+  settings-controlled session chrome hidden, rendered subagents as compact
+  rows, and aligned the workbar picker with Astryx (#2615, #2617, #2619,
+  #2632).
+- Removed obsolete Runtime Host transition residue and preserved the storage
+  hydration crash fixture (#2635, #2576).
+- Reduced Windows CI work by scoping the baseline to affected surfaces and
+  gating expensive storage coverage, while retrying transient Electron
+  downloads (#2599, #2637, #2594).
+- Updated bundled Computer Use and WebContent dependency pins, including the
+  frame reflow fix (#2627, #2631, #2638).
+
+### Distribution
+
+- Ships for Apple Silicon macOS as a signed and notarized DMG and ZIP, and for
+  Windows x64 as an unsigned NSIS installer and ZIP, built and verified in the
+  same release run.
+- The bundled Computer Use skill ships with the app, but the Computer Use
+  executor remains excluded from this release.
+
+## 0.1.9 - 2026-08-09
+
+### Highlights
+
+- Completed the Runtime Host M5 production cutover (#2420), then established
+  the local standalone service (#2583), authenticated WebSocket access
+  (#2591), and Host-owned project catalog authority (#2603).
+- Added external session import end to end: the shared foundation (#2500), a
+  Codex session adapter (#2502), and the Desktop import flow (#2507).
+- Shipped Visual System 2.0 from its foundations through the full theme sweep
+  and detail polish (#2525, #2536, #2538), aligned high-traffic chrome with
+  Astryx primitives (#2580), and closed the remaining elevation, rhythm, and
+  primitive review debt (#2593).
+- Made task submission readiness a shared product contract (#2498), exposed it
+  in Desktop (#2519), added CLI preflight (#2524), and consumed the readiness
+  result at submission time (#2523).
+- Expanded implementation-agent capabilities with portable terminal input
+  (#2526), semantic terminal mouse input (#2533), interactive shell controls
+  (#2561), and OpenAI native ApplyPatch (#2532).
+- Replaced the CodeMode `Self` evaluator with QuickJS (#2549).
+
+### Reliability and developer experience
+
+- Runtime recovery now handles idle and incomplete provider streams (#2535,
+  #2604), preserves compaction projection after overflow (#2602), retains
+  imported session context (#2579), and keeps full access available in Plan
+  mode (#2581).
+- Stabilized Runtime Host session lifecycle races (#2548), added client request
+  backpressure (#2539), made task refusals actionable (#2527), recovered CLI
+  sessions after workspace moves (#2531), and kept renamed Claude model ids
+  stable across catalog refreshes (#2482).
+- Matured the generated-files workbar (#2506), kept generated files under user
+  control (#2585), restored composer drafts across remounts (#2584), exposed
+  diagnostics from error toasts (#2540), and added per-connection model request
+  customization (#2565).
+- Cut CI wall-clock time with impact gates and a single end-to-end job (#2589),
+  reduced Storybook to render smoke (#2582), and expanded Windows process,
+  named-pipe, artifact, workspace, and crash-recovery coverage.
+
+### Distribution
+
+- Ships for Apple Silicon macOS as a signed and notarized DMG and ZIP, and for
+  Windows x64 as an unsigned NSIS installer and ZIP, built and verified in the
+  same release run.
+- The bundled Computer Use skill ships with the app, but the Computer Use
+  executor remains excluded from this release.
+
+## 0.1.8 - 2026-08-08
+
+### Highlights
+
+- Added Codex-style side conversations: branch a side thread from the one you
+  are in and come back with the answer (#2428).
+- Gave projects a first-class Settings page: manage every project Maka knows,
+  pick the default one new conversations open in (explicit default beats
+  last-used; the composer can still switch per conversation) (#2446), rename
+  and reveal a project from its row menu (#2447), and carried the list on the
+  entity-list components with folder anchors and tail-preserving path
+  truncation (#2451).
+- Closed three self-serve gaps reported by users: the Models page can set the
+  default connection where the 默认 badge lives (#2421), new conversations
+  take a configurable default thinking level and the composer menu says
+  模型默认 instead of a deceptive 默认 (#2430), and the 外观 page structure,
+  grouping, and copy were brought under the settings idiom (#2343).
+- Introduced custom pets end to end: a pack contract with atomic storage
+  (#2422), safe pack import (#2423), a pack library (#2427), persisted
+  selection (#2437), management in Settings (#2440), rendering (#2442), and
+  runtime-state-driven animation (#2444).
+- Enabled Mimo and DeepSeek free models by default for OpenCode Free (#2431)
+  and seeded its default inventory on create (#2443).
+- Removed the product Voice module end to end (#2426).
+- Closed the Runtime Host M4 readiness gaps (#2419).
+
+### Reliability and developer experience
+
+- Windows: serialized root marker repair (#2438), stabilized portable path
+  tests (#2395), enabled long paths for bare Git fixtures (#2435), normalized
+  CI process identities (#2334), and refreshed the test skip inventory
+  (#2434).
+- Storage: removed worktrees outside their cwd (#2424).
+- Renamed the desktop UI components to kebab-case (#2417), finished two CI
+  cleanups and reformatted what landed unformatted (#2432), and trimmed
+  low-value guard and CSS-contract suites while fixing sqlite warning noise
+  (#2425).
+
+### Distribution
+
+- Ships for Apple Silicon macOS as a signed and notarized DMG and ZIP, and for
+  Windows x64 as an unsigned NSIS installer and ZIP, built and verified in the
+  same release run.
+- The bundled Computer Use skill ships with the app, but the Computer Use
+  executor remains excluded from this release.
+
+## 0.1.7 - 2026-08-07
+
+### Highlights
+
+- Rebuilt the composer attachment experience: staged attachments are Token
+  chips with tooltip metadata and a lightbox (#2393), with preview thumbnails
+  and file cards (#2367).
+- Unified the app's status language: what a status means is now named in one
+  place (#2397), the Settings surfaces state semantics instead of colours
+  (#2401), and the migration finished by deleting its own bridge (#2403) —
+  every status dot draws from a single definition, and five formerly
+  "active-blue" informational dots settled into their true quiet states.
+- Added bounded long-term memory extraction (#2117) and a runtime `WebFetch`
+  tool (#2362).
+- Moved the CLI onto Runtime Host: `maka run` (#2337) and TUI sessions
+  (#2308), and scanned finished runs' trajectories for retrieval (#2319).
+- Kept a running status line up for the whole live turn (#2356), opened linked
+  subagents from stream tools instead of the sidebar (#2383), restored the
+  transcript's markdown rhythm (#2348), handed the chat meta row back to
+  Astryx primitives (#2358), and exposed recovery for empty failed turns
+  (#2381).
+- Rebuilt the extension module pages on the shared ModulePage shell (#2266),
+  led the session trace with an Astryx-native overview (#2289), and unified
+  the workspace picker onto the composer's ghost-menu family (#2287).
+- The window titlebar states the session's project and name (#2327), and the
+  Pinned and Recent group headers carry a new-task trigger (#2364).
+- Upgraded Astryx 0.2.0 → 0.3.0 (#2288), unified lucide-react onto one major
+  (#2275), added a dependency audit lane (#2223), and published the bundled
+  Git runtime's source materials (#2235).
+
+### Reliability and developer experience
+
+- Provider transport: hardened incremental OpenAI Responses (#2247), stopped
+  reporting a truncated provider stream as a finished turn (#2297), sent the
+  Responses wire the options it reads and read the reasoning it returns
+  (#2328), settled stop cleanly when it aborts a pending question (#2257), and
+  bounded oversized prior turns (#2378).
+- Sessions and storage: made session copy retries idempotent (#2398),
+  preserved operational state across schema upgrades (#2361), imported legacy
+  JSONL session transcripts into SQLite (#2263), closed usage stores after
+  lease revocation (#2365), made active session joins replay-safe (#2368), and
+  validated swarm resume by agent id (#2375).
+- Chat and UI details: kept quote layer geometry stable during entry (#2377)
+  and shown only for settled selections (#2350), made the tool diff readable
+  with its counts on a collapsed group (#2300), kept the prompt rail clickable
+  on macOS (#2338), used standard tab order in the provider catalog (#2306),
+  and served Claude OAuth models from the curated catalog with real error
+  causes (#2336).
+- Desktop platform: isolated the dev build's userData root from release
+  (#2292), closed xAI OAuth callback connections and retried a busy port
+  (#2302), enforced a metadata-free renderer startup boundary (#2176), and
+  dropped the consumer-less update-download bridge (#2326) while giving the
+  update action a slot instead of a row (#2320).
+- Runtime and headless: compacted and sanitized agent tool contracts (#2349),
+  classified an expired probe budget as timeout (#2344), decided the tool call
+  event's ledger lane at push time (#2240), separated request latency from
+  liveness (#2392), measured the wire the Maka runtime actually dials (#2286),
+  and mounted build outputs into the task container rather than the repo root
+  (#2298).
+- Trimmed low-value and redundant tests across suites (#2404, #2406), and made
+  ordering assertions independent of fixed wall-clock budgets (#2304).
+
+### Distribution
+
+- Ships for Apple Silicon macOS as a signed and notarized DMG and ZIP, and for
+  Windows x64 as an unsigned NSIS installer and ZIP, built and verified in the
+  same release run.
+- The bundled Computer Use skill ships with the app, but the Computer Use
+  executor remains excluded from this release.
 
 ## 0.1.6 - 2026-08-06
 
@@ -152,8 +438,8 @@
   Astryx Link for the last bare anchors (#2138), a localized required/optional
   field marker (#2184), global shortcuts through Astryx `useHotkeys` (#2091),
   and Astryx `clickAction` owning the in-flight button state (#2089).
-- Fixed the 计划提醒 inspector to sit two tab stops from any row (#2185) and
-  seeded plan reminders with distinct `createdAt` (#2186).
+- Fixed the 定时任务 inspector to sit two tab stops from any row (#2185) and
+  seeded scheduled tasks with distinct `createdAt` (#2186).
 - Added an a11y audit that flags `aria-label` on elements whose role cannot hold
   a name (#2108), and established the Windows support baseline (#2156).
 - Replaced fixed waits with explicit barriers in runtime tests (#2162), owned
@@ -219,7 +505,7 @@
 - Derived thinking-strength controls from models.dev reasoning options, and
   unified cron expression authority.
 - Continued the Astryx redesign across Settings, the subagent page, the
-  extensions page, plan reminders, skill chips and empty states, and the
+  extensions page, scheduled tasks, skill chips and empty states, and the
   composer model and voice controls.
 - Put every headless benchmark arm under the same tool surface and model
   budget, registered `ArchiveRead` for Harbor-archived tool results, and

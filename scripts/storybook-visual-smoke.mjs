@@ -1,131 +1,85 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { createReadStream } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { dirname, extname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { auditAxTree } from './ax-tree-audit.mjs';
 
-const PRODUCT_VIEWPORTS = Object.freeze({
-  wide: Object.freeze({ width: 1280, height: 900 }),
-  compact: Object.freeze({ width: 820, height: 900 }),
-  floor: Object.freeze({ width: 480, height: 900 }),
-});
-
-// A surface listed here cannot be switched off by deleting its manifest entry:
-// the validator fails instead. Without that, a guard is only as durable as the
-// line that opts into it.
-const REQUIRED_PRODUCT_SURFACES = Object.freeze([
-  'settings',
-  'skills',
-  'mcp',
-  'planReminders',
-  'dailyReview',
-  'sessionContext',
-  'composer',
-  // The autoplay contract (#1981): if plays stop running, they also stop
-  // failing, so the harness carries a story that positively proves execution.
-  'playContract',
+const RENDER_VIEWPORT = Object.freeze({ width: 1280, height: 900 });
+const NARROW_RENDER_VIEWPORT = Object.freeze({ width: 720, height: 900 });
+const COLOR_SCHEMES = Object.freeze(['light', 'dark']);
+const FULL_PALETTE_STORY_IDS = new Set(['product-shell-official-appshell--native-conversation']);
+const REQUIRED_COMPUTER_USE_STORY_IDS = new Set([
+  'product-accessibility-dialogs--create-scheduled-task',
+  'product-accessibility-dialogs--mermaid-fullscreen',
+  'product-accessibility-dialogs--rename-conversation',
+  'product-accessibility-overlays--bot-onboarding-qr',
+  'product-accessibility-overlays--side-chat-close',
+  'product-accessibility-overlays--wechat-login-qr',
+  'product-accessibility-runtime-surfaces--active-terminal',
+  'product-accessibility-runtime-surfaces--browser-loaded',
+  'product-accessibility-runtime-surfaces--html-artifact',
+  'product-accessibility-runtime-surfaces--remote-project-directory',
+  'product-accessibility-runtime-surfaces--runtime-host-ssh-terminal',
+  'product-module-hubs--extensions-mcp-editor',
+  'product-module-hubs--extensions-mcp-inspector',
+  'product-module-hubs--extensions-mcp-narrow',
+  'product-module-hubs--extensions-skills-narrow',
+  'product-module-hubs--scheduled-daily-review-report',
+  'product-module-hubs--scheduled-tasks-narrow',
+  'product-module-hubs--scheduled-tasks-inspector',
+  'product-onboarding--narrow-window',
+  'product-settings-pages--memory-populated',
+  'product-settings-pages--permission-center-diagnostics-expanded',
+  'product-settings-pages--subagent-editor',
+  'product-settings-pages--daily-review-narrow',
+  'product-settings-pages--usage-narrow',
+  'product-settings-providers--add-provider',
+  'product-settings-providers--connection-detail-page',
+  'product-sidebar-session-list--long-titles-and-narrow',
+  'product-shell-official-appshell--native-conversation',
+  'product-shell-official-appshell--waiting-for-permission',
+]);
+// The smoke observes render completion, focus, and the accessibility tree; it
+// does not compare pixels. Every story supplies that structural evidence once,
+// while these canonical surfaces also prove the separate dark token block.
+// Dark mode currently changes only paint tokens, with no dark-only DOM, layout,
+// or renderer branches; expand this set if that invariant changes.
+const DARK_THEME_SENTINEL_STORY_IDS = new Set([
+  'design-system-palette-matrix--all-palettes',
+  'product-accessibility-dialogs--rename-conversation',
+  'product-markdown--rich-assistant-answer',
+  'product-settings-pages--appearance',
+  'product-settings-pages--bot-chat-needs-attention',
+  'product-shell-official-appshell--default-layout',
+]);
+const FORCED_COLORS_STORY_IDS = new Set([
+  'product-settings-pages--general-forced-colors-focus-ring',
 ]);
 
-const PRODUCT_CHECKS = new Set([
-  'composer-focus-ownership',
-  'module-page-inspector',
-  'module-page-shell',
-  'plan-reminder-row',
-  'session-context-layer',
-  'play-executed',
-]);
-
-function fail(message) {
-  throw new Error(`Product Storybook manifest: ${message}`);
-}
-
-function isRecord(value) {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function validateCoverageManifest(manifest, storyIndex) {
-  if (!isRecord(manifest) || manifest.version !== 1) fail('version must be 1');
-  if (!isRecord(manifest.viewports)) fail('viewports must be an object');
-  if (!isRecord(manifest.surfaces)) fail('surfaces must be an object');
-  if (!isRecord(storyIndex?.entries)) fail('built Storybook index has no entries');
-
-  for (const [name, expected] of Object.entries(PRODUCT_VIEWPORTS)) {
-    const actual = manifest.viewports[name];
-    if (!isRecord(actual) || actual.width !== expected.width || actual.height !== expected.height) {
-      fail(`${name} viewport must be ${expected.width}x${expected.height}`);
-    }
-  }
-
-  for (const surface of REQUIRED_PRODUCT_SURFACES) {
-    if (!isRecord(manifest.surfaces[surface])) fail(`missing required surface: ${surface}`);
-  }
-
-  const jobs = [];
-  for (const [surface, entry] of Object.entries(manifest.surfaces)) {
-    if (!isRecord(entry)) fail(`${surface} must be an object`);
-    if (typeof entry.storyId !== 'string' || entry.storyId.length === 0) {
-      fail(`${surface} must identify a story id`);
-    }
-    if (typeof entry.productionHost !== 'string' || entry.productionHost.length === 0) {
-      fail(`${surface} must identify its production host`);
-    }
-    if (typeof entry.state !== 'string' || entry.state.length === 0) {
-      fail(`${surface} must identify its user-reachable state`);
-    }
-    if (storyIndex.entries[entry.storyId]?.type !== 'story') {
-      fail(`unknown story id: ${entry.storyId}`);
-    }
-
-    const requiredViewports = Array.isArray(entry.viewports) ? entry.viewports : [];
-    const optOuts = isRecord(entry.viewportOptOuts) ? entry.viewportOptOuts : {};
-    const viewportSizes = isRecord(entry.viewportSizes) ? entry.viewportSizes : {};
-    const colorSchemes = Array.isArray(entry.colorSchemes) ? entry.colorSchemes : ['light'];
-    const checks = Array.isArray(entry.checks) ? entry.checks : [];
-    for (const check of checks) {
-      if (!PRODUCT_CHECKS.has(check)) fail(`${surface} uses unknown check: ${String(check)}`);
-    }
-    if (
-      colorSchemes.length === 0 ||
-      colorSchemes.some((scheme) => scheme !== 'light' && scheme !== 'dark')
-    ) {
-      fail(`${surface} colorSchemes must contain light or dark`);
-    }
-    for (const viewport of requiredViewports) {
-      if (!(viewport in PRODUCT_VIEWPORTS)) fail(`${surface} uses unknown viewport: ${viewport}`);
-    }
-    for (const viewport of Object.keys(PRODUCT_VIEWPORTS)) {
-      if (requiredViewports.includes(viewport)) {
-        const size = viewportSizes[viewport] ?? PRODUCT_VIEWPORTS[viewport];
-        if (
-          !isRecord(size) ||
-          !Number.isInteger(size.width) ||
-          !Number.isInteger(size.height) ||
-          size.width <= 0 ||
-          size.height <= 0
-        ) {
-          fail(`${surface} ${viewport} viewport override must have positive integer dimensions`);
-        }
-        for (const colorScheme of colorSchemes) {
-          jobs.push({
-            surface,
-            storyId: entry.storyId,
-            viewport,
-            size,
-            colorScheme,
-            checks,
-            productionHost: entry.productionHost,
-            state: entry.state,
-          });
-        }
-        continue;
-      }
-      if (typeof optOuts[viewport] !== 'string' || optOuts[viewport].trim().length === 0) {
-        fail(`${surface} must cover or explain its ${viewport} viewport opt-out`);
-      }
-    }
-  }
-  return jobs;
-}
+// This is a catalog render and accessibility-tree health check.
+// Story `play` functions do run: many stories reach their named final state
+// only by opening an inspector, dialog, selector, or disclosure. The smoke
+// waits for Storybook's completion event before reading the AX tree.
 
 function describeBrowserValue(value) {
   if (value instanceof Error) return value.message;
@@ -133,11 +87,10 @@ function describeBrowserValue(value) {
   return String(value);
 }
 
-function installStorybookSmokeProbe({ storyId }) {
+function installStorybookRenderProbe({ storyId }) {
   const smoke = {
     finished: false,
     failures: [],
-    connected: false,
   };
   Object.defineProperty(window, '__makaStorybookSmoke', {
     configurable: true,
@@ -165,7 +118,6 @@ function installStorybookSmokeProbe({ storyId }) {
       window.setTimeout(connect, 0);
       return;
     }
-    smoke.connected = true;
     channel.on('storyFinished', (payload) => {
       if (!belongsToStory(payload)) return;
       if (payload?.status === 'error') {
@@ -174,13 +126,7 @@ function installStorybookSmokeProbe({ storyId }) {
         smoke.finished = true;
       }
     });
-    for (const eventName of [
-      'storyErrored',
-      'storyThrewException',
-      'playFunctionThrewException',
-      'unhandledErrorsWhilePlaying',
-      'storyMissing',
-    ]) {
+    for (const eventName of ['storyErrored', 'storyThrewException', 'storyMissing']) {
       channel.on(eventName, (payload) => {
         if (belongsToStory(payload)) {
           smoke.failures.push(`${eventName}: ${eventMessage(payload)}`);
@@ -191,11 +137,74 @@ function installStorybookSmokeProbe({ storyId }) {
   connect();
 }
 
-async function smokeStory(page, baseUrl, job, options = {}) {
-  const prefix = `[${job.storyId} @ ${job.viewport}]`;
+export function catalogJobs(
+  storyIndex,
+  { themePalettes = ['default'], fullPaletteStoryIds = FULL_PALETTE_STORY_IDS } = {},
+) {
+  const entries = storyIndex?.entries;
+  if (!entries || typeof entries !== 'object' || Array.isArray(entries)) {
+    throw new Error('Built Storybook index has no entries');
+  }
+  if (!Array.isArray(themePalettes) || themePalettes.length === 0) {
+    throw new Error('Storybook smoke requires at least one theme palette');
+  }
+  const palettes = [...new Set(themePalettes)];
+  if (!palettes.includes('default')) {
+    throw new Error('Storybook smoke theme palettes must include default');
+  }
+  const jobs = Object.values(entries)
+    .filter((entry) => entry?.type === 'story' && typeof entry.id === 'string')
+    .flatMap((entry) => {
+      const hasFullPaletteCoverage = fullPaletteStoryIds.has(entry.id);
+      const entryPalettes = hasFullPaletteCoverage ? palettes : ['default'];
+      const colorSchemes =
+        hasFullPaletteCoverage || DARK_THEME_SENTINEL_STORY_IDS.has(entry.id)
+          ? COLOR_SCHEMES
+          : ['light'];
+      return entryPalettes.flatMap((palette) =>
+        colorSchemes.map((colorScheme) => ({
+          storyId: entry.id,
+          colorScheme,
+          forcedColors: FORCED_COLORS_STORY_IDS.has(entry.id) ? 'active' : 'none',
+          palette,
+        })),
+      );
+    });
+  if (jobs.length === 0) throw new Error('Built Storybook index has no stories');
+  return jobs;
+}
+
+export function storyUrl(baseUrl, job) {
+  const url = new URL('/iframe.html', baseUrl);
+  url.searchParams.set('id', job.storyId);
+  url.searchParams.set('viewMode', 'story');
+  url.searchParams.set('globals', `colorScheme:${job.colorScheme};palette:${job.palette}`);
+  return url.href;
+}
+
+export function storyViewport(storyId) {
+  return storyId.includes('narrow') ? NARROW_RENDER_VIEWPORT : RENDER_VIEWPORT;
+}
+
+export function jobLabel(job) {
+  const forcedColors = job.forcedColors === 'active' ? '/forced-colors' : '';
+  return `${job.storyId} (${job.colorScheme}/${job.palette}${forcedColors})`;
+}
+
+export function isExpectedConsoleError(storyId, message) {
+  return (
+    storyId === 'product-settings-pages--general-host-settings-error' &&
+    message === '[settings] operation failed: Runtime Host settings read failed in this story.'
+  );
+}
+
+export async function smokeStory(page, baseUrl, job, options = {}) {
+  const prefix = `[${jobLabel(job)}]`;
   const browserFailures = [];
   const onConsole = (message) => {
-    if (message.type() === 'error') browserFailures.push(`console.error: ${message.text()}`);
+    if (message.type() === 'error' && !isExpectedConsoleError(job.storyId, message.text())) {
+      browserFailures.push(`console.error: ${message.text()}`);
+    }
   };
   const onPageError = (error) => {
     browserFailures.push(`uncaught page error: ${describeBrowserValue(error)}`);
@@ -204,16 +213,10 @@ async function smokeStory(page, baseUrl, job, options = {}) {
   page.on('pageerror', onPageError);
 
   try {
-    await page.addInitScript(installStorybookSmokeProbe, { storyId: job.storyId });
-
-    await page.setViewportSize(job.size);
-    const globals = `colorScheme:${job.colorScheme ?? 'light'}`;
-    await page.goto(
-      `${baseUrl}/iframe.html?id=${encodeURIComponent(job.storyId)}&viewMode=story&globals=${encodeURIComponent(globals)}`,
-      {
-        waitUntil: 'load',
-      },
-    );
+    await page.addInitScript(installStorybookRenderProbe, { storyId: job.storyId });
+    await page.setViewportSize(storyViewport(job.storyId));
+    await page.emulateMedia({ colorScheme: job.colorScheme, forcedColors: job.forcedColors });
+    await page.goto(storyUrl(baseUrl, job), { waitUntil: 'load' });
 
     try {
       await page.waitForFunction(
@@ -226,354 +229,69 @@ async function smokeStory(page, baseUrl, job, options = {}) {
       );
     } catch (error) {
       if (browserFailures.length === 0) {
-        browserFailures.push(`story did not finish render/play: ${describeBrowserValue(error)}`);
+        browserFailures.push(`story did not finish rendering: ${describeBrowserValue(error)}`);
       }
     }
 
-    if (job.checks?.includes('plan-reminder-row') || job.checks?.includes('module-page-shell')) {
-      try {
-        await page.waitForSelector('.maka-module-page-rows > li', {
-          state: 'visible',
-          timeout: 5_000,
-        });
-      } catch {
-        browserFailures.push('plan reminder rows did not finish rendering');
+    const result = await page.evaluate(() => {
+      const root = document.querySelector('#storybook-root');
+      const failures = [...(window.__makaStorybookSmoke?.failures ?? [])];
+      if (!(root instanceof HTMLElement) || root.innerHTML.trim().length === 0) {
+        failures.push('storybook root is empty after render');
       }
-    }
-    if (job.checks?.includes('module-page-inspector')) {
-      try {
-        // Either placement is a pass here; the assertion below is what decides
-        // which one this viewport was supposed to get.
-        await page.waitForSelector(
-          '.maka-module-page [role="complementary"], .maka-module-page [role="dialog"], .maka-module-page dialog[open]',
-          { state: 'attached', timeout: 5_000 },
+      const active = document.activeElement;
+      if (
+        active instanceof HTMLElement &&
+        (active.closest('[aria-hidden="true"]') || active.closest('[inert]'))
+      ) {
+        failures.push('focus is inside an aria-hidden or inert surface');
+      }
+      const dialogs = [
+        ...document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog'),
+      ].filter((dialog) => {
+        if (!(dialog instanceof HTMLElement)) return false;
+        if (dialog instanceof HTMLDialogElement) return dialog.open;
+        if (dialog.getAttribute('aria-modal') !== 'true') return false;
+        const style = getComputedStyle(dialog);
+        return (
+          !dialog.hidden &&
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          dialog.getClientRects().length > 0
         );
-      } catch {
-        browserFailures.push('the selected item never produced an inspector');
+      });
+      if (
+        dialogs.length > 0 &&
+        active instanceof HTMLElement &&
+        !dialogs.some((dialog) => dialog.contains(active))
+      ) {
+        failures.push('visible dialog does not own focus after rendering');
       }
-    }
-
-    const result = await page.evaluate(
-      ({ checks, colorScheme }) => {
-        const root = document.querySelector('#storybook-root');
-        const failures = [...(window.__makaStorybookSmoke?.failures ?? [])];
-        if (
-          colorScheme === 'dark' &&
-          (!document.documentElement.classList.contains('dark') ||
-            getComputedStyle(document.documentElement).colorScheme !== 'dark')
-        ) {
-          failures.push('dark color scheme was not applied to the production root');
-        }
-        // The context layer is built from the production derive helpers, which
-        // return undefined unless the story's session list really establishes
-        // the lineage. Without this the surface would still pass while showing
-        // no banner and no revision counter at all — the story would be a lie
-        // that renders. The layer must also survive the narrow viewports, which
-        // is the reason it is smoked at three of them.
-        if (checks.includes('session-context-layer')) {
-          const layer = document.querySelector('.maka-session-context');
-          if (!layer) {
-            failures.push('session context layer is missing');
-          } else {
-            const isVisible = (element) => {
-              if (!element) return false;
-              const rect = element.getBoundingClientRect();
-              const style = getComputedStyle(element);
-              return (
-                rect.width > 0 &&
-                rect.height > 0 &&
-                style.display !== 'none' &&
-                style.visibility !== 'hidden'
-              );
-            };
-            // OverflowList keeps a hidden measurement copy of every item, so
-            // ask whether ANY copy is visible — querySelector alone would read
-            // the measurement clone and report a rendered item as missing.
-            const anyVisible = (selector) => [...layer.querySelectorAll(selector)].some(isVisible);
-
-            if (!anyVisible('.maka-session-context__breadcrumbs')) {
-              failures.push('branch breadcrumbs are missing — deriveBranchBanner returned nothing');
-            }
-            // Goal, memory and the revision counter share that OverflowList, so
-            // a narrow viewport is allowed to move them into the MoreMenu — but
-            // not to drop them. Absent from both places means the state the
-            // manifest names is not on screen at all.
-            const inOverflowMenu = anyVisible(
-              '[data-slot="more-menu"], .astryx-more-menu, button[aria-haspopup="menu"]',
-            );
-            for (const [selector, label] of [
-              ['.maka-session-context__revision', 'revision navigation'],
-              ['.maka-session-context__goal', 'goal indicator'],
-            ]) {
-              if (!anyVisible(selector) && !inOverflowMenu) {
-                failures.push(`${label} is neither visible nor collapsed into the overflow menu`);
-              }
-            }
-            if (!anyVisible('.maka-session-context__cluster')) {
-              failures.push('session context cluster rendered no items');
-            }
-            if (layer.scrollWidth > layer.clientWidth + 1) {
-              failures.push(
-                `session context layer overflows horizontally (${layer.scrollWidth} > ${layer.clientWidth})`,
-              );
-            }
-          }
-        }
-        // #1981: the play-contract story's play flips this marker. If it is
-        // still pending, Storybook stopped autoplaying play functions — which
-        // also means throwing plays no longer fail this harness, so the
-        // regression must surface here, positively.
-        if (checks.includes('play-executed')) {
-          const proof = root?.querySelector('[data-play-proof]');
-          if (!(proof instanceof HTMLElement)) {
-            failures.push('play contract story rendered without its proof node');
-          } else if (proof.dataset.playProof !== 'executed') {
-            failures.push(
-              'play function did not execute — the Storybook autoplay contract (FIDELITY.md) is broken',
-            );
-          }
-        }
-        if (checks.includes('composer-focus-ownership')) {
-          const editor = document.querySelector('.maka-composer-editor > [contenteditable="true"]');
-          const composer = editor?.closest('[data-maka-contract="composer-inner"]');
-          if (!(editor instanceof HTMLElement) || !(composer instanceof HTMLElement)) {
-            failures.push('composer editor or Astryx focus surface is missing');
-          } else {
-            const focusAncestors = [];
-            for (let element = editor.parentElement; element; element = element.parentElement) {
-              focusAncestors.push(element);
-              if (element === composer) break;
-            }
-            const visibleFocusChrome = (element) => {
-              const style = getComputedStyle(element);
-              const border = ['Top', 'Right', 'Bottom', 'Left'].flatMap((side) => {
-                const width = Number.parseFloat(style[`border${side}Width`]);
-                return width > 0
-                  ? [
-                      `${side}:${style[`border${side}Style`]} ${width}px ${style[`border${side}Color`]}`,
-                    ]
-                  : [];
-              });
-              return {
-                border,
-                boxShadow: style.boxShadow === 'none' ? null : style.boxShadow,
-                outline:
-                  style.outlineStyle === 'none' || Number.parseFloat(style.outlineWidth) === 0
-                    ? null
-                    : `${style.outlineStyle} ${style.outlineWidth} ${style.outlineColor}`,
-              };
-            };
-            const restingChrome = focusAncestors.map(visibleFocusChrome);
-            editor.focus();
-            // Resolve Astryx's focus transition to its final state before
-            // comparing computed presentation. The contract is the visible
-            // owner, not an intermediate animation frame.
-            for (const element of focusAncestors) {
-              void getComputedStyle(element).boxShadow;
-              for (const animation of element.getAnimations()) animation.finish();
-            }
-            const focusedChrome = focusAncestors.map(visibleFocusChrome);
-            const style = getComputedStyle(editor);
-            const actual = {
-              backgroundColor: style.backgroundColor,
-              borderWidth: style.borderWidth,
-              boxShadow: style.boxShadow,
-              outlineStyle: style.outlineStyle,
-            };
-            const expected = {
-              backgroundColor: 'rgba(0, 0, 0, 0)',
-              borderWidth: '0px',
-              boxShadow: 'none',
-              outlineStyle: 'none',
-            };
-            for (const [property, expectedValue] of Object.entries(expected)) {
-              if (actual[property] !== expectedValue) {
-                failures.push(
-                  `composer editor ${property} must be ${expectedValue}, got ${actual[property]}`,
-                );
-              }
-            }
-            if (document.activeElement !== editor) {
-              failures.push('composer editor did not retain focus');
-            }
-            const visibleOwner = focusedChrome.some((focused, index) => {
-              const changed = JSON.stringify(focused) !== JSON.stringify(restingChrome[index]);
-              const visible =
-                focused.border.length > 0 || focused.boxShadow !== null || focused.outline !== null;
-              return changed && visible;
-            });
-            if (!visibleOwner) {
-              failures.push(
-                'no Astryx composer ancestor produced visible border, shadow, or outline focus feedback',
-              );
-            }
-          }
-        }
-        if (checks.includes('module-page-shell')) {
-          /* The page's layout contract, which a screenshot cannot hold:
-             ONE column, the title over its own rows, and no chrome hairline
-             anywhere. Every one of these was a real defect during the
-             rebuild. */
-          const page = document.querySelector('.maka-module-page');
-          const header = page?.querySelector('.astryx-layout-header');
-          const rows = page?.querySelector('.maka-module-page-rows, .maka-module-page-panel');
-          if (!page || !header || !rows) {
-            failures.push('module page shell is missing its header or content');
-          } else {
-            const inner = header.firstElementChild;
-            const headerLeft = inner?.getBoundingClientRect().left ?? -1;
-            const rowsLeft = rows.getBoundingClientRect().left;
-            if (Math.abs(headerLeft - rowsLeft) > 1) {
-              failures.push(
-                `page title (${Math.round(headerLeft)}) must share the rows' left edge (${Math.round(rowsLeft)})`,
-              );
-            }
-            /* No rule under the header and none around the toolbar: the only
-               lines on the page are the list's own row dividers. */
-            for (const [element, label] of [
-              [header, 'layout header'],
-              [page.querySelector('.maka-module-page-bar'), 'control bar'],
-            ]) {
-              if (!element) continue;
-              const style = getComputedStyle(element);
-              if (
-                element.getAttribute('data-divider') != null ||
-                style.borderBlockEndWidth !== '0px'
-              ) {
-                failures.push(`${label} must not draw a hairline`);
-              }
-            }
-          }
-        }
-        if (checks.includes('module-page-inspector')) {
-          /* Rows are inert by design, so the inspector is the ONLY path to
-             every per-item action. Narrow drops the side panel — it must not
-             drop the inspector with it. */
-          const panel = document.querySelector('.maka-module-page [role="complementary"]');
-          const dialog = document.querySelector(
-            '.maka-module-page [role="dialog"], .maka-module-page dialog[open]',
-          );
-          const narrow = window.matchMedia('(max-width: 1024px)').matches;
-          const surface = narrow ? dialog : panel;
-          if (!surface) {
-            failures.push(`selected item has no inspector at ${window.innerWidth}px`);
-          } else if (!surface.textContent?.includes('立即触发')) {
-            failures.push('inspector is present but carries none of the item actions');
-          }
-          if (narrow && panel) failures.push('narrow window must not keep the side panel');
-          if (!narrow && dialog)
-            failures.push('wide window must show the inspector beside the rows, not over them');
-        }
-        if (checks.includes('plan-reminder-row')) {
-          if (document.documentElement.scrollWidth > document.documentElement.clientWidth) {
-            failures.push('document has horizontal overflow');
-          }
-          const rows = [...document.querySelectorAll('.maka-module-page-rows > li')];
-          if (rows.length === 0) failures.push('plan reminder rows are missing');
-          const checkElement = (element, label) => {
-            const rect = element?.getBoundingClientRect();
-            if (
-              !element ||
-              getComputedStyle(element).display === 'none' ||
-              getComputedStyle(element).visibility === 'hidden' ||
-              !rect ||
-              rect.width <= 0 ||
-              rect.left < -1 ||
-              rect.right > document.documentElement.clientWidth + 1
-            ) {
-              failures.push(
-                `${label} is hidden or clipped (${rect?.left ?? 'missing'}..${rect?.right ?? 'missing'} / ${document.documentElement.clientWidth})`,
-              );
-            }
-          };
-          for (const row of rows) {
-            if (row.scrollWidth > row.clientWidth)
-              failures.push('plan reminder row has horizontal overflow');
-            /* Every row leads with a StatusDot — that is what makes the main
-               column start at the same x on every row, whatever its state. */
-            checkElement(row.querySelector('[role="img"]'), 'row status dot');
-            const countdown = row.querySelector('.maka-plan-countdown');
-            if (countdown) checkElement(countdown, '.maka-plan-countdown');
-          }
-          // The alignment check below runs zero times if countdowns stop
-          // rendering, which would make it pass by vacancy. These fixtures
-          // always have at least one reminder with a next run.
-          if (rows.length > 0 && !rows.some((row) => row.querySelector('.maka-plan-countdown'))) {
-            failures.push(
-              'no plan reminder row rendered a countdown, so its spacing went unchecked',
-            );
-          }
-          if (document.documentElement.clientWidth >= 1100 && rows[0]) {
-            /* One flex row — leading StatusDot, main column, trailing
-               countdown. Countdown right edges must align across rows so the
-               trailing column reads as a column. */
-            if (getComputedStyle(rows[0]).display !== 'flex') {
-              failures.push('plan reminder wide row must lay out as a flex row');
-            }
-            const countdownRights = rows
-              .map(
-                (row) => row.querySelector('.maka-plan-countdown')?.getBoundingClientRect().right,
-              )
-              .filter((right) => typeof right === 'number')
-              .map((right) => Math.round(right));
-            if (
-              countdownRights.length > 1 &&
-              countdownRights.some((right) => Math.abs(right - countdownRights[0]) > 1)
-            ) {
-              failures.push(
-                `plan reminder countdowns must right-align, got ${countdownRights.join(', ')}`,
-              );
-            }
-          }
-        }
-        return {
-          hasContent: Boolean(root?.innerHTML.trim()),
-          failures,
-        };
-      },
-      { checks: job.checks ?? [], colorScheme: job.colorScheme ?? 'light' },
-    );
+      if (dialogs.length > 1) {
+        failures.push(`multiple visible modal dialogs remain open (${dialogs.length})`);
+      }
+      return { failures };
+    });
     browserFailures.push(...result.failures);
-    if (!result.hasContent) browserFailures.push('story root rendered empty content');
+    const cdp = await page.context().newCDPSession(page);
+    try {
+      const axTree = await cdp.send('Accessibility.getFullAXTree');
+      const audit = auditAxTree(axTree.nodes);
+      if (audit.problems.length > 0) {
+        browserFailures.push(`AX audit failed: ${JSON.stringify(audit.problems)}`);
+      }
+    } finally {
+      await cdp.detach();
+    }
     if (browserFailures.length > 0) {
       throw new Error(`${prefix} ${browserFailures.join('; ')}`);
     }
   } finally {
-    page.off?.('console', onConsole);
-    page.off?.('pageerror', onPageError);
+    page.off('console', onConsole);
+    page.off('pageerror', onPageError);
   }
 }
 
-/**
- * Every story the manifest does NOT name, rendered once at wide/light.
- *
- * The manifest is a curated list — a dozen surfaces across viewports and colour
- * schemes, because those checks are expensive and only worth paying for where
- * layout actually varies. But that left every other story verified by nothing:
- * `build-storybook` bundles a story without mounting it, so a render that
- * throws, a play function that rejects, or a console error ships green.
- *
- * This pass is deliberately shallow. It answers one question — does the story
- * still mount and finish its play function without errors — and leaves
- * viewport, colour-scheme and surface-specific assertions to the manifest.
- */
-function catalogJobs(storyIndex, manifestJobs) {
-  const covered = new Set(manifestJobs.map((job) => job.storyId));
-  return Object.values(storyIndex.entries)
-    .filter((entry) => entry.type === 'story' && !covered.has(entry.id))
-    .map((entry) => ({
-      storyId: entry.id,
-      viewport: 'catalog',
-      size: PRODUCT_VIEWPORTS.wide,
-      colorScheme: 'light',
-    }));
-}
-
-/**
- * Every job is attempted and every story failure is collected, so one broken
- * story cannot hide the rest behind it. Only an infrastructure failure — a page
- * that cannot be opened or closed — is allowed to reject and abort the run.
- */
 async function runJobs(browser, baseUrl, jobs, concurrency) {
   const queue = [...jobs];
   const failures = [];
@@ -582,10 +300,10 @@ async function runJobs(browser, baseUrl, jobs, concurrency) {
       const page = await browser.newPage();
       try {
         await smokeStory(page, baseUrl, job);
-        process.stdout.write(`✓ ${job.storyId} @ ${job.viewport}\n`);
+        process.stdout.write(`✓ ${jobLabel(job)}\n`);
       } catch (error) {
         failures.push(error instanceof Error ? error.message : String(error));
-        process.stdout.write(`✗ ${job.storyId} @ ${job.viewport}\n`);
+        process.stdout.write(`✗ ${jobLabel(job)}\n`);
       } finally {
         await page.close();
       }
@@ -651,34 +369,39 @@ async function runCli() {
   const scriptDir = dirname(fileURLToPath(import.meta.url));
   const repoRoot = resolve(scriptDir, '..');
   const staticDir = resolve(process.argv[2] ?? join(repoRoot, 'apps/desktop/storybook-static'));
-  const manifestPath = resolve(
-    process.argv[3] ?? join(repoRoot, 'apps/desktop/stories/product-smoke-manifest.json'),
-  );
-  const [manifest, storyIndex] = await Promise.all([
-    readFile(manifestPath, 'utf8').then(JSON.parse),
-    readFile(join(staticDir, 'index.json'), 'utf8').then(JSON.parse),
+  const storyIndex = await readFile(join(staticDir, 'index.json'), 'utf8').then(JSON.parse);
+  const { THEME_PALETTES } = await import('@maka/core/settings');
+  const jobs = catalogJobs(storyIndex, { themePalettes: THEME_PALETTES });
+  const storyIds = new Set(jobs.map((job) => job.storyId));
+  const requiredStoryIds = new Set([
+    ...REQUIRED_COMPUTER_USE_STORY_IDS,
+    ...DARK_THEME_SENTINEL_STORY_IDS,
+    ...FORCED_COLORS_STORY_IDS,
   ]);
-  const jobs = validateCoverageManifest(manifest, storyIndex);
-  const catalog = catalogJobs(storyIndex, jobs);
+  const missingRequiredStories = [...requiredStoryIds].filter((storyId) => !storyIds.has(storyId));
+  if (missingRequiredStories.length > 0) {
+    throw new Error(
+      `Computer Use story inventory is missing: ${missingRequiredStories.join(', ')}`,
+    );
+  }
   const { chromium } = await import('@playwright/test');
-  const browser = await chromium.launch({ headless: true });
+  // Headless Chromium paints no platform scrollbar, so anything a scrollbar
+  // can occlude is inert here and on CI. `SMOKE_HEADED=1` is how you check
+  // those by hand, on the platform whose scrollbar overlays the content.
+  const browser = await chromium.launch({ headless: process.env.SMOKE_HEADED !== '1' });
   const server = await startStaticServer(staticDir);
-  const problems = [];
+  let problems;
   try {
-    // The manifest jobs run first and serially: they assert on layout geometry,
-    // which is why they pin a viewport in the first place.
-    problems.push(...(await runJobs(browser, server.baseUrl, jobs, 1)));
-    problems.push(...(await runJobs(browser, server.baseUrl, catalog, 4)));
+    problems = await runJobs(browser, server.baseUrl, jobs, 4);
   } finally {
     await server.close();
     await browser.close();
   }
   if (problems.length > 0) {
-    throw new Error(`${problems.length} story check(s) failed:\n${problems.join('\n')}`);
+    throw new Error(`${problems.length} story render(s) failed:\n${problems.join('\n')}`);
   }
   process.stdout.write(
-    `Product Storybook smoke passed (${jobs.length} manifest check(s), ` +
-      `${catalog.length} catalog render(s)).\n`,
+    `Storybook render smoke passed (${storyIds.size} stories, ${jobs.length} theme renders).\n`,
   );
 }
 

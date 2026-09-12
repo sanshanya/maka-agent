@@ -1,9 +1,29 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { ShellRunSnapshotResult, ShellRunUpdate } from '@maka/core';
+import type { ShellRunSnapshotResult, ShellRunUpdate } from '@maka/core/events';
 import {
   mergeShellRunNotification,
   mergeShellRunUpdates,
+  ShellRunHydration,
 } from '../../renderer/shell-run-update-state.js';
 
 test('ShellRun update state rejects a stale hydration result after a newer notification', () => {
@@ -75,6 +95,20 @@ test('ShellRun update state applies ownership changes at the same revision', () 
     sourceSessionId: 'parent',
   });
   assert.equal(next.branch?.bash?.result.revision, 3);
+});
+
+test('ShellRun hydration ignores an old read and replays updates after the resync boundary', () => {
+  const hydration = new ShellRunHydration();
+  const oldEpoch = hydration.begin();
+  hydration.accept(update(2));
+
+  const currentEpoch = hydration.begin();
+  hydration.accept(update(4));
+  const current = hydration.commit(currentEpoch);
+  assert.deepEqual(current?.updates.map((entry) => entry.result.revision), [4]);
+  assert.equal(hydration.commit(oldEpoch), undefined);
+
+  assert.equal(hydration.accept(update(5))?.result.revision, 5);
 });
 
 function update(revision: number): ShellRunUpdate {

@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /* ============================================================================
    Chat message body
    ----------------------------------------------------------------------------
@@ -21,6 +40,38 @@
 
 .maka-chat-message-list {
   width: 100%;
+}
+
+/* Native anchoring handles ordinary content growth. The scroll authority
+   disables it during following and atomic range replacement, when it owns
+   the position write itself. */
+[data-chat-scroll-container='true'] {
+  overflow-anchor: auto;
+}
+
+/* These rows mount and unmount around the reader without being anything the
+   reader is reading, so anchoring on one moves the transcript for no content:
+   a send that is not durable yet, the placeholder held until the live Turn
+   exists. */
+[data-transient-message-id],
+.maka-turn[data-live-streaming='true']:not([data-turn-id]) {
+  overflow-anchor: none;
+}
+
+.maka-transcript-turn {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  gap: var(--spacing-4);
+  /* Resident Turns contribute their real size before the first scroll. */
+  contain: layout style paint;
+}
+
+.maka-chat-message-loading {
+  display: grid;
+  place-items: center;
+  min-height: min(240px, 40vh);
+  padding: var(--space-6);
 }
 
 /* Astryx's ChatMessageList renders a `flex: 1` spacer before its rows so a
@@ -47,21 +98,33 @@
   font: var(--maka-text-body);
 }
 
-/* Geometry (radius, padding, max-width) belongs to ChatMessageBubble: under
-   `density="compact"` it resolves --radius-container plus the compact padding
-   step, so re-declaring them here only forked the primitive. What stays is the
-   product tint and the verbatim-text rule — Maka renders user input as typed,
-   which the primitive has no opinion about. */
+/* Padding, max-width and radius belong to ChatMessageBubble; re-declaring any
+   of them here only forks the primitive. What stays is the product tint and the
+   verbatim-text rule (Maka renders user input as typed, which the primitive has
+   no opinion about).
+
+   Radius is absent on purpose. The primitive resolves `--radius-chat` (28px),
+   the same token `ChatComposer` reads through `--_chat-composer-radius`, so the
+   bubble and the dock round together as one conversation surface — DESIGN.md §6
+   records that as the chat rung. Astryx publishes no radius prop on this
+   component (only `variant`), so a product radius could only fight the
+   primitive, never configure it.
+
+   Scoped to the filled bubble on purpose: the assistant bubble is `ghost` (no
+   fill, measured transparent), so it carries no tint to override. */
 .maka-chat-message-bubble-user {
   background: var(--chat-user-bg);
   color: var(--chat-user-foreground, var(--foreground));
   white-space: pre-wrap;
 }
 
+/* The ghost bubble has no fill or border, so its inherited 28px radius paints
+   nothing. It is also a transcript boundary below, and paint containment clips
+   to the rounded padding box, so the invisible corners became clip arcs that
+   shaved the first glyph of the first line and the last. Square it. */
 .maka-chat-message-bubble-assistant {
-  width: 100%;
-  max-width: none;
   padding: var(--space-0-5) 0 0;
+  border-radius: 0;
 }
 
 .maka-processing-sequence {
@@ -69,6 +132,32 @@
   min-width: 0;
   flex-direction: column;
   gap: var(--space-1);
+}
+
+/* Keep containment without skipping layout: first visibility must not replace
+   an estimate and change the scroll range. Window membership bounds residency. */
+.maka-chat-message-list [data-maka-transcript-boundary] {
+  contain: layout style paint;
+}
+
+/* An expanded reasoning header stays reachable while its own detail is being
+   read. Tool-call disclosures remain in normal flow: pinning both the group
+   header and an expanded call row creates a floating two-tier stack that
+   visually detaches from the transcript around adjacent messages. */
+.maka-turn .maka-deep-thinking .maka-activity-card-header[aria-expanded="true"] {
+  position: sticky;
+  top: var(--space-2);
+  z-index: var(--z-sticky);
+  background: var(--surface-raised);
+  border-radius: var(--radius-element);
+  box-shadow: 0 var(--border-width-hairline) 0 var(--border-soft);
+}
+
+/* The inner wrapper is a grid item: without an explicit zero minimum its long,
+   nowrap call preview becomes the track's minimum size and stretches every
+   expanded row past the turn instead of ellipsizing it. */
+.maka-turn .maka-tool-activity-card > [role="button"] + div > div {
+  min-width: 0;
 }
 
 /* Cursor for tool/reasoning disclosure triggers is owned by
@@ -100,7 +189,8 @@
    and preview in a `<div>` (packages/ui/src/astryx-chat-reasoning.tsx), so
    the rule enlarged the leading icon wrapper and left the reasoning text at
    supporting size — the one row the retune was for. */
-.maka-turn :is(.astryx-chat-reasoning, .astryx-chat-tool-calls) [role="button"] {
+.maka-turn .astryx-chat-reasoning [role="button"],
+.maka-turn .astryx-chat-tool-calls [role="button"] {
   --text-supporting-size: var(--text-body-size);
   --text-supporting-leading: var(--maka-line-body);
 }
@@ -126,7 +216,7 @@
 @media (hover: hover) {
   .maka-turn .astryx-chat-tool-calls [role="button"]:hover,
   .maka-turn .astryx-chat-reasoning [role="button"]:hover {
-    background-color: var(--color-overlay-hover);
+    background-color: var(--foreground-5);
     border-radius: var(--radius-element);
   }
 }
@@ -135,11 +225,12 @@
 
    The Astryx duration/ease below are deliberate, not a leak of the product
    scale. Astryx ChatToolCalls animates its own group open with
-   `grid-template-rows --duration-medium --ease-standard`; a detail row that
+   `grid-template-rows --duration-medium` and its own easing; a detail row that
    expands beside one has to share that clock or the two disclosures visibly
    desync. Product motion belongs on the maka-tokens scale — this is the
    exception that follows a neighbouring Astryx component, so retune it only
-   when ChatToolCalls moves. */
+   when ChatToolCalls moves. Astryx exports --duration-medium as a CSS var but
+   not its easing, so the curve is copied by value. */
 @keyframes maka-chat-tool-detail-open {
   from { grid-template-rows: 0fr; }
   to { grid-template-rows: 1fr; }
@@ -148,7 +239,7 @@
 .maka-chat-tool-detail {
   display: grid;
   grid-template-rows: 1fr;
-  animation: maka-chat-tool-detail-open var(--duration-medium, 300ms) var(--ease-standard, cubic-bezier(0.24, 1, 0.4, 1)) both;
+  animation: maka-chat-tool-detail-open var(--duration-medium, 300ms) cubic-bezier(0.24, 1, 0.4, 1) both;
 }
 
 .maka-chat-tool-detail-inner {
@@ -162,48 +253,42 @@
   }
 }
 
-/* --- Assistant bubble shell ----------------------------------------------- */
-/* User message: a tinted Astryx bubble anchored to the right, sized by the
-   primitive's own compact-density geometry. */
-/* Assistant: no bubble — just text on background, like an editor. The
-   Markdown typography and block rhythm belong to Astryx, so the shell keeps
-   only container geometry.
-   The reading measure is inherited from the conversation surface shared with
-   the composer, so the assistant block matches the composer width. */
-/* The streaming ▎ caret + its trailing-<p> inline hack were retired by the
-   streaming UI rework. Chat smooths the visible text before it reaches
-   Markdown; PR 8 owns the remaining streaming and scroll-anchoring boundary. */
-
 /* --- User-turn meta row (relocated from tool-output.css) ----------------- */
-/* PR-CHAT-CHROME-FOLLOWUP-0 / PR5 CHAT-MESSAGE-TIME-0: the relative time is
-   always visible now (it was `opacity: 0` until hover, which hid it on
-   touch + from assistive tech). It stays quiet — caption tier at
-   normal weight, muted — and rides in the user turn's meta row beneath
-   the block. Aligned to the same tier the footer-action cva uses (text-xs). */
-/* #1879: height off the control ruler, not off the line box. `inline-block`
-   let the leading decide the box — measured, bumping this element's own
-   leading to 40px took the box from 20px to 40px and carried the meta row
-   with it. `--h-control-xs` is 20px, the value the supporting leading
-   already resolves to, so the pin is pixel-neutral today and load-bearing
-   the next time a leading moves. Safe to pin because `white-space: nowrap`
-   below makes single-line a property of this box rather than an assumption. */
+/* The time is an Astryx `Timestamp`, so the quiet register (supporting tier,
+   secondary colour) is the component's own default and is not restated here.
+   What stays is what the component does not decide:
+
+   - #1879: height off the control ruler, not off the line box. Measured then,
+     bumping this element's leading to 40px took the box from 20px to 40px and
+     carried the meta row with it. `--h-control-xs` is 20px, what the supporting
+     leading already resolves to, so the pin is pixel-neutral today and
+     load-bearing the next time a leading moves. Safe to pin because `nowrap`
+     makes single-line a property of this box rather than an assumption.
+   - `tabular-nums`, because `Timestamp`'s `time` format renders the hour with
+     `hour: 'numeric'` — no leading zero, so `9:05` and `14:32` differ by a
+     digit. The row is right-aligned, so that difference shows up on the left
+     edge; equal-width digits keep it to the one character it really is. */
 .maka-message-time-inline {
-  font: var(--maka-text-supporting);
   height: var(--h-control-xs);
   display: inline-flex;
   align-items: center;
-  color: var(--muted-foreground);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
 /* User turn meta row: quiet time + a copy affordance, right-aligned
    beneath the message block (the parent `Message role="user"` aligns its
-   items to flex-end, so this row shrink-wraps and hugs the right edge). */
+   items to flex-end, so this row shrink-wraps and hugs the right edge).
+
+   The row's own box is 28px — the height of the action buttons, not of the
+   12px time beside them — so it reads tighter against the bubble than its
+   4px top margin suggests. Astryx's default is nudged one step to 6px to give
+   the row back some air without opening a visible gap. */
 .maka-message-meta {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1-5);
+  margin-top: var(--space-1-5);
 }
 
 /* Turn summary / lineage rows / footer measure column folded into the
@@ -212,39 +297,16 @@
    independent instead of keyed on a `[data-role="assistant"]` descendant. */
 
 /* --- Conversation heading scale ------------------------------------------- */
-/* Astryx's heading ladder (20/18/16/14…) is a DOCUMENT scale, and the
-   transcript is not a document. An agent turn emits `##` freely, so a ladder
-   that steps 1.4× per level shreds one reply into visually unrelated slabs.
-   Flatten it to two steps — h1 for a genuine section break, everything below
-   at body size — and let weight 600 plus colour carry the hierarchy, which is
-   what the rest of the conversation already does.
-   Cursor (1.43/1.32/1.21), Claude Code (1.14/1.07/1.0) and Codex
-   (1.71/1.43/1.21) all flatten here relative to their own document styles;
-   Claude Code goes furthest and merges h4–h6 into `strong`. Two steps sits
-   inside that range.
-   Every level shares the transcript baseline so headings do not add rhythm of
-   their own.
-   Scoped to `.maka-turn`, not to the Markdown contract alone. The contract is
-   emitted by the shared MarkdownBody, whose other caller is the Daily Review
-   panel — and a review report IS a document, so the argument above does not
-   apply to it. It keeps Astryx's full ladder.
-   Bare tags are the whole story: Astryx's Markdown renderer emits plain
-   h1–h6 with stylex props (Markdown.js `const Tag = \`h${level}\``). The
-   .astryx-heading.level-N classes come from the standalone Heading
-   component, which Markdown never mounts. */
-/* The one heading in a turn that is not at the body size, and so the one that
-   cannot take the body baseline with it: at 16px, --maka-line-body's 20px is
-   on the 4px grid but is the 14px tier's line box, one step tighter than the
-   tier this heading actually sits at. It takes its own tier's leading (24px);
-   the turn still reads as one rhythm because 24 is the next step of the same
-   grid, not a different one. */
-.maka-turn [data-maka-contract="markdown"] h1 {
-  font: var(--maka-text-heading-3);
-}
-
-.maka-turn [data-maka-contract="markdown"] :is(h2, h3, h4, h5, h6) {
-  font: var(--maka-text-heading-4);
-}
+/* Moved to the transcript rhythm table in packages/ui/src/styles.css. The
+   argument for flattening the document ladder is unchanged; what changed is
+   where it is expressed. These rules keyed on a `.maka-turn` ancestor, which
+   made the heading scale a function of DOM position: the same MarkdownBody
+   rendered document-sized headings in the Daily Review and flat ones in a
+   turn, and no Storybook story could reproduce the transcript without
+   remembering to wrap one. The rhythm table keys on Astryx's own
+   `data-density` instead, so the scale follows the `density` prop that already
+   distinguishes the two surfaces. It also keeps two size steps rather than
+   one — h2 and h3 used to be identical in size, weight and colour. */
 
 .maka-chat-message pre:not([data-maka-contract="markdown"] pre) {
   margin: 0;
@@ -258,7 +320,7 @@
   font: var(--maka-text-supporting);
   display: inline-flex;
   border-radius: var(--radius-pill);
-  background: oklch(from var(--info) l c h / 0.08);
-  color: var(--info-text);
+  background: var(--color-accent-muted);
+  color: var(--foreground);
   padding: var(--space-0-5) var(--space-1-5);
 }
